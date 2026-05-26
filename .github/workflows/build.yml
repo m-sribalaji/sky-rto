@@ -1,0 +1,178 @@
+name: Build RTO Tracker Binaries
+
+# Trigger: push to main OR manual dispatch from Actions tab
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'client/**'
+      - 'installer/**'
+      - 'build.sh'
+      - '.github/workflows/build.yml'
+  workflow_dispatch:   # allows manual trigger from GitHub Actions UI
+
+jobs:
+  # ── macOS arm64 (M1/M2/M3) ────────────────────────────────────────────────
+  build-mac-arm64:
+    runs-on: macos-14   # GitHub's arm64 runner
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install build dependencies
+        run: |
+          pip install pyinstaller pyobjc-framework-Cocoa
+
+      - name: Build rto-mac-arm64
+        run: |
+          pyinstaller \
+            --onefile --noconfirm --clean --noupx \
+            --distpath dist \
+            --workpath build --specpath build \
+            --add-data "client/checkin_core.py:." \
+            --add-data "client/notifier.py:." \
+            --hidden-import=checkin_core \
+            --hidden-import=notifier \
+            --hidden-import=ipaddress \
+            --hidden-import=AppKit \
+            --hidden-import=Foundation \
+            --hidden-import=objc \
+            --name rto-mac-arm64 \
+            installer/rto_agent_mac.py
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rto-mac-arm64
+          path: dist/rto-mac-arm64
+
+  # ── macOS x86_64 (Intel) ──────────────────────────────────────────────────
+  build-mac-x86:
+    runs-on: macos-13   # GitHub's Intel runner
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install build dependencies
+        run: |
+          pip install pyinstaller pyobjc-framework-Cocoa
+
+      - name: Build rto-mac-x86
+        run: |
+          pyinstaller \
+            --onefile --noconfirm --clean --noupx \
+            --distpath dist \
+            --workpath build --specpath build \
+            --add-data "client/checkin_core.py:." \
+            --add-data "client/notifier.py:." \
+            --hidden-import=checkin_core \
+            --hidden-import=notifier \
+            --hidden-import=ipaddress \
+            --hidden-import=AppKit \
+            --hidden-import=Foundation \
+            --hidden-import=objc \
+            --name rto-mac-x86 \
+            installer/rto_agent_mac.py
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rto-mac-x86
+          path: dist/rto-mac-x86
+
+  # ── Windows x64 ───────────────────────────────────────────────────────────
+  build-windows:
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install build dependencies
+        run: |
+          pip install pyinstaller pywin32
+
+      - name: Build rto-win.exe
+        shell: bash
+        run: |
+          pyinstaller \
+            --onefile --noconfirm --clean --noupx \
+            --distpath dist \
+            --workpath build --specpath build \
+            --add-data "client/checkin_core.py;." \
+            --add-data "client/notifier.py;." \
+            --hidden-import=checkin_core \
+            --hidden-import=notifier \
+            --hidden-import=ipaddress \
+            --hidden-import=winreg \
+            --hidden-import=ctypes \
+            --hidden-import=win32api \
+            --hidden-import=win32con \
+            --hidden-import=win32gui \
+            --hidden-import=win32ts \
+            --name rto-win \
+            installer/rto_agent_win.py
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rto-win
+          path: dist/rto-win.exe
+
+  # ── Bundle all 3 into a GitHub Release ───────────────────────────────────
+  release:
+    needs: [build-mac-arm64, build-mac-x86, build-windows]
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist/
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: "build-${{ github.run_number }}"
+          name: "RTO Tracker Build ${{ github.run_number }}"
+          body: |
+            Auto-built from commit ${{ github.sha }}
+
+            **Download the right file for your machine:**
+            - `rto-mac-arm64` — Mac with Apple Silicon (M1 / M2 / M3)
+            - `rto-mac-x86`   — Mac with Intel processor
+            - `rto-win.exe`   — Windows (all x64)
+
+            **macOS install:**
+            1. Download `rto-mac-arm64` (or `rto-mac-x86`)
+            2. Open Terminal in the download folder
+            3. Run: `chmod +x rto-mac-arm64 && ./rto-mac-arm64`
+            4. Browser opens for registration — done
+
+            **Windows install:**
+            1. Download `rto-win.exe`
+            2. Double-click it
+            3. Browser opens for registration — done
+          files: |
+            dist/rto-mac-arm64/rto-mac-arm64
+            dist/rto-mac-x86/rto-mac-x86
+            dist/rto-win/rto-win.exe
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
