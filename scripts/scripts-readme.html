@@ -258,14 +258,8 @@ code{
         <h1>Installation Guide</h1>
         <div class="subtitle">
             <span>Download the installer for your platform and</span>
-            <span class="highlight">double-click to install.</span>
-            <span>No setup required.</span>
-        </div>
-        <div class="badge-row">
-            <span class="badge"><i data-lucide="check-circle"></i> No Python required</span>
-            <span class="badge"><i data-lucide="check-circle"></i> No admin / IT ticket needed</span>
-            <span class="badge"><i data-lucide="check-circle"></i> Auto-starts on every login</span>
-            <span class="badge"><i data-lucide="check-circle"></i> Fully automatic after install</span>
+            <span class="highlight">run it once.</span>
+            <span>Fully automatic from there.</span>
         </div>
     </div>
 
@@ -275,38 +269,25 @@ code{
         <section class="card">
             <h2>
                 macOS
-                <span class="platform-badge">arm64 / Intel</span>
+                <span class="platform-badge">Apple Silicon</span>
             </h2>
 
             <div class="step">
                 <div class="step-num">Step 1</div>
                 <div class="step-title">
-                    Download the correct binary for your Mac
+                    Download the Mac installer
                 </div>
-                <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:4px">
-                    <div style="background:var(--bg2);border:1px solid var(--b0);border-radius:10px;padding:12px 14px">
-                        <div style="font-family:var(--mono);font-size:9px;text-transform:uppercase;letter-spacing:.08em;color:var(--tx3);margin-bottom:6px">M1 / M2 / M3</div>
-                        <code>rto-mac-arm64</code>
-                    </div>
-                    <div style="background:var(--bg2);border:1px solid var(--b0);border-radius:10px;padding:12px 14px">
-                        <div style="font-family:var(--mono);font-size:9px;text-transform:uppercase;letter-spacing:.08em;color:var(--tx3);margin-bottom:6px">Intel Mac</div>
-                        <code>rto-mac-x86</code>
-                    </div>
-                </div>
-                <div style="margin-top:8px;font-family:var(--mono);font-size:11px;color:var(--tx3)">
-                    Not sure? Apple menu &rarr; About This Mac &rarr; Chip
+                <div style="background:var(--bg2);border:1px solid var(--b0);border-radius:10px;padding:12px 14px;display:inline-block;margin-top:4px">
+                    <code>rto-mac-arm64</code>
                 </div>
             </div>
 
-            <div class="step" data-command="chmod +x rto-mac-arm64 &amp;&amp; ./rto-mac-arm64">
+            <div class="step" data-command="xattr -d com.apple.quarantine rto-mac-arm64 &amp;&amp; chmod +x rto-mac-arm64 &amp;&amp; ./rto-mac-arm64">
                 <div class="step-num">Step 2</div>
                 <div class="step-title">
                     Open Terminal in the download folder and run
                 </div>
-<pre><code>chmod +x rto-mac-arm64 &amp;&amp; ./rto-mac-arm64</code></pre>
-                <div style="margin-top:6px;font-family:var(--mono);font-size:11px;color:var(--tx3)">
-                    Replace <code>rto-mac-arm64</code> with <code>rto-mac-x86</code> if on Intel.
-                </div>
+<pre><code>xattr -d com.apple.quarantine rto-mac-arm64 &amp;&amp; chmod +x rto-mac-arm64 &amp;&amp; ./rto-mac-arm64</code></pre>
                 <div class="step-actions">
                     <button class="btn" onclick="copyStepCommand(this)">
                         <i data-lucide="copy"></i>Copy command
@@ -432,23 +413,15 @@ code{
         <div class="notes">
             <div class="note-item">
                 <div class="dot"></div>
-                <div><strong style="color:var(--tx)">No Python required.</strong> The installer is a self-contained binary — the Python runtime is bundled inside it. Nothing else needs to be installed.</div>
+                <div><strong style="color:var(--tx)">Sky VPN required.</strong> Connect to Sky VPN before running the installer if you are at home. The agent will queue your check-in locally and sync automatically once VPN is connected.</div>
             </div>
             <div class="note-item">
                 <div class="dot"></div>
-                <div><strong style="color:var(--tx)">macOS Gatekeeper.</strong> On first run macOS may show "cannot be opened because it is from an unidentified developer". Go to System Settings &rarr; Privacy &amp; Security &rarr; scroll down &rarr; click "Open Anyway".</div>
+                <div><strong style="color:var(--tx)">Windows SmartScreen.</strong> If a blue warning appears, click <strong style="color:var(--tx)">More info</strong> &rarr; <strong style="color:var(--tx)">Run anyway</strong>. This is expected for internally distributed tools.</div>
             </div>
             <div class="note-item">
                 <div class="dot"></div>
-                <div><strong style="color:var(--tx)">Windows SmartScreen.</strong> Click "More info" &rarr; "Run anyway". This appears because the binary is not signed with a commercial certificate.</div>
-            </div>
-            <div class="note-item">
-                <div class="dot"></div>
-                <div><strong style="color:var(--tx)">Server must be reachable.</strong> Connect to Sky VPN before installing if you are working from home. The installer will prompt you if the server is unreachable.</div>
-            </div>
-            <div class="note-item">
-                <div class="dot"></div>
-                <div><strong style="color:var(--tx)">Logs.</strong> All activity is logged to <code>~/.rto_tracker/checkin.log</code> and <code>~/.rto_tracker/rto_agent.log</code>. Share these with your admin if something isn't working.</div>
+                <div><strong style="color:var(--tx)">Something not working?</strong> Run the binary with <code>--reset</code> to clear all caches and start fresh. Share <code>~/.rto_tracker/checkin.log</code> with your admin if the issue persists.</div>
             </div>
         </div>
     </div>
