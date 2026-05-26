@@ -227,6 +227,13 @@ code{
     border-bottom:1px solid var(--b0);
     vertical-align:top;
 }
+
+.cli-table th:first-child,
+.cli-table td:first-child{
+    width:140px;
+    white-space:nowrap;
+}
+
 .cli-table tr:last-child td{ border-bottom:none; }
 .cli-table code{ font-size:11px; }
 .cli-table .desc{ color:var(--tx2); }
@@ -256,11 +263,6 @@ code{
     <div class="hero">
         <div class="eyebrow">SKY-RTO</div>
         <h1>Installation Guide</h1>
-        <div class="subtitle">
-            <span>Download the installer for your platform and</span>
-            <span class="highlight">run it once.</span>
-            <span>Fully automatic from there.</span>
-        </div>
     </div>
 
     <div class="grid">
@@ -413,7 +415,7 @@ code{
         <div class="notes">
             <div class="note-item">
                 <div class="dot"></div>
-                <div><strong style="color:var(--tx)">Sky VPN required.</strong> Connect to Sky VPN before running the installer if you are at home. The agent will queue your check-in locally and sync automatically once VPN is connected.</div>
+                <div><strong style="color:var(--tx)">Sky VPN required.</strong> The agent will queue your check-in locally and sync automatically once VPN is connected.</div>
             </div>
             <div class="note-item">
                 <div class="dot"></div>
@@ -421,12 +423,10 @@ code{
             </div>
             <div class="note-item">
                 <div class="dot"></div>
-                <div><strong style="color:var(--tx)">Something not working?</strong> Run the binary with <code>--reset</code> to clear all caches and start fresh. Share <code>~/.rto_tracker/checkin.log</code> with your admin if the issue persists.</div>
+                <div><strong style="color:var(--tx)">Something not working?</strong> Run the binary with <code> --reset</code> to clear all caches and start fresh. Share <code>~/.rto_tracker/checkin.log</code> with your admin if the issue persists.</div>
             </div>
         </div>
     </div>
-
-    <div class="footer">Sky RTO Tracker &mdash; Automatic attendance tracking</div>
 </div>
 
 <script>
