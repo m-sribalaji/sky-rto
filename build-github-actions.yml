@@ -1,5 +1,8 @@
 name: Build RTO Tracker Binaries
 
+permissions:
+  contents: write
+
 on:
   push:
     branches: [main]
