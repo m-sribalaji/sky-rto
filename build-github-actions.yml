@@ -66,61 +66,7 @@ jobs:
           name: rto-mac-arm64
           path: dist/rto-mac-arm64
 
-  # ── macOS x86_64 (Intel) ────────────────────────────────────────────────
-  build-mac-x86:
-    runs-on: macos-13
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-
-      - name: Install build dependencies
-        run: |
-          pip install pyinstaller pyobjc-framework-Cocoa certifi
-
-      - name: Build rto-mac-x86
-        run: |
-          pyinstaller \
-            --onefile --noconfirm --clean --noupx \
-            --distpath dist \
-            --add-data "client/checkin_core.py:." \
-            --add-data "client/notifier.py:." \
-            --hidden-import=checkin_core \
-            --hidden-import=notifier \
-            --hidden-import=platform \
-            --hidden-import=ipaddress \
-            --hidden-import=urllib.request \
-            --hidden-import=urllib.error \
-            --hidden-import=fcntl \
-            --hidden-import=json \
-            --hidden-import=threading \
-            --hidden-import=socket \
-            --hidden-import=argparse \
-            --hidden-import=logging \
-            --hidden-import=webbrowser \
-            --hidden-import=random \
-            --hidden-import=datetime \
-            --hidden-import=pathlib \
-            --hidden-import=ssl \
-            --hidden-import=certifi \
-            --hidden-import=zlib \
-            --collect-all=certifi \
-            --hidden-import=AppKit \
-            --hidden-import=Foundation \
-            --hidden-import=objc \
-            --name rto-mac-x86 \
-            scripts/rto_agent_mac.py
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: rto-mac-x86
-          path: dist/rto-mac-x86
-
+  
   # ── Windows x64 ─────────────────────────────────────────────────────────
   build-windows:
     runs-on: windows-latest
@@ -179,9 +125,9 @@ jobs:
           name: rto-win
           path: dist/rto-win.exe
 
-  # ── Bundle all 3 into a GitHub Release ──────────────────────────────────
+  # ── Bundle all 2 into a GitHub Release ──────────────────────────────────
   release:
-    needs: [build-mac-arm64, build-mac-x86, build-windows]
+    needs: [build-mac-arm64, build-windows]
     runs-on: ubuntu-latest
     if: github.ref == 'refs/heads/main'
 
@@ -201,11 +147,10 @@ jobs:
 
             **Download the right file for your machine:**
             - `rto-mac-arm64` — Mac with Apple Silicon (M1 / M2 / M3)
-            - `rto-mac-x86`   — Mac with Intel processor
             - `rto-win.exe`   — Windows (all x64)
 
             **macOS install:**
-            1. Download `rto-mac-arm64` (or `rto-mac-x86`)
+            1. Download `rto-mac-arm64`
             2. Open Terminal in the download folder
             3. Run: `chmod +x rto-mac-arm64 && ./rto-mac-arm64`
             4. Browser opens for registration — done
@@ -216,7 +161,6 @@ jobs:
             3. Browser opens for registration — done
           files: |
             dist/rto-mac-arm64/rto-mac-arm64
-            dist/rto-mac-x86/rto-mac-x86
             dist/rto-win/rto-win.exe
           draft: false
           prerelease: false
