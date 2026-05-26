@@ -172,7 +172,14 @@ def _send_teams(webhook_url: str, payload: dict) -> bool:
         req  = urllib.request.Request(
             webhook_url,
             data=data,
-            headers={"Content-Type": "application/json"},
+            headers={
+                "Content-Type": "application/json",
+                # Accept-Encoding: identity tells the server not to compress
+                # the response — avoids the zlib Error -3 decompression crash
+                # that occurs when urllib gets a gzip response it can't handle
+                # inside a PyInstaller binary.
+                "Accept-Encoding": "identity",
+            },
             method="POST",
         )
         # SSL: resolve cert bundle — works both as .py and inside PyInstaller binary
@@ -190,10 +197,21 @@ def _send_teams(webhook_url: str, payload: dict) -> bool:
                 ssl_ctx = _ssl._create_unverified_context()
         with urllib.request.urlopen(req, timeout=10, context=ssl_ctx) as resp:
             status = resp.status
+            # Read and decode safely — handle both plain and any residual encoding
+            raw = resp.read()
+            try:
+                import zlib
+                encoding = resp.headers.get("Content-Encoding", "")
+                if encoding == "gzip":
+                    raw = zlib.decompress(raw, zlib.MAX_WBITS | 16)
+                elif encoding == "deflate":
+                    raw = zlib.decompress(raw)
+            except Exception:
+                pass  # if decompression fails, use raw bytes as-is
+            body_txt = raw.decode("utf-8", errors="ignore")
             if status == 200:
                 logger.info("[OK] Teams notification sent")
                 return True
-            body_txt = resp.read().decode("utf-8", errors="ignore")
             logger.warning(f"[WARN] Teams webhook returned HTTP {status}: {body_txt}")
             return False
     except urllib.error.URLError as e:
