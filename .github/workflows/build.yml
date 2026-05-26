@@ -32,7 +32,6 @@ jobs:
           pyinstaller \
             --onefile --noconfirm --clean --noupx \
             --distpath dist \
-            --workpath build --specpath build \
             --add-data "client/checkin_core.py:." \
             --add-data "client/notifier.py:." \
             --hidden-import=checkin_core \
@@ -88,7 +87,6 @@ jobs:
           pyinstaller \
             --onefile --noconfirm --clean --noupx \
             --distpath dist \
-            --workpath build --specpath build \
             --add-data "client/checkin_core.py:." \
             --add-data "client/notifier.py:." \
             --hidden-import=checkin_core \
@@ -145,7 +143,6 @@ jobs:
           pyinstaller \
             --onefile --noconfirm --clean --noupx \
             --distpath dist \
-            --workpath build --specpath build \
             --add-data "client/checkin_core.py;." \
             --add-data "client/notifier.py;." \
             --hidden-import=checkin_core \

@@ -1,20 +1,19 @@
 name: Build RTO Tracker Binaries
 
-# Trigger: push to main OR manual dispatch from Actions tab
 on:
   push:
     branches: [main]
     paths:
       - 'client/**'
-      - 'installer/**'
+      - 'scripts/**'
       - 'build.sh'
       - '.github/workflows/build.yml'
-  workflow_dispatch:   # allows manual trigger from GitHub Actions UI
+  workflow_dispatch:
 
 jobs:
-  # ── macOS arm64 (M1/M2/M3) ────────────────────────────────────────────────
+  # ── macOS arm64 (M1/M2/M3) ──────────────────────────────────────────────
   build-mac-arm64:
-    runs-on: macos-14   # GitHub's arm64 runner
+    runs-on: macos-14
 
     steps:
       - uses: actions/checkout@v4
@@ -26,24 +25,40 @@ jobs:
 
       - name: Install build dependencies
         run: |
-          pip install pyinstaller pyobjc-framework-Cocoa
+          pip install pyinstaller pyobjc-framework-Cocoa certifi
 
       - name: Build rto-mac-arm64
         run: |
           pyinstaller \
             --onefile --noconfirm --clean --noupx \
             --distpath dist \
-            --workpath build --specpath build \
             --add-data "client/checkin_core.py:." \
             --add-data "client/notifier.py:." \
             --hidden-import=checkin_core \
             --hidden-import=notifier \
+            --hidden-import=platform \
             --hidden-import=ipaddress \
+            --hidden-import=urllib.request \
+            --hidden-import=urllib.error \
+            --hidden-import=fcntl \
+            --hidden-import=json \
+            --hidden-import=threading \
+            --hidden-import=socket \
+            --hidden-import=argparse \
+            --hidden-import=logging \
+            --hidden-import=webbrowser \
+            --hidden-import=random \
+            --hidden-import=datetime \
+            --hidden-import=pathlib \
+            --hidden-import=ssl \
+            --hidden-import=certifi \
+            --hidden-import=zlib \
+            --collect-all=certifi \
             --hidden-import=AppKit \
             --hidden-import=Foundation \
             --hidden-import=objc \
             --name rto-mac-arm64 \
-            installer/rto_agent_mac.py
+            scripts/rto_agent_mac.py
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -51,9 +66,9 @@ jobs:
           name: rto-mac-arm64
           path: dist/rto-mac-arm64
 
-  # ── macOS x86_64 (Intel) ──────────────────────────────────────────────────
+  # ── macOS x86_64 (Intel) ────────────────────────────────────────────────
   build-mac-x86:
-    runs-on: macos-13   # GitHub's Intel runner
+    runs-on: macos-13
 
     steps:
       - uses: actions/checkout@v4
@@ -65,24 +80,40 @@ jobs:
 
       - name: Install build dependencies
         run: |
-          pip install pyinstaller pyobjc-framework-Cocoa
+          pip install pyinstaller pyobjc-framework-Cocoa certifi
 
       - name: Build rto-mac-x86
         run: |
           pyinstaller \
             --onefile --noconfirm --clean --noupx \
             --distpath dist \
-            --workpath build --specpath build \
             --add-data "client/checkin_core.py:." \
             --add-data "client/notifier.py:." \
             --hidden-import=checkin_core \
             --hidden-import=notifier \
+            --hidden-import=platform \
             --hidden-import=ipaddress \
+            --hidden-import=urllib.request \
+            --hidden-import=urllib.error \
+            --hidden-import=fcntl \
+            --hidden-import=json \
+            --hidden-import=threading \
+            --hidden-import=socket \
+            --hidden-import=argparse \
+            --hidden-import=logging \
+            --hidden-import=webbrowser \
+            --hidden-import=random \
+            --hidden-import=datetime \
+            --hidden-import=pathlib \
+            --hidden-import=ssl \
+            --hidden-import=certifi \
+            --hidden-import=zlib \
+            --collect-all=certifi \
             --hidden-import=AppKit \
             --hidden-import=Foundation \
             --hidden-import=objc \
             --name rto-mac-x86 \
-            installer/rto_agent_mac.py
+            scripts/rto_agent_mac.py
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -90,7 +121,7 @@ jobs:
           name: rto-mac-x86
           path: dist/rto-mac-x86
 
-  # ── Windows x64 ───────────────────────────────────────────────────────────
+  # ── Windows x64 ─────────────────────────────────────────────────────────
   build-windows:
     runs-on: windows-latest
 
@@ -104,7 +135,7 @@ jobs:
 
       - name: Install build dependencies
         run: |
-          pip install pyinstaller pywin32
+          pip install pyinstaller pywin32 certifi
 
       - name: Build rto-win.exe
         shell: bash
@@ -112,12 +143,27 @@ jobs:
           pyinstaller \
             --onefile --noconfirm --clean --noupx \
             --distpath dist \
-            --workpath build --specpath build \
             --add-data "client/checkin_core.py;." \
             --add-data "client/notifier.py;." \
             --hidden-import=checkin_core \
             --hidden-import=notifier \
+            --hidden-import=platform \
             --hidden-import=ipaddress \
+            --hidden-import=urllib.request \
+            --hidden-import=urllib.error \
+            --hidden-import=json \
+            --hidden-import=threading \
+            --hidden-import=socket \
+            --hidden-import=argparse \
+            --hidden-import=logging \
+            --hidden-import=webbrowser \
+            --hidden-import=random \
+            --hidden-import=datetime \
+            --hidden-import=pathlib \
+            --hidden-import=ssl \
+            --hidden-import=certifi \
+            --hidden-import=zlib \
+            --collect-all=certifi \
             --hidden-import=winreg \
             --hidden-import=ctypes \
             --hidden-import=win32api \
@@ -125,7 +171,7 @@ jobs:
             --hidden-import=win32gui \
             --hidden-import=win32ts \
             --name rto-win \
-            installer/rto_agent_win.py
+            scripts/rto_agent_win.py
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -133,7 +179,7 @@ jobs:
           name: rto-win
           path: dist/rto-win.exe
 
-  # ── Bundle all 3 into a GitHub Release ───────────────────────────────────
+  # ── Bundle all 3 into a GitHub Release ──────────────────────────────────
   release:
     needs: [build-mac-arm64, build-mac-x86, build-windows]
     runs-on: ubuntu-latest
