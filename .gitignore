@@ -1,0 +1,51 @@
+# ── Python ───────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+
+# ── Virtual environment ───────────────────────────────────
+.venv/
+venv/
+env/
+
+# ── PyInstaller build output ──────────────────────────────
+build/
+dist/
+*.spec
+
+# ── Local RTO tracker data (never commit personal data) ───
+.rto_tracker/
+*.log
+
+# ── macOS system files ────────────────────────────────────
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+.Spotlight-V100
+.Trashes
+
+# ── VS Code ───────────────────────────────────────────────
+.vscode/
+*.code-workspace
+
+# ── Database (SQLite — lives in Docker volume, not repo) ──
+*.db
+*.sqlite
+*.sqlite3
+data/
+
+# ── Environment / secrets ─────────────────────────────────
+.env
+.env.*
+*.env
+
+# ── Docker ────────────────────────────────────────────────
+.dockerignore
+
+# ── Misc ──────────────────────────────────────────────────
+*.swp
+*.swo
+*~

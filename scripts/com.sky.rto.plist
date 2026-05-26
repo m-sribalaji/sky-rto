@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  com.sky.rto.plist
+  Runs rto_agent_mac.py as a persistent background agent.
+  rto_agent_mac.py uses NSWorkspace notifications (event-driven,
+  no polling) to detect screen unlock and fires checkin.py.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.sky.rto</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>PYTHON_PATH</string>
+    <string>WATCHER_PATH</string>
+  </array>
+
+  <!-- Restart automatically if it crashes -->
+  <key>KeepAlive</key>
+  <true/>
+
+  <!-- Start at login -->
+  <key>RunAtLoad</key>
+  <true/>
+
+  <key>StandardOutPath</key>
+  <string>LOG_DIR/launchd.log</string>
+
+  <key>StandardErrorPath</key>
+  <string>LOG_DIR/launchd_err.log</string>
+
+  <key>ProcessType</key>
+  <string>Background</string>
+
+  <!-- Give it time to start up -->
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
+</dict>
+</plist>

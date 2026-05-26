@@ -1,0 +1,97 @@
+{% extends "base.html" %}
+{% block title %}Register{% endblock %}
+
+{% block body %}
+<div class="card">
+  <div>
+    <div class="eyebrow">First time setup</div>
+    <h1>Register your device</h1>
+  </div>
+
+  <div class="field">
+    <label>Detected hostname</label>
+    <div class="chip">
+      <span class="chip-key">Machine ID</span>
+      <span class="chip-val">{{ hostname }}</span>
+    </div>
+  </div>
+
+  <div class="divider"></div>
+
+  <div class="field">
+    <label>Your full name</label>
+    <input type="text" id="nm" placeholder="Enter employee name"/>
+  </div>
+  <div class="field">
+    <label>Employee ID</label>
+    <input type="text" id="eid" placeholder="Enter employee ID"/>
+  </div>
+  <div class="field">
+    <label>Team</label>
+    <select id="tm">
+      <option value="">Loading teams...</option>
+    </select>
+  </div>
+
+  <div class="divider"></div>
+
+  <div class="notice warn">
+    <i data-lucide="shield-alert"></i>
+    <span>Location is auto-detected using DNS, LAN IP, VPN tunnel, and ethernet signals. You'll only be prompted if signals are ambiguous.</span>
+  </div>
+
+  <button class="btn" id="reg-btn" onclick="register()">
+    <i data-lucide="monitor-check"></i>
+    Register device
+  </button>
+</div>
+{% endblock %}
+
+{% block script %}
+<script>
+// Load teams
+(async () => {
+  try {
+    const r = await fetch('/api/teams');
+    const d = await r.json();
+    const sel = document.getElementById('tm');
+    if (d.teams && d.teams.length) {
+      sel.innerHTML = '<option value="">Select your team</option>' +
+        d.teams.map(t => `<option value="${t.name}">${t.name}</option>`).join('');
+    } else {
+      sel.outerHTML = '<input type="text" id="tm" placeholder="Enter team name"/>';
+    }
+  } catch(e) {
+    document.getElementById('tm').outerHTML =
+      '<input type="text" id="tm" placeholder="Enter team name"/>';
+  }
+})();
+
+async function register() {
+  const nm  = document.getElementById('nm').value.trim();
+  const eid = document.getElementById('eid').value.trim();
+  const tm  = document.getElementById('tm').value.trim();
+  if (!nm || !eid) { alert('Name and Employee ID are required.'); return; }
+  const btn = document.getElementById('reg-btn');
+  btn.innerHTML = '<i data-lucide="loader"></i> Registering...';
+  lucide.createIcons();
+  try {
+    const plt = navigator.platform.toLowerCase().includes('win') ? 'windows' : 'macos';
+    await fetch('/api/register', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ hostname: '{{ hostname }}', employee_name: nm,
+                             employee_id: eid, team: tm, platform: plt })
+    });
+    localStorage.setItem('rto_my_employee_id', eid);
+    btn.innerHTML = '<i data-lucide="check-circle"></i> Registered successfully!';
+    btn.className = 'btn success';
+    lucide.createIcons();
+    setTimeout(() => window.close(), 1500);
+  } catch(e) {
+    btn.innerHTML = '<i data-lucide="x-circle"></i> Error - try again';
+    lucide.createIcons();
+  }
+}
+</script>
+{% endblock %}

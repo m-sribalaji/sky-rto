@@ -1,0 +1,101 @@
+{% extends "base.html" %}
+{% block title %}Where are you today?{% endblock %}
+
+{% block body %}
+<div class="card">
+  <div>
+    <div class="eyebrow">Daily check-in - {{ today }}</div>
+    <h1>Where are you today, {{ first_name }}?</h1>
+  </div>
+
+  <p style="font-size:13px;color:var(--tx2);line-height:1.6">
+    Sky VPN detected. We couldn't auto-classify your location from signals alone.
+  </p>
+
+  <div class="signals">
+    <div style="font-size:9px;text-transform:uppercase;letter-spacing:0.08em;color:var(--tx3);margin-bottom:2px">Detected signals</div>
+    <div class="signal-row">
+      <span class="signal-key">VPN tunnel</span>
+      <span class="signal-val" style="color:var(--amber)">{{ vpn_tunnel }}</span>
+    </div>
+    <div class="signal-row">
+      <span class="signal-key">LAN IP</span>
+      <span class="signal-val">{{ lan_ip }}</span>
+    </div>
+    <div class="signal-row">
+      <span class="signal-key">Hostname</span>
+      <span class="signal-val">{{ hostname }}</span>
+    </div>
+  </div>
+
+  <div>
+    <button class="option-btn" id="btn-wfo" onclick="pick('wfo')">
+      <i data-lucide="building-2"></i>
+      <div>
+        <div class="opt-title">In the office</div>
+        <div class="opt-sub">Connected via _SkyInternet + VPN</div>
+      </div>
+    </button>
+    <button class="option-btn" id="btn-wfh" onclick="pick('wfh')">
+      <i data-lucide="home"></i>
+      <div>
+        <div class="opt-title">Working from home</div>
+        <div class="opt-sub">Remote - VPN on</div>
+      </div>
+    </button>
+  </div>
+
+  <div class="notice warn">
+    <i data-lucide="triangle-alert"></i>
+    <span>Your selection is logged alongside network signals. Mismatches are flagged for review.</span>
+  </div>
+
+  <button class="btn" id="confirm-btn" onclick="confirm()"
+          style="opacity:0.4;pointer-events:none">
+    <i data-lucide="check"></i>
+    Confirm location
+  </button>
+</div>
+{% endblock %}
+
+{% block script %}
+<script>
+let chosen = null;
+
+function pick(v) {
+  chosen = v;
+  document.getElementById('btn-wfo').className =
+    'option-btn' + (v === 'wfo' ? ' selected-wfo' : '');
+  document.getElementById('btn-wfh').className =
+    'option-btn' + (v === 'wfh' ? ' selected-wfh' : '');
+  const btn = document.getElementById('confirm-btn');
+  btn.style.opacity = '1';
+  btn.style.pointerEvents = 'auto';
+}
+
+async function confirm() {
+  if (!chosen) return;
+  const btn = document.getElementById('confirm-btn');
+  btn.innerHTML = '<i data-lucide="loader"></i> Saving...';
+  lucide.createIcons();
+  try {
+    await fetch('/api/confirm', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ hostname: '{{ hostname }}', declared_status: chosen })
+    });
+    btn.innerHTML = chosen === 'wfo'
+      ? '<i data-lucide="building-2"></i> Logged as In Office'
+      : '<i data-lucide="home"></i> Logged as WFH';
+    btn.className = 'btn success';
+    lucide.createIcons();
+    setTimeout(() => window.close(), 1500);
+  } catch(e) {
+    btn.innerHTML = '<i data-lucide="x-circle"></i> Error - try again';
+    btn.style.opacity = '1';
+    btn.style.pointerEvents = 'auto';
+    lucide.createIcons();
+  }
+}
+</script>
+{% endblock %}

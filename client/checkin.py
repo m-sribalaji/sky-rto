@@ -1,0 +1,1203 @@
+#!/usr/bin/env python3
+"""
+checkin.py - RTO Tracker Client v3
+macOS + Windows | Triggered on screen unlock
+
+KEY BEHAVIOURS:
+  - Detects location on every unlock (no blind dedup)
+  - Re-checks if location signals changed since last check-in
+  - Queues check-ins locally when server unreachable, retries automatically
+  - Handles late-night -> next-day office transitions correctly
+  - Never misses a WFH day due to VPN being off
+
+Usage:
+  python3 checkin.py           # normal (called by launchd/scheduler)
+  python3 checkin.py --setup   # first-time registration
+  python3 checkin.py --force   # force re-check regardless of cache
+  python3 checkin.py --reset   # clear all caches + run fresh check-in
+  python3 checkin.py --retry   # retry any queued failed check-ins
+"""
+
+import sys, os, json, socket, platform, subprocess
+import argparse, logging, webbrowser, time, random
+from pathlib import Path
+from datetime import date, datetime
+
+# -- CONFIG ------------------------------------------------
+CONFIG_DIR   = Path.home() / ".rto_tracker"
+CONFIG_FILE  = CONFIG_DIR / "config.json"
+LOG_FILE     = CONFIG_DIR / "checkin.log"
+QUEUE_FILE   = CONFIG_DIR / "pending_queue.json"  # offline queue
+
+DEFAULT_CONFIG = {
+    "server_url":          "http://YOUR_SERVER_IP:8989",
+    "last_checkin_date":   None,
+    "last_status":         None,
+    "last_detected_class": None,  # last locally-classified status
+    "last_reg_attempt_ts":  None,
+}
+
+CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+logging.basicConfig(
+    filename=str(LOG_FILE), level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+)
+logger = logging.getLogger("rto_client")
+
+IS_MAC = platform.system() == "Darwin"
+IS_WIN = platform.system() == "Windows"
+
+# -- NOTIFIER (Teams + Desktop) ----------------------------
+try:
+    from notifier import (
+        notify,
+        notify_checkin_wfo, notify_checkin_wfh,
+        notify_vpn_ambiguous, notify_server_unreachable,
+        notify_missed_days, notify_queue_flushed,
+        notify_queue_saved, notify_registration_needed,
+        notify_registration_complete,
+        LEVEL_ALL, LEVEL_IMPORTANT, LEVEL_ERRORS,
+    )
+    NOTIFIER_AVAILABLE = True
+except ImportError:
+    NOTIFIER_AVAILABLE = False
+    LEVEL_ALL = LEVEL_IMPORTANT = LEVEL_ERRORS = "all"
+    def notify(*a, **kw): pass
+    def _desktop_notify(*a, **kw): pass  # stub so calls don't crash
+    def notify_registration_complete(*a, **kw): pass
+    logger.warning("[WARN] notifier.py not found - Teams notifications disabled")
+
+# VPN_TUNNEL_RANGES replaced by _VPN_TUNNEL_NETS CIDR check below
+
+# -- CONFIG HELPERS ----------------------------------------
+def load_config():
+    if CONFIG_FILE.exists():
+        try:
+            raw = CONFIG_FILE.read_bytes()
+            # Strip UTF-8 BOM if present (Windows PowerShell sometimes writes it)
+            if raw.startswith(b'\xef\xbb\xbf'):
+                raw = raw[3:]
+            data = json.loads(raw.decode('utf-8'))
+            return {**DEFAULT_CONFIG, **data}
+        except Exception:
+            pass
+    return DEFAULT_CONFIG.copy()
+
+def save_config(cfg):
+    with open(CONFIG_FILE, "w") as f:
+        json.dump(cfg, f, indent=2)
+
+def get_hostname():
+    return socket.gethostname().upper()
+
+def get_platform():
+    return "windows" if IS_WIN else "macos"
+
+# -- SIGNAL 1: LAN IP -------------------------------------
+def get_lan_ip():
+    """
+    Best-effort LAN IP detection on both macOS and Windows.
+    Falls back to a UDP route probe if interface parsing fails.
+    """
+    if IS_WIN:
+        try:
+            flags = subprocess.CREATE_NO_WINDOW if hasattr(subprocess, "CREATE_NO_WINDOW") else 0
+            out = subprocess.run(
+                ["ipconfig"], capture_output=True, text=True, timeout=5, creationflags=flags
+            ).stdout
+            for line in out.splitlines():
+                s = line.strip()
+                if "IPv4 Address" in s and ":" in s:
+                    ip = s.split(":")[-1].strip().rstrip("(Preferred)").strip()
+                    if ip and not _ip_in(ip, _VPN_TUNNEL_NETS):
+                        return ip
+        except Exception:
+            pass
+    else:
+        try:
+            for iface in ["en0", "en1", "en2", "en3"]:
+                r = subprocess.run(["ipconfig", "getifaddr", iface],
+                    capture_output=True, text=True, timeout=3)
+                if r.returncode == 0 and r.stdout.strip():
+                    ip = r.stdout.strip()
+                    if not _ip_in(ip, _VPN_TUNNEL_NETS):
+                        return ip
+        except Exception:
+            pass
+
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+        s.close()
+        if not _ip_in(ip, _VPN_TUNNEL_NETS):
+            return ip
+    except Exception:
+        pass
+    return None
+
+# -- SIGNAL 2: VPN TUNNEL ---------------------------------
+def get_vpn_tunnel_ip():
+    if IS_MAC:  return _vpn_macos()
+    if IS_WIN:  return _vpn_windows()
+    return None
+
+def _vpn_macos():
+    try:
+        out = subprocess.run(["ifconfig"], capture_output=True, text=True, timeout=5).stdout
+        current, ifaces = None, {}
+        for line in out.splitlines():
+            s = line.strip()
+            if s.startswith("utun") and "flags" in s:
+                current = s.split(":")[0]; ifaces[current] = None
+            if current and current in ifaces:
+                if s.startswith("inet ") and "-->" in s:
+                    ifaces[current] = s.split()[1]
+                elif s.startswith("inet ") and "netmask" in s:
+                    ifaces[current] = s.split()[1]
+        for ip in ifaces.values():
+            if ip and not ip.startswith("fe80") and not ip.startswith("127."):
+                return ip
+    except Exception:
+        pass
+    return None
+
+def _vpn_windows():
+    try:
+        flags = subprocess.CREATE_NO_WINDOW if hasattr(subprocess, "CREATE_NO_WINDOW") else 0
+        out = subprocess.run(["ipconfig"], capture_output=True, text=True,
+                             timeout=5, creationflags=flags).stdout
+
+        # Strategy 1: look for known VPN adapter name keywords
+        VPN_KEYWORDS = [
+            "Cisco AnyConnect", "AnyConnect", "Cisco Secure",
+            "Cisco VPN", "VPN Adapter", "Virtual Private",
+            "Tunnel Adapter", "PPP Adapter",
+        ]
+        in_vpn = False
+        current_ip = None
+        for line in out.splitlines():
+            stripped = line.strip()
+            # New adapter block starts with non-indented text ending in colon
+            if line and not line.startswith(" ") and not line.startswith("\t"):
+                # Check if this adapter name contains a VPN keyword
+                in_vpn = any(k.lower() in line.lower() for k in VPN_KEYWORDS)
+                current_ip = None
+            elif in_vpn and "IPv4 Address" in line and ":" in line:
+                ip = line.split(":")[-1].strip().rstrip("(Preferred)").strip()
+                if ip:
+                    current_ip = ip
+            elif in_vpn and stripped == "" and current_ip:
+                return current_ip  # end of VPN adapter block
+
+        if in_vpn and current_ip:
+            return current_ip
+
+        # Strategy 2: scan ALL interfaces for IPs in VPN tunnel ranges
+        # Catches VPN adapters with unusual names (e.g. "Local Area Connection 3")
+        import ipaddress as _ipa
+        VPN_NETS = [_ipa.ip_network(c, strict=False) for c in
+                    ["10.109.0.0/16", "10.23.0.0/16", "10.8.0.0/16"]]
+        current_block_ip = None
+        for line in out.splitlines():
+            if "IPv4 Address" in line and ":" in line:
+                ip_str = line.split(":")[-1].strip().rstrip("(Preferred)").strip()
+                try:
+                    addr = _ipa.ip_address(ip_str)
+                    if any(addr in net for net in VPN_NETS):
+                        return ip_str
+                except ValueError:
+                    pass
+    except Exception:
+        pass
+    return None
+
+# -- SIGNAL 3: DNS ----------------------------------------
+def get_dns_info():
+    if IS_MAC:  return _dns_macos()
+    if IS_WIN:  return _dns_windows()
+    return [], []
+
+def _dns_macos():
+    servers, domains = [], []
+    try:
+        out = subprocess.run(["scutil","--dns"],
+            capture_output=True, text=True, timeout=5).stdout
+        for line in out.splitlines():
+            line = line.strip()
+            if line.startswith("resolver #2"): break
+            if "nameserver[" in line and ":" in line:
+                ns = line.split(":")[-1].strip()
+                if ns and ns not in servers: servers.append(ns)
+            if "search domain[" in line and ":" in line:
+                d = line.split(":")[-1].strip()
+                if d and d not in domains: domains.append(d)
+    except Exception as e:
+        logger.warning(f"[WARN] DNS detect failed: {e}")
+    return servers, domains
+
+def _dns_windows():
+    servers, domains = [], []
+    try:
+        flags = subprocess.CREATE_NO_WINDOW if hasattr(subprocess, "CREATE_NO_WINDOW") else 0
+        out = subprocess.run(["ipconfig","/all"], capture_output=True, text=True,
+                             timeout=5, creationflags=flags).stdout
+        for line in out.splitlines():
+            s = line.strip()
+            if "DNS Servers" in s and ":" in s:
+                ip = s.split(":")[-1].strip()
+                if ip and ip not in servers: servers.append(ip)
+            elif "Connection-specific DNS Suffix" in s and ":" in s:
+                d = s.split(":")[-1].strip()
+                if d and d not in domains: domains.append(d)
+    except Exception as e:
+        logger.warning(f"[WARN] DNS detect failed: {e}")
+    return servers, domains
+
+# -- SIGNAL 4: ETHERNET -----------------------------------
+def get_is_ethernet():
+    if IS_MAC:  return _eth_macos()
+    if IS_WIN:  return _eth_windows()
+    return False
+
+def _eth_macos():
+    try:
+        for iface in ["en1","en2","en3","eth0"]:
+            r = subprocess.run(["ipconfig","getifaddr",iface],
+                capture_output=True, text=True, timeout=3)
+            if r.returncode == 0 and r.stdout.strip():
+                ip = r.stdout.strip()
+                if not _ip_in(ip, _VPN_TUNNEL_NETS):
+                    return True
+    except Exception:
+        pass
+    return False
+
+def _eth_windows():
+    try:
+        flags = subprocess.CREATE_NO_WINDOW if hasattr(subprocess, "CREATE_NO_WINDOW") else 0
+        out = subprocess.run(["netsh","interface","show","interface"],
+            capture_output=True, text=True, timeout=5, creationflags=flags).stdout
+        for line in out.splitlines():
+            if "Connected" in line and ("Ethernet" in line or "Local Area" in line):
+                return True
+    except Exception:
+        pass
+    return False
+
+# -- LOCAL CLASSIFIER -------------------------------------
+# Classifies location purely from local signals WITHOUT server.
+# Used to:
+#   1. Detect location changes (to bypass dedup)
+#   2. Queue offline check-ins when server is unreachable
+# -- NETWORK CONSTANTS (mirrors server config.py) ---------
+# Uses stdlib ipaddress - no pip dependencies required.
+import ipaddress as _ipaddress
+
+def _nets(cidrs):
+    nets = []
+    for c in cidrs:
+        try: nets.append(_ipaddress.ip_network(c, strict=False))
+        except ValueError: pass
+    return nets
+
+def _ip_in(ip, nets):
+    if not ip: return False
+    try:
+        addr = _ipaddress.ip_address(ip.strip().split("%")[0])
+        return any(addr in n for n in nets)
+    except ValueError: return False
+
+# Office network
+_OFFICE_LAN_NETS = _nets(["10.126.0.0/16"])
+_OFFICE_DNS_NETS = _nets(["10.126.63.0/24", "10.5.0.0/16", "10.20.0.0/16"])
+_OFFICE_DNS_DOMS = ("bskyb.com", "sssl.bskyb.com")
+
+# VPN tunnel ranges (IPs assigned to the client by Sky VPN)
+_VPN_TUNNEL_NETS = _nets(["10.109.0.0/16", "10.23.0.0/16", "10.8.0.0/16"])
+
+# Home / remote LAN ranges
+_HOME_LAN_NETS   = _nets(["192.168.0.0/16", "172.16.0.0/12"])
+
+# All RFC-1918 private ranges (used to catch 10.x home ISP routers)
+_ALL_PRIVATE     = _nets(["10.0.0.0/8", "172.16.0.0/12",
+                           "192.168.0.0/16", "100.64.0.0/10"])
+
+def _classify_lan(lan_ip):
+    """Classify a LAN IP. Returns: 'office'|'home'|'vpn_tunnel'|'private_unknown'|'unknown'"""
+    if not lan_ip: return "unknown"
+    if _ip_in(lan_ip, _OFFICE_LAN_NETS):  return "office"
+    if _ip_in(lan_ip, _VPN_TUNNEL_NETS):  return "vpn_tunnel"
+    if _ip_in(lan_ip, _HOME_LAN_NETS):    return "home"
+    if _ip_in(lan_ip, _ALL_PRIVATE):      return "private_unknown"
+    return "unknown"
+
+def _dns_is_office(dns_servers, dns_domains):
+    for s in (dns_servers or []):
+        if _ip_in(s, _OFFICE_DNS_NETS): return True
+    for d in (dns_domains or []):
+        if any(d.lower().endswith(od) for od in _OFFICE_DNS_DOMS): return True
+    return False
+
+def classify_locally(lan_ip, vpn_tunnel_ip, dns_servers, dns_domains, is_ethernet):
+    """
+    Local classification - no server needed. Mirrors server detection.py.
+    Returns: 'wfo' | 'wfh' | 'vpn_ambiguous' | 'unknown'
+    """
+    vpn_active             = bool(vpn_tunnel_ip)
+    lan_class              = _classify_lan(lan_ip)
+    dns_office             = _dns_is_office(dns_servers, dns_domains)
+    lan_is_office          = (lan_class == "office")
+    lan_is_home            = (lan_class == "home")
+    lan_is_private_unknown = (lan_class == "private_unknown")
+
+    # 1. Office LAN - definitive
+    if lan_is_office: return "wfo"
+
+    # 2. Office DNS — home LAN means DNS is VPN-routed regardless of tunnel detection
+    if dns_office:
+        if lan_is_home or lan_is_private_unknown: return "wfh"
+        return "wfo"
+
+    # 3. VPN active
+    if vpn_active:
+        if lan_is_office or dns_office:  return "wfo"
+        if lan_is_home:                  return "wfh"
+        if lan_is_private_unknown:       return "wfh"   # 10.x home ISP
+        return "vpn_ambiguous"
+
+    # 4. Ethernet + not home
+    if is_ethernet and not lan_is_home and not lan_is_private_unknown:
+        return "wfo"
+
+    # 5. Home LAN
+    if lan_is_home:            return "wfh"
+
+    # 6. Private unknown 10.x (home ISP), no VPN
+    if lan_is_private_unknown: return "wfh"
+
+    # 7. No signals - unknown (caller decides whether to queue)
+    return "unknown"
+
+# -- OFFLINE QUEUE ----------------------------------------
+def queue_checkin(payload: dict):
+    """
+    Save a check-in payload locally when server is unreachable.
+    Will be retried next time server is reachable.
+    Weekend dates are never queued - no point syncing them.
+    """
+    from datetime import datetime as _dt
+    date_str = payload.get("date", "")
+    try:
+        if _dt.strptime(date_str, "%Y-%m-%d").weekday() >= 5:
+            logger.info(f"Weekend date {date_str} - not queuing")
+            return
+    except Exception:
+        pass
+
+    queue = []
+    if QUEUE_FILE.exists():
+        try:
+            queue = json.loads(QUEUE_FILE.read_text())
+        except Exception:
+            queue = []
+
+    # Avoid duplicate dates in queue - replace existing entry for same date
+    queue = [q for q in queue if q.get("date") != payload.get("date")]
+    payload["queued_at"] = datetime.utcnow().isoformat() + "Z"  # explicit UTC
+    queue.append(payload)
+    QUEUE_FILE.write_text(json.dumps(queue, indent=2))
+    logger.info(f"Queued check-in for {payload.get('date')} (server unreachable)")
+
+def flush_queue(server: str) -> int:
+    """
+    Retry all queued check-ins. Returns count of successfully synced records.
+    Called automatically whenever server is reachable.
+    """
+    if not QUEUE_FILE.exists():
+        return 0
+
+    try:
+        queue = json.loads(QUEUE_FILE.read_text())
+    except Exception:
+        return 0
+
+    if not queue:
+        return 0
+
+    synced   = []
+    failed   = []
+    hostname = get_hostname()
+
+    from datetime import datetime as _dt
+    for payload in queue:
+        # Never sync weekend dates - skip and treat as synced (remove from queue)
+        date_str = payload.get("date", "")
+        try:
+            if _dt.strptime(date_str, "%Y-%m-%d").weekday() >= 5:
+                logger.info(f"Skipping weekend queued entry: {date_str}")
+                synced.append(payload)
+                continue
+        except Exception:
+            pass
+        # Skip if already handled (server has a record for this date)
+        resp = api_post(f"{server}/api/checkin", payload)
+        if resp and resp.get("action") in ("ok", "already_checked_in", "confirm_needed", "override_locked", "leave_recorded"):
+            synced.append(payload)
+            logger.info(f"Flushed queued check-in: {payload.get('date')} -> {resp.get('action')}")
+        else:
+            failed.append(payload)
+            logger.warning(f"[WARN] Failed to flush: {payload.get('date')}")
+
+    # Save only the ones that failed
+    if failed:
+        QUEUE_FILE.write_text(json.dumps(failed, indent=2))
+    else:
+        QUEUE_FILE.unlink(missing_ok=True)
+
+    if synced:
+        logger.info(f"Flushed {len(synced)} queued check-in(s) to server")
+
+    return len(synced)
+
+# -- API HELPERS -------------------------------------------
+def api_post(url, payload, timeout=10):
+    try:
+        import urllib.request
+        data = json.dumps(payload).encode()
+        req  = urllib.request.Request(url, data=data,
+                   headers={"Content-Type":"application/json"}, method="POST")
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.loads(r.read().decode())
+    except Exception as e:
+        logger.error(f"[FAIL] POST {url} failed: {e}")
+        return None
+
+def api_get(url, timeout=10):
+    try:
+        import urllib.request
+        with urllib.request.urlopen(url, timeout=timeout) as r:
+            return json.loads(r.read().decode())
+    except Exception as e:
+        logger.error(f"[FAIL] GET {url} failed: {e}")
+        return None
+
+def _get_notify_cfg(cfg: dict) -> tuple:
+    """Return (webhook_url, notify_level, server_url) from config."""
+    return (
+        cfg.get("teams_webhook") or None,
+        cfg.get("teams_notify_level", LEVEL_ALL) if NOTIFIER_AVAILABLE else LEVEL_ALL,
+        cfg.get("server_url", ""),
+    )
+
+def server_reachable(server: str) -> bool:
+    return bool(api_get(f"{server}/health", timeout=5))
+
+def open_browser(url):
+    """Open browser - uses platform-appropriate method.
+    On Windows hidden processes, webbrowser.open() silently fails.
+    Using 'start' command via cmd.exe works reliably without admin.
+    """
+    try:
+        if IS_WIN:
+            # cmd /c start works from any process context including hidden ones
+            flags = subprocess.CREATE_NO_WINDOW if hasattr(subprocess, "CREATE_NO_WINDOW") else 0
+            subprocess.Popen(
+                ["cmd", "/c", "start", "", url],
+                creationflags=flags,
+                shell=False,
+            )
+            logger.info(f"Browser opened via cmd start: {url}")
+        else:
+            webbrowser.open(url)
+            logger.info(f"Browser opened: {url}")
+    except Exception as e:
+        logger.error(f"[FAIL] Browser failed: {e}")
+        # Last resort fallback
+        try:
+            webbrowser.open(url)
+        except Exception:
+            pass
+
+def _desktop_notify(title, message):
+    try:
+        if IS_MAC:
+            subprocess.run(["osascript","-e",
+                f'display notification "{message}" with title "{title}"'],
+                timeout=5, capture_output=True)
+        elif IS_WIN:
+            ps = (f'Add-Type -AssemblyName System.Windows.Forms;'
+                  f'$n=New-Object System.Windows.Forms.NotifyIcon;'
+                  f'$n.Icon=[System.Drawing.SystemIcons]::Information;'
+                  f'$n.Visible=$true;$n.ShowBalloonTip(5000,"{title}","{message}",'
+                  f'[System.Windows.Forms.ToolTipIcon]::Info)')
+            flags = subprocess.CREATE_NO_WINDOW if hasattr(subprocess,"CREATE_NO_WINDOW") else 0
+            subprocess.run(["powershell","-WindowStyle","Hidden","-Command",ps],
+                           timeout=10, capture_output=True, creationflags=flags)
+    except Exception as e:
+        logger.warning(f"[WARN] Notification failed: {e}")
+
+# -- LOCATION CHANGE DETECTION -----------------------------
+def location_changed(cfg: dict, current_class: str) -> bool:
+    """
+    Returns True if the current local classification differs
+    significantly from what was last checked in.
+
+    This allows mid-day location changes (home->office, office->home)
+    to be re-detected and re-reported without manual intervention.
+
+    Rules:
+      WFH -> WFO : always re-check (went to office)
+      WFO -> WFH : always re-check (left office)
+      unknown   : re-check if last status was definitive
+      same      : skip (dedup)
+    """
+    last_status = cfg.get("last_status")
+    last_class  = cfg.get("last_detected_class")
+    today       = date.today().isoformat()
+
+    # Different day -> always re-check (new day, fresh start)
+    if cfg.get("last_checkin_date") != today:
+        return True
+
+    # No previous record -> always check
+    if not last_status:
+        return True
+
+    # VPN ambiguous -> always re-check (signals may have resolved)
+    if current_class == "vpn_ambiguous":
+        return False  # don't spam; wait for user action
+
+    # Definitive location change detected
+    if last_status == "wfh" and current_class == "wfo":
+        logger.info("Location change: WFH -> WFO detected")
+        return True
+
+    if last_status == "wfo" and current_class == "wfh":
+        logger.info("Location change: WFO -> WFH detected")
+        return True
+
+    # Unknown -> try again if last was definitive (might have resolved)
+    if current_class == "unknown" and last_status in ("wfo","wfh"):
+        return False  # don't downgrade a good status with unknown
+
+    return False
+
+# -- MISSED DAY DETECTION ---------------------------------
+MISSED_DAY_FILE = CONFIG_DIR / ".last_missed_check"
+
+def check_missed_yesterday(server: str, hostname: str, cfg: dict, today: str):
+    """
+    On first unlock of each day, check the last N weekdays for missing records.
+    Shows one popup at a time (oldest first) - user resolves each day sequentially.
+    Only runs once per day maximum (tracked via .last_missed_check file).
+    Max lookback: 7 calendar days (catches a full work week of gaps).
+    """
+    from datetime import datetime, timedelta
+
+    # Only run once per day
+    try:
+        last_checked = MISSED_DAY_FILE.read_text().strip() if MISSED_DAY_FILE.exists() else ""
+        if last_checked == today:
+            return   # already checked today
+    except Exception:
+        pass
+
+    # Mark as checked for today immediately (prevents re-triggering)
+    try:
+        MISSED_DAY_FILE.write_text(today)
+    except Exception:
+        pass
+
+    if not server_reachable(server):
+        return
+
+    device = api_get(f"{server}/api/device/{hostname}")
+    if not device or not device.get("registered"):
+        return
+
+    emp_id = device.get("employee_id", "")
+
+    # Get public holidays to skip
+    ph_dates = set()
+    ph_data = api_get(f"{server}/api/holidays?year={today[:4]}")
+    if ph_data:
+        ph_dates = {h["date"] for h in ph_data.get("holidays", [])}
+
+    # Build list of weekdays to check (last 7 calendar days, oldest first)
+    days_to_check = []
+    for i in range(7, 0, -1):   # 7 days back -> yesterday
+        dt = datetime.now() - timedelta(days=i)
+        if dt.weekday() >= 5:   # skip weekends
+            continue
+        ds = dt.strftime("%Y-%m-%d")
+        if ds in ph_dates:      # skip public holidays
+            continue
+        if ds >= today:         # don't check today or future
+            continue
+        days_to_check.append(ds)
+
+    if not days_to_check:
+        return
+
+    # Fetch history for the relevant month(s) - deduplicate month queries
+    months_needed = list(dict.fromkeys(d[:7] for d in days_to_check))
+    records_by_date = {}
+    for month in months_needed:
+        history = api_get(f"{server}/api/history/{emp_id}?month={month}")
+        if history:
+            for r in history.get("records", []):
+                records_by_date[r["date"]] = r
+
+    # Find first missing day (oldest first) - prompt one at a time
+    # User resolves it, next unlock catches the next missing day
+    for yesterday in days_to_check:
+        if yesterday in records_by_date:
+            logger.info(f"Missed day check: {yesterday} has record ({records_by_date[yesterday].get('status')}) - ok")
+            continue
+
+    logger.info(f"Missed day check: {yesterday} has no record - adding to bulk list")
+
+    # -- All missing days collected - now handle as a batch ------
+    # (Loop continues collecting, we open ONE page for all missing days)
+
+    # Collect all genuinely missing days (not auto-resolved from queue)
+    missing_to_prompt = []
+
+    for yesterday in days_to_check:
+        if yesterday in records_by_date:
+            continue
+
+        # Try auto-flush from offline queue first
+        cached_payload = None
+        try:
+            if QUEUE_FILE.exists():
+                queue_data = json.loads(QUEUE_FILE.read_text())
+                cached_payload = next(
+                    (q for q in queue_data if q.get("date") == yesterday), None
+                )
+        except Exception:
+            pass
+
+        if cached_payload:
+            local_class = classify_locally(
+                cached_payload.get("lan_ip"),
+                cached_payload.get("vpn_tunnel_ip"),
+                cached_payload.get("dns_servers", []),
+                cached_payload.get("dns_domains", []),
+                cached_payload.get("is_ethernet", False),
+            )
+            if server_reachable(server):
+                resp = api_post(f"{server}/api/checkin", cached_payload)
+                if resp and resp.get("action") in ("ok", "already_checked_in"):
+                    logger.info(f"Soft miss auto-resolved: {yesterday} flushed")
+                    try:
+                        queue_data = json.loads(QUEUE_FILE.read_text())
+                        queue_data = [q for q in queue_data if q.get("date") != yesterday]
+                        if queue_data:
+                            QUEUE_FILE.write_text(json.dumps(queue_data, indent=2))
+                        else:
+                            QUEUE_FILE.unlink(missing_ok=True)
+                    except Exception:
+                        pass
+                    continue   # auto-resolved - skip this day
+            # Couldn't flush - add to prompt with hint
+            missing_to_prompt.append({
+                "date":         yesterday,
+                "cached_class": local_class,
+                "cached_lan":   cached_payload.get("lan_ip", ""),
+            })
+        else:
+            missing_to_prompt.append({
+                "date":         yesterday,
+                "cached_class": "",
+                "cached_lan":   "",
+            })
+
+        if not missing_to_prompt:
+            logger.info("Missed day check: all days auto-resolved from queue")
+            return
+
+        # -- Open ONE bulk page for all missing days --------------
+        dates_str = ",".join(d["date"] for d in missing_to_prompt)
+        missed_url = f"{server}/missed/{hostname}?dates={dates_str}"
+
+        # Append cached signal hints as query params
+        for d in missing_to_prompt:
+            if d["cached_class"]:
+                missed_url += f"&class_{d['date']}={d['cached_class']}"
+            if d["cached_lan"]:
+                missed_url += f"&lan_{d['date']}={d['cached_lan']}"
+
+        n = len(missing_to_prompt)
+        if n == 1:
+            _desktop_notify("RTO Tracker",
+                   f"No record for {missing_to_prompt[0]['date']}. Please fill in your attendance.")
+        else:
+            _desktop_notify("RTO Tracker",
+                   f"{n} days with no attendance record. Please fill them in.")
+
+        logger.info(f"Opening bulk missed page for {n} day(s): {dates_str}")
+        open_browser(missed_url)
+        if NOTIFIER_AVAILABLE:
+            wh, lvl, _ = _get_notify_cfg(cfg)
+            notify_missed_days(cfg.get("employee_name", hostname),
+                               [d["date"] for d in missing_to_prompt],
+                               missed_url, webhook=wh, level=lvl)
+
+
+# -- LOCK FILE --------------------------------------------
+LOCK_FILE = CONFIG_DIR / ".checkin.lock"
+
+def acquire_lock():
+    """
+    Prevent concurrent checkin.py runs (installer + watcher racing).
+
+    Returns:
+        open lock file handle if acquired, otherwise None
+    """
+    LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
+    lock_fd = None
+
+    try:
+        lock_fd = open(LOCK_FILE, "a+")
+
+        # Write PID for easier debugging
+        lock_fd.seek(0)
+        lock_fd.truncate()
+        lock_fd.write(str(os.getpid()))
+        lock_fd.flush()
+
+        if os.name == "nt":
+            import msvcrt
+            lock_fd.seek(0)
+            msvcrt.locking(lock_fd.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(lock_fd.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+        return lock_fd
+
+    except (IOError, OSError, BlockingIOError):
+        try:
+            if lock_fd:
+                lock_fd.close()
+        except Exception:
+            pass
+        return None
+    except Exception:
+        try:
+            if lock_fd:
+                lock_fd.close()
+        except Exception:
+            pass
+        return None
+
+def release_lock(lock_fd):
+    """Release inter-process lock safely on all supported platforms."""
+    if not lock_fd:
+        return
+
+    try:
+        if os.name == "nt":
+            import msvcrt
+            try:
+                lock_fd.seek(0)
+                msvcrt.locking(lock_fd.fileno(), msvcrt.LK_UNLCK, 1)
+            except Exception:
+                pass
+        else:
+            import fcntl
+            try:
+                fcntl.flock(lock_fd.fileno(), fcntl.LOCK_UN)
+            except Exception:
+                pass
+    except Exception:
+        pass
+    finally:
+        try:
+            lock_fd.close()
+        except Exception:
+            pass
+        try:
+            LOCK_FILE.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+# -- MAIN CHECK-IN -----------------------------------------
+def run_checkin(force=False):
+    cfg      = load_config()
+    hostname = get_hostname()
+    server   = cfg["server_url"].rstrip("/")
+    today    = date.today().isoformat()
+
+    logger.info(f"Check-in triggered | {hostname} | {today} | force={force}")
+
+    # Prevent concurrent runs (e.g. installer + watcher firing simultaneously)
+    lock = acquire_lock()
+    if not lock:
+        logger.info("Another checkin.py is running - skipping to avoid duplicate")
+        return
+
+    try:
+        # -- Collect local signals first (always, no network needed) --
+        lan_ip               = get_lan_ip()
+        vpn_tun              = get_vpn_tunnel_ip()
+        dns_servers, dns_dom = get_dns_info()
+        ethernet             = get_is_ethernet()
+
+        # Classify locally - used for change detection and offline queuing
+        local_class = classify_locally(lan_ip, vpn_tun, dns_servers, dns_dom, ethernet)
+
+        logger.info(
+            f"Local signals: lan={lan_ip} vpn={vpn_tun} "
+            f"dns={dns_servers} domains={dns_dom} eth={ethernet} "
+            f"-> local_class={local_class}"
+        )
+
+        # -- Dedup check - skip ONLY if same location, same day, no force --
+        # This is the KEY fix: bypass dedup if location changed
+        changed = location_changed(cfg, local_class)
+        if not force and not changed:
+            # Still flush any pending offline queue even if location hasn't changed
+            # (VPN just reconnected — server now reachable even though status is same)
+            if QUEUE_FILE.exists():
+                if server_reachable(server):
+                    flushed = flush_queue(server)
+                    if flushed > 0:
+                        logger.info(f"Flushed {flushed} queued offline record(s)")
+                        if NOTIFIER_AVAILABLE:
+                            wh, lvl, srv = _get_notify_cfg(cfg)
+                            notify_queue_flushed(
+                                cfg.get("employee_name", hostname),
+                                flushed, webhook=wh, level=lvl, server_url=srv)
+            logger.info(f"Same location ({local_class}), same day - skipping")
+            return
+
+        # -- Build check-in payload ------------------------------------
+        payload = {
+            "hostname":      hostname,
+            "lan_ip":        lan_ip,
+            "vpn_tunnel_ip": vpn_tun,
+            "ssid":          None,
+            "is_ethernet":   ethernet,
+            "dns_servers":   dns_servers,
+            "dns_domains":   dns_dom,
+            "platform":      get_platform(),
+            "date":          today,           # for offline queue
+        }
+
+        # -- Server reachable? -----------------------------------------
+        if not server_reachable(server):
+            logger.warning(f"[WARN] Server unreachable at {server}")
+
+            # -- OFFLINE HANDLING --------------------------------------
+            if local_class in ("wfo", "wfh"):
+                queue_checkin(payload)
+                logger.info(f"Queued {local_class} check-in for later sync")
+                cfg["last_checkin_date"]   = today
+                cfg["last_status"]         = local_class
+                cfg["last_detected_class"] = local_class
+                save_config(cfg)
+                if NOTIFIER_AVAILABLE:
+                    wh, lvl, _ = _get_notify_cfg(cfg)
+                    notify_queue_saved(cfg.get("employee_name", hostname),
+                                       local_class, webhook=wh, level=lvl)
+                    notify_server_unreachable(server, webhook=wh, level=lvl)
+                else:
+                    _desktop_notify("RTO Tracker",
+                           f"Server offline - {local_class.upper()} logged locally. "
+                           f"Will sync when VPN connected.")
+            else:
+                _desktop_notify("RTO Tracker",
+                       "Server unreachable. Connect Sky VPN for attendance tracking.")
+            return
+
+        # -- Server reachable - flush any queued records first ---------
+        flushed = flush_queue(server)
+        if flushed > 0:
+            logger.info(f"Flushed {flushed} offline record(s) to server")
+            if NOTIFIER_AVAILABLE:
+                wh, lvl, srv = _get_notify_cfg(cfg)
+                notify_queue_flushed(cfg.get("employee_name", hostname),
+                                     flushed, webhook=wh, level=lvl, server_url=srv)
+        # -- Registered? -----------------------------------------------
+        device = api_get(f"{server}/api/device/{hostname}")
+        if not device or not device.get("registered"):
+            logger.info("Not registered - opening registration page")
+
+            # Track when we last opened the browser to avoid duplicate tabs
+            # Only open browser once per hour max (not once per day)
+            import time as _time
+            last_reg_ts  = cfg.get("last_reg_attempt_ts") or 0
+            now_ts       = _time.time()
+            hour_elapsed = (now_ts - float(last_reg_ts)) > 3600  # 1 hour
+
+            if hour_elapsed:
+                reg_url = f"{server}/register/{hostname}"
+                if NOTIFIER_AVAILABLE:
+                    wh, lvl, _ = _get_notify_cfg(cfg)
+                    notify_registration_needed(hostname, reg_url,
+                                               webhook=wh, level=lvl)
+                else:
+                    _desktop_notify("RTO Tracker", "Please register your device for attendance tracking.")
+                open_browser(reg_url)
+                cfg["last_reg_attempt_ts"] = now_ts
+                save_config(cfg)
+                logger.info("Opened registration browser")
+            else:
+                logger.info("Registration browser opened recently - waiting for user to complete")
+
+            # Poll for up to 3 minutes waiting for user to complete registration
+            # This means the VERY NEXT unlock after registering will auto check-in
+            logger.info("Waiting up to 3 minutes for registration to complete...")
+            for attempt in range(36):   # 36 x 5s = 3 minutes
+                _time.sleep(5)
+                check = api_get(f"{server}/api/device/{hostname}")
+                if check and check.get("registered"):
+                    emp_name = check.get("employee_name", hostname)
+                    logger.info(f"Registration completed as: {emp_name}")
+                    # Clear reg attempt tracking
+                    cfg.pop("last_reg_attempt_ts", None)
+                    cfg.pop("last_reg_attempt_date", None)
+                    cfg["employee_name"] = emp_name
+                    save_config(cfg)
+                    # -- Welcome notification ----------------------
+                    if NOTIFIER_AVAILABLE:
+                        wh, lvl, srv = _get_notify_cfg(cfg)
+                        notify_registration_complete(
+                            emp_name, hostname,
+                            check.get("team", ""),
+                            srv, webhook=wh, level=lvl,
+                        )
+                    else:
+                        _desktop_notify("RTO Tracker", f"Welcome, {emp_name}! Device registered successfully.")
+                    # Fall through to check-in below
+                    device = check
+                    break
+            else:
+                # Still not registered after 3 minutes - give up for now
+                logger.info("Registration not completed in 3 minutes - will retry on next unlock")
+                return
+
+        # If we reach here, device is registered (either was already, or just completed)
+
+        # -- Weekend skip - attendance only, registration always runs above --
+        from datetime import datetime as _dt
+        if _dt.strptime(today, "%Y-%m-%d").weekday() >= 5:
+            logger.info(f"Weekend ({today}) - skipping attendance check-in")
+            release_lock(lock)
+            return
+
+        # -- POST check-in to server -----------------------------------
+        response = api_post(f"{server}/api/checkin", payload)
+
+        if not response:
+            logger.error("[FAIL] Check-in POST failed - queuing for retry")
+            if local_class in ("wfo", "wfh"):
+                queue_checkin(payload)
+            return
+
+        action = response.get("action")
+        logger.info(f"Server: action={action} detail={response.get('detail','')}")
+
+        if action == "ok":
+            status     = response.get("status")
+            confidence = response.get("confidence", "")
+            logger.info(f"[OK] Checked in: {status} (conf: {confidence})")
+            cfg["last_checkin_date"]   = today
+            cfg["last_status"]         = status
+            cfg["last_detected_class"] = local_class
+            # Save employee_name from server if not already in config
+            if not cfg.get("employee_name"):
+                dev_check = api_get(f"{server}/api/device/{hostname}")
+                if dev_check and dev_check.get("employee_name"):
+                    cfg["employee_name"] = dev_check["employee_name"]
+            save_config(cfg)
+            if NOTIFIER_AVAILABLE:
+                wh, lvl, srv = _get_notify_cfg(cfg)
+                emp_name = cfg.get("employee_name") or hostname
+                if status == "wfo":
+                    notify_checkin_wfo(emp_name, lan_ip, confidence,
+                                       webhook=wh, level=lvl, server_url=srv)
+                elif status == "wfh":
+                    notify_checkin_wfh(emp_name, lan_ip, confidence,
+                                       vpn=bool(vpn_tun),
+                                       webhook=wh, level=lvl, server_url=srv)
+
+        elif action == "already_checked_in":
+            existing_status = response.get("status")
+            # If server has a status but local signals strongly disagree -> force update
+            if local_class in ("wfo", "wfh") and existing_status != local_class and force:
+                logger.info(
+                    f"Server has {existing_status} but local signals say {local_class} "
+                    f"- forcing update via override"
+                )
+                # Re-POST with force flag for server to re-evaluate
+                force_payload = {**payload, "force_update": True}
+                resp2 = api_post(f"{server}/api/checkin", force_payload)
+                if resp2 and resp2.get("action") == "ok":
+                    status = resp2.get("status")
+                    logger.info(f"[OK] Status updated: {status}")
+                    cfg["last_checkin_date"]   = today
+                    cfg["last_status"]         = status
+                    cfg["last_detected_class"] = local_class
+                    save_config(cfg)
+                    return
+            logger.info(f"Already checked in today: {existing_status}")
+            cfg["last_checkin_date"]   = today
+            cfg["last_status"]         = existing_status
+            cfg["last_detected_class"] = local_class
+            save_config(cfg)
+
+        elif action == "confirm_needed":
+            logger.info("VPN ambiguous - opening confirmation page")
+            open_browser(f"{server}/confirm/{hostname}")
+
+        elif action == "register_first":
+            open_browser(f"{server}/register/{hostname}")
+
+        elif action == "override_locked":
+            locked_status = response.get("status", "unknown")
+            logger.info(f"Day is manager-locked as {locked_status} - check-in skipped")
+            cfg["last_checkin_date"]   = today
+            cfg["last_status"]         = locked_status
+            save_config(cfg)
+
+        elif action == "leave_recorded":
+            logger.info("Leave recorded for today - check-in skipped")
+            cfg["last_checkin_date"]   = today
+            cfg["last_status"]         = "leave"
+            save_config(cfg)
+
+        else:
+            logger.warning(f"[WARN] Unknown action: {action}")
+
+    finally:
+        release_lock(lock)
+
+# -- SETUP -------------------------------------------------
+def run_setup():
+    cfg      = load_config()
+    hostname = get_hostname()
+    server   = cfg["server_url"].rstrip("/")
+
+    print(f"\n{'='*52}")
+    print(f"  RTO Tracker - First Time Setup")
+    print(f"{'='*52}")
+    print(f"  Hostname : {hostname}")
+    print(f"  Platform : {get_platform()}")
+    print(f"  Server   : {server}")
+    print(f"{'='*52}\n")
+
+    lan_ip               = get_lan_ip()
+    vpn_tun              = get_vpn_tunnel_ip()
+    dns_servers, dns_dom = get_dns_info()
+    ethernet             = get_is_ethernet()
+    local_class          = classify_locally(lan_ip, vpn_tun, dns_servers, dns_dom, ethernet)
+
+    print(f"  Local signals detected:")
+    print(f"    LAN IP      : {lan_ip or 'Not detected'}")
+    print(f"    VPN tunnel  : {vpn_tun or 'Not active'}")
+    print(f"    DNS servers : {', '.join(dns_servers) if dns_servers else 'Not detected'}")
+    print(f"    DNS domains : {', '.join(dns_dom) if dns_dom else 'Not detected'}")
+    print(f"    Ethernet    : {'Yes' if ethernet else 'No'}")
+    print(f"    Classification: {local_class.upper()}")
+    print()
+
+    if not server_reachable(server):
+        print(f"  [FAIL] Cannot reach server at {server}")
+        print(f"    Update server_url in {CONFIG_FILE} and retry.\n")
+        sys.exit(1)
+
+    print(f"  [OK] Server reachable")
+    device = api_get(f"{server}/api/device/{hostname}")
+    if device and device.get("registered"):
+        print(f"  [OK] Already registered: {device['employee_name']} ({device['employee_id']})")
+        save_config(cfg)
+        return
+
+    reg_url = f"{server}/register/{hostname}"
+    print(f"  Opening registration page...")
+    open_browser(reg_url)
+    print(f"  Complete registration in your browser.")
+    print(f"\n  If browser didn't open: {reg_url}\n")
+
+# -- RESET -------------------------------------------------
+def run_reset():
+    """Clear ALL local caches then run a fresh check-in."""
+    cleared = []
+    watcher_run = CONFIG_DIR / ".last_watcher_run"
+    if watcher_run.exists():
+        watcher_run.unlink(); cleared.append(".last_watcher_run")
+
+    cfg = load_config()
+    cfg["last_checkin_date"]   = None
+    cfg["last_status"]         = None
+    cfg["last_detected_class"] = None
+    cfg.pop("last_reg_attempt_ts", None)
+    cfg.pop("last_reg_attempt_date", None)
+    save_config(cfg)
+    cleared.append("config.json cache")
+
+    print(f"\n  [OK] Reset complete - cleared: {', '.join(cleared)}")
+    print(f"  Running fresh check-in...\n")
+
+# -- RETRY QUEUE -------------------------------------------
+def run_retry():
+    """Manually retry all queued offline check-ins."""
+    cfg    = load_config()
+    server = cfg["server_url"].rstrip("/")
+
+    if not QUEUE_FILE.exists():
+        print("  No queued check-ins to retry.")
+        return
+
+    try:
+        queue = json.loads(QUEUE_FILE.read_text())
+    except Exception:
+        print("  [FAIL] Queue file unreadable."); return
+
+    if not queue:
+        print("  Queue is empty."); return
+
+    print(f"\n  Found {len(queue)} queued check-in(s):")
+    for q in queue:
+        print(f"    {q.get('date')} - locally classified as "
+              f"{classify_locally(q.get('lan_ip'), q.get('vpn_tunnel_ip'), q.get('dns_servers',[]), q.get('dns_domains',[]), q.get('is_ethernet',False))}")
+
+    if not server_reachable(server):
+        print(f"\n    [WARN] Server unreachable at {server}")
+        print(f"  Connect VPN and try again.\n")
+        return
+
+    flushed = flush_queue(server)
+    print(f"\n    [OK] Synced {flushed} record(s) to server.")
+    remaining = json.loads(QUEUE_FILE.read_text()) if QUEUE_FILE.exists() else []
+    if remaining:
+        print(f"    [FAIL] {len(remaining)} record(s) still failed - check logs.")
+    print()
+
+# -- ENTRY -------------------------------------------------
+def main():
+    parser = argparse.ArgumentParser(description="RTO Tracker client v3")
+    parser.add_argument("--setup",  action="store_true", help="First-time registration")
+    parser.add_argument("--force",  action="store_true", help="Force check-in now")
+    parser.add_argument("--reset",  action="store_true", help="Clear caches + fresh check-in")
+    parser.add_argument("--retry",  action="store_true", help="Retry queued offline check-ins")
+    args = parser.parse_args()
+
+    if args.setup:
+        run_setup()
+    elif args.reset:
+        run_reset()
+        run_checkin(force=True)
+    elif args.retry:
+        run_retry()
+    else:
+        if not args.force:
+            time.sleep(random.randint(2, 15))  # reduced jitter for responsiveness
+        run_checkin(force=args.force)
+
+if __name__ == "__main__":
+    main()

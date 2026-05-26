@@ -1,0 +1,12 @@
+launchctl unload ~/Library/LaunchAgents/com.sky.rto.plist
+rm ~/Library/LaunchAgents/com.sky.rto.plist
+pkill -f rto_agent_mac.py
+
+rm -f ~/.rto_tracker/.last_watcher_run
+rm -f ~/.rto_tracker/.checkin.lock
+rm -f ~/.rto_tracker/rto_agent.log
+
+
+when removing old files do before installing distribution:
+rm ~/.rto_tracker/.last_missed_check
+rm ~/.rto_tracker/config.json

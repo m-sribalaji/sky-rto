@@ -1,0 +1,317 @@
+{% extends "base.html" %}
+{% block title %}Missing Attendance{% endblock %}
+
+{% block body %}
+<div id="page-data"
+     data-hostname="{{ hostname }}"
+     data-days="{{ missing_days_json | e }}"
+     style="display:none"></div>
+<div class="card" style="max-width:560px">
+  <div>
+    <div class="eyebrow">Missing attendance</div>
+    <h1>
+      {% if missing_days|length == 1 %}
+        What happened on this day, {{ first_name }}?
+      {% else %}
+        You have {{ missing_days|length }} days with no record, {{ first_name }}
+      {% endif %}
+    </h1>
+  </div>
+
+  <p style="font-size:13px;color:var(--tx2);line-height:1.6">
+    {% if missing_days|length == 1 %}
+      No attendance record found for this date.
+    {% else %}
+      Select the days and apply leave or attendance in bulk, or fill individually.
+    {% endif %}
+  </p>
+
+  <!-- Day list -->
+  <div id="day-list" style="display:flex;flex-direction:column;gap:6px">
+    {% for day in missing_days %}
+    <div class="day-row" data-date="{{ day.date }}"
+         style="display:flex;align-items:center;gap:10px;padding:10px 12px;
+                background:var(--bg2);border:1px solid var(--b0);border-radius:8px;
+                cursor:pointer;transition:border-color 0.15s"
+         onclick="toggleDay('{{ day.date }}')">
+      <div class="day-check" id="chk-{{ day.date }}"
+           style="width:16px;height:16px;border-radius:4px;border:1.5px solid var(--tx3);
+                  flex-shrink:0;display:flex;align-items:center;justify-content:center">
+      </div>
+      <div style="flex:1">
+        <div style="font-size:13px;font-weight:500">{{ day.nice_date }}</div>
+        {% if day.cached_class %}
+        <div style="font-family:var(--mono);font-size:10px;color:var(--tx3);margin-top:1px">
+          Cached signal: {{ day.cached_class|upper }}
+          {% if day.cached_lan %}(LAN: {{ day.cached_lan }}){% endif %}
+        </div>
+        {% endif %}
+      </div>
+      <div class="day-status" id="status-{{ day.date }}"
+           style="font-family:var(--mono);font-size:10px;color:var(--tx3)">
+        -
+      </div>
+    </div>
+    {% endfor %}
+  </div>
+
+  <div class="divider"></div>
+
+  <!-- Bulk action -->
+  <div>
+    <div style="font-size:11px;font-family:var(--mono);color:var(--tx3);
+                text-transform:uppercase;letter-spacing:0.08em;margin-bottom:8px">
+      Apply to selected days
+    </div>
+    <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px">
+      <button class="action-btn" onclick="bulkApply('wfo')">
+        <i data-lucide="building-2"></i> In Office
+      </button>
+      <button class="action-btn" onclick="bulkApply('wfh')">
+        <i data-lucide="home"></i> WFH
+      </button>
+      <button class="action-btn" onclick="bulkApply('annual')">
+        <i data-lucide="plane"></i> Annual Leave
+      </button>
+      <button class="action-btn" onclick="bulkApply('casual')">
+        <i data-lucide="calendar-days"></i> Casual Leave
+      </button>
+      <button class="action-btn" onclick="bulkApply('sick')">
+        <i data-lucide="stethoscope"></i> Sick Leave
+      </button>
+      <button class="action-btn" onclick="bulkApply('public_holiday')">
+        <i data-lucide="sparkles"></i> Public Holiday
+      </button>
+      <button class="action-btn" onclick="bulkApply('optional_holiday')">
+        <i data-lucide="calendar-plus"></i> Optional Holiday
+      </button>
+      <button class="action-btn" onclick="bulkApply('half_day_am')">
+        <i data-lucide="sunrise"></i> Half Day AM
+      </button>
+      <button class="action-btn" onclick="bulkApply('half_day_pm')">
+        <i data-lucide="sunset"></i> Half Day PM
+      </button>
+      <button class="action-btn" onclick="bulkApply('other')">
+        <i data-lucide="file-text"></i> Other
+      </button>
+    </div>
+
+    <!-- Note field (shown for 'other') -->
+    <div id="note-field" style="display:none;margin-bottom:10px">
+      <label>Note <span style="color:var(--red)">*required for Other</span></label>
+      <input type="text" id="bulk-note" placeholder="Describe the reason"/>
+    </div>
+
+    <div style="display:flex;gap:8px">
+      <button class="btn" id="apply-btn" onclick="submitBulk()"
+              style="opacity:0.4;pointer-events:none;flex:1">
+        <i data-lucide="check-circle"></i>
+        <span id="apply-label">Select days and type above</span>
+      </button>
+      <button class="btn" onclick="selectAll()"
+              style="background:var(--bg2);color:var(--tx2);border:1px solid var(--b1);
+                     flex:0;padding:7px 14px;font-size:12px">
+        All
+      </button>
+      <button class="btn" onclick="selectNone()"
+              style="background:var(--bg2);color:var(--tx2);border:1px solid var(--b1);
+                     flex:0;padding:7px 14px;font-size:12px">
+        None
+      </button>
+    </div>
+  </div>
+
+  <div id="result" style="margin-top:4px"></div>
+
+  <div class="notice warn">
+    <i data-lucide="triangle-alert"></i>
+    <span>Your selections are logged for RTO tracking and can be reviewed by your manager.</span>
+  </div>
+</div>
+{% endblock %}
+
+{% block script %}
+<style>
+.action-btn{display:inline-flex;align-items:center;gap:5px;padding:6px 11px;
+  border-radius:7px;border:1px solid var(--b0);background:var(--bg2);
+  cursor:pointer;font-family:var(--sans);font-size:11px;color:var(--tx2);
+  transition:all 0.15s;}
+.action-btn svg{width:13px;height:13px;stroke-width:1.8;}
+.action-btn:hover{border-color:var(--b1);color:var(--tx);background:var(--bg3);}
+.action-btn.active{border-color:var(--acc);background:var(--accg);color:var(--accl);}
+.day-row.selected{border-color:rgba(193,123,63,0.4);background:rgba(193,123,63,0.06);}
+.day-row.done{border-color:rgba(74,222,128,0.3);background:rgba(74,222,128,0.04);}
+</style>
+<script>
+const HOSTNAME = document.getElementById('page-data').dataset.hostname;
+const MISSING_DAYS = JSON.parse(document.getElementById('page-data').dataset.days);
+const LEAVE_TYPES = ['annual','casual','sick','public_holiday',
+                     'optional_holiday','half_day_am','half_day_pm','other'];
+
+let selected = new Set();
+let chosenType = null;
+
+// Auto-select all on load
+window.addEventListener('DOMContentLoaded', () => {
+  MISSING_DAYS.forEach(d => toggleDay(d.date, true));
+});
+
+function toggleDay(date, forceOn=false){
+  if(selected.has(date) && !forceOn){
+    selected.delete(date);
+    document.querySelector(`[data-date="${date}"]`).classList.remove('selected');
+    const chk = document.getElementById('chk-'+date);
+    chk.style.borderColor = 'var(--tx3)';
+    chk.innerHTML = '';
+  } else {
+    selected.add(date);
+    document.querySelector(`[data-date="${date}"]`).classList.add('selected');
+    const chk = document.getElementById('chk-'+date);
+    chk.style.borderColor = 'var(--acc)';
+    chk.style.background = 'var(--acc)';
+    chk.innerHTML = `<svg xmlns="http://www.w3.org/2000/svg" width="10" height="10"
+      viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="3"
+      stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>`;
+  }
+  updateApplyBtn();
+}
+
+function selectAll(){ MISSING_DAYS.forEach(d=>{ if(!selected.has(d.date)) toggleDay(d.date,true); }); }
+function selectNone(){ [...selected].forEach(d=>toggleDay(d)); }
+
+function bulkApply(type){
+  chosenType = type;
+  document.querySelectorAll('.action-btn').forEach(b=>b.classList.remove('active'));
+  event.currentTarget.classList.add('active');
+  document.getElementById('note-field').style.display = type==='other' ? 'block' : 'none';
+  updateApplyBtn();
+}
+
+function updateApplyBtn(){
+  const btn = document.getElementById('apply-btn');
+  const lbl = document.getElementById('apply-label');
+  if(selected.size > 0 && chosenType){
+    btn.style.opacity = '1';
+    btn.style.pointerEvents = 'auto';
+    lbl.textContent = `Apply ${chosenType.replace('_',' ')} to ${selected.size} day${selected.size!==1?'s':''}`;
+  } else {
+    btn.style.opacity = '0.4';
+    btn.style.pointerEvents = 'none';
+    lbl.textContent = selected.size===0 ? 'Select days above' : 'Choose type above';
+  }
+}
+
+async function submitBulk(){
+  if(!chosenType || selected.size===0) return;
+  const note = document.getElementById('bulk-note')?.value?.trim() || null;
+  if(chosenType==='other' && !note){
+    document.getElementById('result').innerHTML =
+      `<div class="notice err"><i data-lucide="x-circle"></i><span>Note is required for "Other".</span></div>`;
+    lucide.createIcons(); return;
+  }
+
+  const btn    = document.getElementById('apply-btn');
+  const lbl    = document.getElementById('apply-label');
+  const result = document.getElementById('result');
+
+  // Show saving state
+  if(lbl) lbl.textContent = 'Saving...';
+  btn.style.pointerEvents = 'none';
+  btn.style.opacity = '0.7';
+
+  const isLeave = LEAVE_TYPES.includes(chosenType);
+  const days = [...selected].sort();
+  let failed = 0, succeeded = 0;
+  const savedDates = [];
+
+  for(const date of days){
+    try{
+      const resp = await fetch('/api/missed', {
+        method: 'POST',
+        headers: {'Content-Type':'application/json'},
+        body: JSON.stringify({
+          hostname: HOSTNAME,
+          date,
+          status: chosenType,
+          leave_type: isLeave ? chosenType : null,
+          source: 'missed_prompt_bulk',
+          has_cached_data: false,
+          note: note || undefined,
+        })
+      });
+      if(resp.ok){
+        succeeded++;
+        savedDates.push(date);
+        selected.delete(date);
+        // Mark row visually as saved
+        const row = document.querySelector(`[data-date="${date}"]`);
+        if(row){
+          row.classList.remove('selected');
+          row.classList.add('done');
+          const st = document.getElementById('status-'+date);
+          if(st) st.innerHTML =
+            `<span style="color:var(--green);font-family:var(--mono);font-size:10px">saved</span>`;
+        }
+      } else {
+        failed++;
+      }
+    } catch(e){ failed++; }
+  }
+
+  // Fade out and remove saved rows — wait for animation before checking allDone
+  const doneRows = document.querySelectorAll('.day-row.done');
+  doneRows.forEach(row => {
+    row.style.transition = 'opacity 0.25s';
+    row.style.opacity = '0';
+  });
+
+  // Wait for fade, then finalise
+  setTimeout(() => {
+    doneRows.forEach(row => row.remove());
+
+    const pendingRows = document.querySelectorAll('.day-row:not(.done)');
+    const allDone = pendingRows.length === 0;
+
+    if(failed === 0){
+      if(allDone){
+        // All days saved — show done message, user closes manually
+        btn.style.opacity = '1';
+        btn.style.background = 'var(--green)';
+        btn.style.color = '#000';
+        btn.style.pointerEvents = 'none';
+        if(lbl) lbl.textContent = 'All saved!';
+        result.innerHTML =
+          `<div class="notice ok"><i data-lucide="check-circle"></i>
+           <span>All ${succeeded} day${succeeded!==1?'s':''} recorded. You can close this tab.</span></div>`;
+        lucide.createIcons();
+      } else {
+        // More days remain — fully reset so user can pick next batch
+        chosenType = null;
+        document.querySelectorAll('.action-btn').forEach(b => b.classList.remove('active'));
+        document.getElementById('note-field').style.display = 'none';
+        // Restore button to its original disabled state cleanly
+        btn.style.opacity = '0.4';
+        btn.style.background = '';
+        btn.style.color = '';
+        btn.style.pointerEvents = 'none';
+        if(lbl) lbl.textContent = 'Choose type above';
+        result.innerHTML =
+          `<div class="notice ok"><i data-lucide="check-circle"></i>
+           <span>${succeeded} day${succeeded!==1?'s':''} saved — select the remaining days above.</span></div>`;
+        lucide.createIcons();
+      }
+    } else {
+      // Some failed — re-enable so user can retry
+      btn.style.opacity = '1';
+      btn.style.pointerEvents = 'auto';
+      btn.style.background = '';
+      if(lbl) lbl.textContent = `${failed} failed — try again`;
+      result.innerHTML =
+        `<div class="notice err"><i data-lucide="x-circle"></i>
+         <span>${failed} day(s) failed to save. Try again.</span></div>`;
+      lucide.createIcons();
+    }
+  }, 300);
+}
+</script>
+{% endblock %}
