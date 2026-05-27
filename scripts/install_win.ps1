@@ -216,6 +216,7 @@ Write-Host "  [6/7] Checking server..."
 $ServerOk = $false
 try {
     $r = Invoke-WebRequest -Uri "$ServerUrl/health" `
+         -Headers @{ "Accept-Encoding" = "identity"; "Connection" = "close" } `
          -UseBasicParsing -TimeoutSec 8 -ErrorAction Stop
     $ServerOk = ($r.StatusCode -eq 200)
 } catch { $ServerOk = $false }
@@ -256,6 +257,7 @@ if ($ServerOk) {
     $RegName = ""
     try {
         $resp = Invoke-WebRequest -Uri "$ServerUrl/api/device/$Hostname" `
+                -Headers @{ "Accept-Encoding" = "identity"; "Connection" = "close" } `
                 -UseBasicParsing -TimeoutSec 5
         $dev  = $resp.Content | ConvertFrom-Json
         $IsRegistered = $dev.registered
@@ -293,6 +295,7 @@ if ($ServerOk) {
             $waitCount++
             try {
                 $chk  = Invoke-WebRequest -Uri "$ServerUrl/api/device/$Hostname" `
+                        -Headers @{ "Accept-Encoding" = "identity"; "Connection" = "close" } `
                         -UseBasicParsing -TimeoutSec 5
                 $chkD = $chk.Content | ConvertFrom-Json
                 if ($chkD.registered) {

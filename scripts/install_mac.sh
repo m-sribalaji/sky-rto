@@ -188,7 +188,11 @@ SERVER_OK=false
 if "$PYTHON" -c "
 import urllib.request, sys
 try:
-    urllib.request.urlopen('$SERVER_URL/health', timeout=8)
+    req = urllib.request.Request(
+        '$SERVER_URL/health',
+        headers={'Accept-Encoding': 'identity', 'Connection': 'close'},
+    )
+    urllib.request.urlopen(req, timeout=8)
     sys.exit(0)
 except:
     sys.exit(1)
@@ -219,7 +223,11 @@ else
   REGISTERED=$("$PYTHON" -c "
 import urllib.request, json, sys
 try:
-    r = urllib.request.urlopen('$SERVER_URL/api/device/$HOSTNAME', timeout=5)
+    req = urllib.request.Request(
+        '$SERVER_URL/api/device/$HOSTNAME',
+        headers={'Accept-Encoding': 'identity', 'Connection': 'close'},
+    )
+    r = urllib.request.urlopen(req, timeout=5)
     d = json.loads(r.read())
     print('yes:' + d.get('employee_name','') if d.get('registered') else 'no')
 except Exception as e:
@@ -263,7 +271,11 @@ except Exception as e:
       CHECK=$("$PYTHON" -c "
 import urllib.request, json, sys
 try:
-    r = urllib.request.urlopen('$SERVER_URL/api/device/$HOSTNAME', timeout=5)
+    req = urllib.request.Request(
+        '$SERVER_URL/api/device/$HOSTNAME',
+        headers={'Accept-Encoding': 'identity', 'Connection': 'close'},
+    )
+    r = urllib.request.urlopen(req, timeout=5)
     d = json.loads(r.read())
     print('yes:' + d.get('employee_name','') if d.get('registered') else 'no')
 except:

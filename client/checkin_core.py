@@ -439,7 +439,12 @@ def api_post(url, payload, timeout=10):
         import urllib.request
         data = json.dumps(payload).encode()
         req  = urllib.request.Request(url, data=data,
-                   headers={"Content-Type": "application/json"}, method="POST")
+                   headers={
+                       "Content-Type": "application/json",
+                       "Accept": "application/json",
+                       "Accept-Encoding": "identity",
+                       "Connection": "close",
+                   }, method="POST")
         with urllib.request.urlopen(req, timeout=timeout) as r:
             return json.loads(r.read().decode())
     except Exception as e:
@@ -448,7 +453,16 @@ def api_post(url, payload, timeout=10):
 def api_get(url, timeout=10):
     try:
         import urllib.request
-        with urllib.request.urlopen(url, timeout=timeout) as r:
+        req = urllib.request.Request(
+            url,
+            headers={
+                "Accept": "application/json",
+                "Accept-Encoding": "identity",
+                "Connection": "close",
+            },
+            method="GET",
+        )
+        with urllib.request.urlopen(req, timeout=timeout) as r:
             return json.loads(r.read().decode())
     except Exception as e:
         logger.error(f"[FAIL] GET {url}: {e}"); return None
