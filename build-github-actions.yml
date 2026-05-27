@@ -147,7 +147,7 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: "build-${{ github.run_number }}"
-          name: "RTO Tracker Build ${{ github.run_number }}"
+          name: "sky-rto ${{ github.run_number }}"
           body: |
             Auto-built from commit ${{ github.sha }}
 
@@ -158,7 +158,7 @@ jobs:
             **macOS install:**
             1. Download `rto-mac-arm64`
             2. Open Terminal in the download folder
-            3. Run: `chmod +x rto-mac-arm64 && ./rto-mac-arm64`
+            3. Run: `xattr -d com.apple.quarantine rto-mac-arm64 && chmod +x rto-mac-arm64 && ./rto-mac-arm64`
             4. Browser opens for registration — done
 
             **Windows install:**
