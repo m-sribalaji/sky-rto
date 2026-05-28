@@ -6,7 +6,33 @@ rm -f ~/.rto_tracker/.last_watcher_run
 rm -f ~/.rto_tracker/.checkin.lock
 rm -f ~/.rto_tracker/rto_agent.log
 
-
 when removing old files do before installing distribution:
 rm ~/.rto_tracker/.last_missed_check
 rm ~/.rto_tracker/config.json
+
+
+########## WIN
+
+# stop the old script-based agent
+Get-Process python, pythonw -ErrorAction SilentlyContinue | Stop-Process -Force
+Get-Process -Name "*rto*" -ErrorAction SilentlyContinue | Stop-Process -Force
+
+# remove Windows startup registration if it was added by the script installer
+$runKey = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run"
+Remove-ItemProperty -Path $runKey -Name "SkyRTOTracker" -ErrorAction SilentlyContinue
+
+# remove any startup shortcut if present
+$startup = [Environment]::GetFolderPath("Startup")
+Remove-Item -Force -ErrorAction SilentlyContinue (Join-Path $startup "SkyRTOTracker.lnk")
+
+# remove old script-era cache/state files
+$base = Join-Path $env:USERPROFILE ".rto_tracker"
+
+Remove-Item -Force -ErrorAction SilentlyContinue `
+  (Join-Path $base ".last_watcher_run") `
+  (Join-Path $base ".checkin.lock") `
+  (Join-Path $base ".last_missed_check") `
+  (Join-Path $base "config.json") `
+  (Join-Path $base "pending_queue.json") `
+  (Join-Path $base "checkin.log") `
+  (Join-Path $base "rto_agent.log")

@@ -1087,31 +1087,45 @@ async function loadHistory(){
   const d=await get(`/api/history/${empId}?month=${month}`);
   if(!d)return;
   renderCalendar('cal-grid',d.records,month,d.public_holiday_dates||[]);
-  const wfo=d.records.filter(r=>{ // WFO priority: if ANY segment that day was WFO -> counts as WFO day
+  // Build sets for exclusion BEFORE counting
+  const phDatesSet   = new Set(d.public_holiday_dates||[]);
+  const leaveDtsSet  = new Set(d.personal_leave_dates||[]);
+
+  // WFO: exclude public holidays and personal leave days from count
+  // Exception: if employee comes in on a public holiday/leave, we still
+  // count WFO (and alert manager separately) — handled in WFO-on-leave logic below
+  const wfo=d.records.filter(r=>{
+    // Never count WFO on a public holiday toward the WFO tally
+    if(phDatesSet.has(r.date)) return false;
     if(r.status==='wfo') return true;
     if(r.display_status==='split'&&r.segments)
       return r.segments.some(s=>s.status==='wfo');
     return false;
   }).length;
   const wfh=d.records.filter(r=>{
+    // Never count WFH on a public holiday or personal leave day
+    if(phDatesSet.has(r.date)) return false;
+    if(leaveDtsSet.has(r.date)) return false;
     if(r.display_status==='split'&&r.segments)
       return !r.segments.some(s=>s.status==='wfo')&&r.segments.some(s=>s.status==='wfh');
     return r.status==='wfh';
   }).length;
-  const leave=d.records.filter(r=>r.status&&LEAVE_TYPES[r.status]).length;
+  const leave=d.records.filter(r=>{
+    // Don't double-count: leave on a public holiday = holiday, not personal leave
+    if(phDatesSet.has(r.date)) return false;
+    return r.status&&LEAVE_TYPES[r.status];
+  }).length;
   const working=wfo+wfh,rto=working?Math.round((wfo/working)*100):0;
   const[yr,mo]=month.split('-').map(Number),daysInMonth=new Date(yr,mo,0).getDate();
   const[ty2,tm2,td2]=TODAY.split('-').map(Number);
   // Public + personal leave dates to exclude from working days denominator
-  const phDates  = new Set(d.public_holiday_dates||[]);
-  const leaveDts = new Set(d.personal_leave_dates||[]);
   let workDays=0, totalWorkDays=0, phCount=0;
   for(let day=1;day<=daysInMonth;day++){
     const dt=new Date(yr,mo-1,day);
     if(dt.getDay()===0||dt.getDay()===6)continue;
     const ds=`${month}-${String(day).padStart(2,'0')}`;
     // Exclude public holidays from working days for everyone
-    if(phDates.has(ds)){phCount++;continue;}
+    if(phDatesSet.has(ds)){phCount++;continue;}
     totalWorkDays++;
     const isFuture=(yr===ty2&&mo===tm2&&day>td2)||(yr===ty2&&mo>tm2)||(yr>ty2);
     if(!isFuture)workDays++;

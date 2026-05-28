@@ -53,6 +53,8 @@ _EVENT_LEVELS = {
     "leave_applied":        LEVEL_IMPORTANT,
     # Errors
     "error":                LEVEL_ERRORS,
+    "wfo_on_leave":         LEVEL_IMPORTANT,
+    "registration_complete": LEVEL_IMPORTANT,
 }
 
 # -- Card accent colours -----------------------------------
@@ -70,6 +72,8 @@ _COLOURS = {
     "override_applied":     "warning",
     "leave_applied":        "accent",
     "error":                "attention",
+    "wfo_on_leave":         "warning",
+    "registration_complete": "good",
 }
 
 # -- Icons (text-based, no emojis) ------------------------
@@ -514,6 +518,33 @@ def notify_override_applied(target_name: str, target_id: str,
             ("Applied by", override_by),
         ],
         action_url=server_url,
+        webhook_url=webhook,
+        notify_level=level,
+    )
+
+
+def notify_wfo_on_leave(employee_name: str, employee_id: str,
+                        date: str, leave_type: str,
+                        lan_ip: str = None,
+                        webhook: str = None, level: str = LEVEL_ALL,
+                        server_url: str = None):
+    """Alert: employee has WFO office signals while marked as on leave/holiday."""
+    notify(
+        event="wfo_on_leave",
+        title="Office Detected on Leave Day",
+        body=(
+            f"{employee_name} ({employee_id}) has office network signals on {date} "
+            f"but is recorded as {leave_type}. Please review."
+        ),
+        facts=[
+            ("Employee",   f"{employee_name} ({employee_id})"),
+            ("Date",       date),
+            ("Recorded as", leave_type),
+            ("LAN IP",     lan_ip or "unknown"),
+            ("Action",     "Review and update attendance if needed"),
+        ],
+        action_url=server_url,
+        action_label="Review Attendance",
         webhook_url=webhook,
         notify_level=level,
     )

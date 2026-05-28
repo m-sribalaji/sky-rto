@@ -313,6 +313,51 @@ async def checkin(p: CheckInPayload, request: Request, db: AsyncSession = Depend
 
     # Don't overwrite DB if day is locked by override or leave
     if seg_result.get("action") in ("override_locked", "leave_recorded"):
+        # WFO-on-leave/holiday alert: if employee is on leave/holiday but
+        # office signals are detected, notify their team manager
+        if result.auto_status == "wfo":
+            is_ph = False
+            ph_check = await db.execute(select(PublicHoliday).where(
+                PublicHoliday.date == today))
+            if ph_check.scalars().first():
+                is_ph = True
+            leave_type = seg_result.get("status", "leave")
+            alert_reason = "public holiday" if is_ph else f"leave ({leave_type})"
+            logger.info(
+                f"WFO-on-{alert_reason}: {device.employee_id} "
+                f"({device.employee_name}) detected in office on {today} "
+                f"while marked as {alert_reason}"
+            )
+            # Log anomaly so it appears in the Anomalies panel
+            db.add(AnomalyLog(
+                employee_id   = device.employee_id,
+                employee_name = device.employee_name,
+                anomaly_type  = "wfo_on_leave",
+                description   = (
+                    f"{device.employee_name} ({device.employee_id}) "
+                    f"has office network signals on {today} "
+                    f"but is recorded as {alert_reason}. "
+                    f"LAN: {p.lan_ip or 'unknown'}."
+                ),
+                severity = "medium",
+            ))
+            await db.commit()
+            # Send Teams notification to channel
+            from notifier import notify_wfo_on_leave
+            try:
+                from config import APP_TITLE
+                import os
+                wh = os.environ.get("TEAMS_WEBHOOK", "")
+                notify_wfo_on_leave(
+                    employee_name = device.employee_name,
+                    employee_id   = device.employee_id,
+                    date          = today,
+                    leave_type    = alert_reason,
+                    lan_ip        = p.lan_ip,
+                    webhook       = wh or None,
+                )
+            except Exception as e:
+                logger.warning(f"[WARN] notify_wfo_on_leave failed: {e}")
         return {**seg_result, "detail": result.detail}
 
     await _upsert_checkin(device, today, public_ip, p, result, db)
@@ -945,18 +990,40 @@ async def get_compliance(month: str=None, team: str=None, request: Request=None,
             if date_key not in date_status and status:
                 date_status[date_key] = status
 
-        wfo   = sum(1 for s in date_status.values() if s == "wfo")
-        wfh   = sum(1 for s in date_status.values() if s == "wfh")
+        # Exclude public holiday dates from wfo/wfh counts — a check-in
+        # that fired on a public holiday (agent running that morning) should
+        # not inflate the WFO/WFH numbers. Also exclude personal leave days
+        # from WFH count (leave is already counted separately).
+        leave_dates_set = {lr.date for lr in
+                           (await db.execute(select(LeaveRequest).where(and_(
+                                LeaveRequest.employee_id == d.employee_id,
+                                LeaveRequest.date.like(f"{month}%")
+                           )))).scalars().all()}
+        wfo   = sum(1 for ds, s in date_status.items()
+                    if s == "wfo" and ds not in ph_dates)
+        wfh   = sum(1 for ds, s in date_status.items()
+                    if s == "wfh"
+                    and ds not in ph_dates
+                    and ds not in leave_dates_set)
         leave = sum(1 for date_key, s in date_status.items()
-                    if s in LEAVE_TYPES or date_key in ph_dates)
+                    if (s in LEAVE_TYPES or date_key in ph_dates)
+                    and date_key not in ph_dates)  # ph_dates counted separately below
+        ph_count_emp = sum(1 for ds in ph_dates
+                           if date(yr, mo, 1) <= date.fromisoformat(ds) <=
+                              date(yr, mo, (date(yr, mo % 12 + 1, 1) - timedelta(days=1)).day
+                                    if mo < 12 else 31))
 
         # -- Weekly compliance check --------------------------
         # Rule: each completed week target = max(0, 3 - leave_days_that_week)
         # A week PASSES if wfo_days >= adjusted_target
         weekly_results = []
         for week in completed_weeks:
-            week_wfo   = sum(1 for ds in week if date_status.get(ds) == "wfo")
-            week_wfh   = sum(1 for ds in week if date_status.get(ds) == "wfh")
+            week_wfo   = sum(1 for ds in week
+                             if date_status.get(ds) == "wfo" and ds not in ph_dates)
+            week_wfh   = sum(1 for ds in week
+                             if date_status.get(ds) == "wfh"
+                             and ds not in ph_dates
+                             and ds not in leave_dates_set)
             week_leave = sum(1 for ds in week
                              if date_status.get(ds) in LEAVE_TYPES or ds in ph_dates)
             week_any   = week_wfo + week_wfh + week_leave

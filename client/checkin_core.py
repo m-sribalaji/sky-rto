@@ -404,13 +404,16 @@ def queue_checkin(payload: dict):
     QUEUE_FILE.write_text(json.dumps(queue, indent=2))
     logger.info(f"Queued check-in for {payload.get('date')} (server unreachable)")
 
-def flush_queue(server: str) -> int:
-    if not QUEUE_FILE.exists(): return 0
+def flush_queue(server: str) -> tuple:
+    """Flush pending offline queue to server.
+    Returns (count, synced_payloads_with_responses) so caller can notify.
+    """
+    if not QUEUE_FILE.exists(): return 0, []
     try: queue = json.loads(QUEUE_FILE.read_text())
-    except Exception: return 0
-    if not queue: return 0
+    except Exception: return 0, []
+    if not queue: return 0, []
 
-    synced = []; failed = []
+    synced = []; failed = []; synced_results = []
     from datetime import datetime as _dt
     for payload in queue:
         date_str = payload.get("date", "")
@@ -423,6 +426,7 @@ def flush_queue(server: str) -> int:
                                             "confirm_needed", "override_locked",
                                             "leave_recorded"):
             synced.append(payload)
+            synced_results.append((payload, resp))
             logger.info(f"Flushed queued: {payload.get('date')} -> {resp.get('action')}")
         else:
             failed.append(payload)
@@ -431,7 +435,7 @@ def flush_queue(server: str) -> int:
     if failed: QUEUE_FILE.write_text(json.dumps(failed, indent=2))
     else: QUEUE_FILE.unlink(missing_ok=True)
     if synced: logger.info(f"Flushed {len(synced)} queued check-in(s)")
-    return len(synced)
+    return len(synced), synced_results
 
 # ── API ──────────────────────────────────────────────────────────────────────
 def api_post(url, payload, timeout=10):
@@ -673,13 +677,30 @@ def run_checkin(force: bool = False):
         changed = location_changed(cfg, local_class)
         if not force and not changed:
             if QUEUE_FILE.exists() and server_reachable(server):
-                flushed = flush_queue(server)
+                flushed, flushed_results = flush_queue(server)
                 if flushed > 0:
                     logger.info(f"Flushed {flushed} queued offline record(s)")
                     if NOTIFIER_AVAILABLE:
                         wh, lvl, srv = _get_notify_cfg(cfg)
-                        notify_queue_flushed(cfg.get("employee_name", hostname),
-                                             flushed, webhook=wh, level=lvl, server_url=srv)
+                        emp_name = cfg.get("employee_name", hostname)
+                        # Send individual check-in cards for each flushed record
+                        for f_payload, f_resp in flushed_results:
+                            if f_resp.get("action") == "ok":
+                                f_status = f_resp.get("status")
+                                f_conf   = f_resp.get("confidence", "")
+                                f_date   = f_payload.get("date", "")
+                                if f_status == "wfo":
+                                    notify_checkin_wfo(
+                                        emp_name, f_payload.get("lan_ip"), f_conf,
+                                        webhook=wh, level=lvl, server_url=srv)
+                                elif f_status == "wfh":
+                                    notify_checkin_wfh(
+                                        emp_name, f_payload.get("lan_ip"), f_conf,
+                                        vpn=bool(f_payload.get("vpn_tunnel_ip")),
+                                        webhook=wh, level=lvl, server_url=srv)
+                        # Also send a summary queue-flushed card
+                        notify_queue_flushed(emp_name, flushed,
+                                             webhook=wh, level=lvl, server_url=srv)
             logger.info(f"Same location ({local_class}), same day - skipping"); return
 
         payload = {
@@ -702,26 +723,41 @@ def run_checkin(force: bool = False):
                 cfg["last_status"]         = local_class
                 cfg["last_detected_class"] = local_class
                 save_config(cfg)
-                if NOTIFIER_AVAILABLE:
-                    wh, lvl, _ = _get_notify_cfg(cfg)
-                    notify_queue_saved(cfg.get("employee_name", hostname),
-                                       local_class, webhook=wh, level=lvl)
-                    notify_server_unreachable(server, webhook=wh, level=lvl)
-                else:
-                    _desktop_notify("RTO Tracker",
-                           f"Server offline - {local_class.upper()} logged locally.")
+                # Desktop notification only — Teams webhook also needs internet,
+                # so don't attempt it when the server (and likely internet) is
+                # unreachable. The check-in card will fire when VPN reconnects
+                # and the queue is flushed.
+                _desktop_notify("RTO Tracker",
+                    f"Server offline. {local_class.upper()} check-in saved locally "
+                    f"and will sync automatically when VPN connects.")
             else:
                 _desktop_notify("RTO Tracker",
                        "Server unreachable. Connect Sky VPN for attendance tracking.")
             return
 
-        flushed = flush_queue(server)
+        flushed, flushed_results = flush_queue(server)
         if flushed > 0:
             logger.info(f"Flushed {flushed} offline record(s)")
             if NOTIFIER_AVAILABLE:
                 wh, lvl, srv = _get_notify_cfg(cfg)
-                notify_queue_flushed(cfg.get("employee_name", hostname),
-                                     flushed, webhook=wh, level=lvl, server_url=srv)
+                emp_name = cfg.get("employee_name", hostname)
+                # Send individual check-in cards for each flushed record
+                for f_payload, f_resp in flushed_results:
+                    if f_resp.get("action") == "ok":
+                        f_status = f_resp.get("status")
+                        f_conf   = f_resp.get("confidence", "")
+                        if f_status == "wfo":
+                            notify_checkin_wfo(
+                                emp_name, f_payload.get("lan_ip"), f_conf,
+                                webhook=wh, level=lvl, server_url=srv)
+                        elif f_status == "wfh":
+                            notify_checkin_wfh(
+                                emp_name, f_payload.get("lan_ip"), f_conf,
+                                vpn=bool(f_payload.get("vpn_tunnel_ip")),
+                                webhook=wh, level=lvl, server_url=srv)
+                # Summary card
+                notify_queue_flushed(emp_name, flushed,
+                                     webhook=wh, level=lvl, server_url=srv)
 
         device = api_get(f"{server}/api/device/{hostname}")
         if not device or not device.get("registered"):
