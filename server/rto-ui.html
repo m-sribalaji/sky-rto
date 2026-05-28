@@ -16,7 +16,7 @@ body{font-family:var(--sans);background:var(--bg);color:var(--tx);min-height:100
 .logo{display:flex;align-items:center;gap:10px;}
 .logo-icon{width:44px;height:44px;background:transparent;border-radius:8px;display:flex;align-items:center;justify-content:center;flex-shrink:0;overflow:hidden;}
 .logo-icon img{width:100%;height:100%;object-fit:contain;}
-.logo-name{font-family:var(--serif);font-size:16px;font-weight:500;letter-spacing:0.3px;}.logo-sub{font-family:var(--mono);font-size:9px;color:var(--tx3);text-transform:uppercase;letter-spacing:0.1em;}
+.logo-name{font-family:var(--serif);font-size:16px;font-weight:600;letter-spacing:0.3px;}.logo-sub{font-family:var(--mono);font-size:9px;color:var(--tx3);text-transform:uppercase;letter-spacing:0.1em;}
 .sb-nav{padding:10px 8px;flex:1;display:flex;flex-direction:column;gap:2px;}
 .nav-grp{font-family:var(--mono);font-size:9px;text-transform:uppercase;letter-spacing:0.1em;color:var(--tx3);padding:10px 8px 4px;}
 .nav-item{display:flex;align-items:center;gap:9px;padding:8px 10px;border-radius:7px;cursor:pointer;color:var(--tx2);font-size:12px;transition:all 0.12s;border:1px solid transparent;user-select:none;}
@@ -1178,7 +1178,15 @@ function renderCalendar(gridId,records,month,phDates=[]){
       statusMap[r.date+'_note']=r.leaves[0].note;
   });
   const phSet=new Set(phDates);
-  phSet.forEach(ds=>{if(!statusMap[ds])statusMap[ds]='public_holiday';});
+  // Public holiday always wins — overrides any WFH/WFO check-in that fired
+  // that day (agent may have run before the holiday was added, or at midnight).
+  // Exception: if employee actually came in (wfo), keep wfo so it's visible.
+  phSet.forEach(ds=>{
+    const existing = statusMap[ds];
+    if(!existing || (existing !== 'wfo' && existing !== 'split')){
+      statusMap[ds] = 'public_holiday';
+    }
+  });
   calEl.style.gridTemplateColumns='repeat(5,1fr)';
   const cells=[];
   cells.push(...['Mon','Tue','Wed','Thu','Fri'].map(l=>`<div class="cal-day-lbl">${l}</div>`));
