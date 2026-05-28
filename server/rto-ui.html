@@ -2162,13 +2162,14 @@ async function loadRhythm(){
   const bestBars = bestDays.map((bd, i) => {
     const h = Math.round(bd.probability * 56);
     const c = i === 0 ? 'var(--green)' : i === 1 ? 'var(--green)' : 'var(--amber)';
-    // Star removed from inside bar — shown in card title instead
-    return `<div style="display:flex;flex-direction:column;align-items:center;gap:3px;flex:1">
-      <div style="font-family:var(--mono);font-size:9px;color:var(--tx3);text-align:center;line-height:1.3">${bd.label}</div>
+    const pct = Math.round(bd.probability * 100);
+    return `<div style="display:flex;flex-direction:column;align-items:center;gap:4px;flex:1">
       <div style="width:100%;height:56px;display:flex;align-items:flex-end">
-        <div style="width:100%;height:${Math.max(h,3)}px;background:${c};border-radius:3px 3px 0 0;opacity:0.85"></div>
+        <div style="width:100%;height:${Math.max(h,3)}px;background:${c};border-radius:3px 3px 0 0;opacity:0.85"
+             title="${bd.label}"></div>
       </div>
       <div style="font-family:var(--mono);font-size:10px;color:var(--tx2);font-weight:${i===0?'600':'400'}">${bd.dow_name.slice(0,3)}${i===0?' ★':''}</div>
+      <div style="font-family:var(--mono);font-size:9px;color:var(--tx3)">${pct}%</div>
     </div>`;
   }).join('');
 
