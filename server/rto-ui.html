@@ -347,7 +347,7 @@ input::placeholder,textarea::placeholder{color:var(--tx3);}textarea{resize:verti
             <select id="lm-cal-team-filter" onchange="loadTeamLeave()" style="display:none;width:auto;padding:4px 8px;font-size:11px;background:var(--bg2);border:1px solid var(--acc);border-radius:6px;color:var(--tx)">
               <option value="">All teams</option>
             </select>
-            <select id="team-leave-month" style="width:auto;padding:4px 8px;font-size:11px" onchange="loadTeamLeave()"></select>
+            <select id="lm-cal-month" style="width:auto;padding:4px 8px;font-size:11px" onchange="loadTeamLeave()"></select>
           </div>
           <div id="team-leave-list"><div class="loading"><div class="spinner"></div></div></div>
         </div>
@@ -817,9 +817,13 @@ async function loadDashboard(){
     document.getElementById('donut-wrap').innerHTML=`<svg width="100" height="100" viewBox="0 0 100 100"><circle cx="50" cy="50" r="38" fill="none" stroke="var(--bg2)" stroke-width="14"/><circle cx="50" cy="50" r="38" fill="none" stroke="var(--green)" stroke-width="14" stroke-dasharray="${wfoA} ${circ}" stroke-dashoffset="0" stroke-linecap="round"/><circle cx="50" cy="50" r="38" fill="none" stroke="var(--blue)" stroke-width="14" stroke-dasharray="${wfhA} ${circ}" stroke-dashoffset="${-wfoA}" stroke-linecap="round"/><circle cx="50" cy="50" r="38" fill="none" stroke="var(--amber)" stroke-width="14" stroke-dasharray="${ambA} ${circ}" stroke-dashoffset="${-(wfoA+wfhA)}" stroke-linecap="round"/><text x="50" y="46" text-anchor="middle" font-family="Instrument Serif" font-size="16" fill="var(--tx)">${total}</text><text x="50" y="58" text-anchor="middle" font-family="Geist Mono" font-size="7" fill="var(--tx3)">TODAY</text></svg><div class="donut-legend"><div class="leg-item"><div class="leg-dot" style="background:var(--green)"></div><span style="color:var(--tx2)">In office</span><span class="leg-val">${stats.wfo}</span></div><div class="leg-item"><div class="leg-dot" style="background:var(--blue)"></div><span style="color:var(--tx2)">WFH</span><span class="leg-val">${stats.wfh}</span></div><div class="leg-item"><div class="leg-dot" style="background:var(--amber)"></div><span style="color:var(--tx2)">Pending</span><span class="leg-val">${stats.ambiguous}</span></div></div>`;
   }
   if(today?.checkins){
-    document.getElementById('dash-tbody').innerHTML=today.checkins.length
-      ?today.checkins.map(c=>{const color=colorFor(c.employee_id),ini=iniOf(c.employee_name);
-        const status=c.display_status||c.status; // 'split' for pill display
+    // Employees only see their own team's check-ins in Recent section
+    const visibleCheckins = (MY_ROLE==='employee' && MY_TEAM)
+      ? today.checkins.filter(c => c.team === MY_TEAM || c.employee_id === MY_ID)
+      : today.checkins;
+    document.getElementById('dash-tbody').innerHTML=visibleCheckins.length
+      ?visibleCheckins.map(c=>{const color=colorFor(c.employee_id),ini=iniOf(c.employee_name);
+        const status=c.display_status||c.status;
         return`<tr><td><div style="display:flex;align-items:center;gap:9px"><div style="width:26px;height:26px;border-radius:50%;background:${color};display:flex;align-items:center;justify-content:center;font-size:9px;font-weight:600;color:#fff">${ini}</div><div><div style="font-size:12px;font-weight:500">${c.employee_name}</div><div style="font-family:var(--mono);font-size:10px;color:var(--tx3)">${c.employee_id}</div></div></div></td><td><div style="display:inline-flex;align-items:center;gap:6px;flex-wrap:wrap">${chipS(status,c.split_label)}${renderSplitLabel(c.split_label)}</div></td><td><code style="font-size:10px;background:var(--bg2);padding:2px 6px;border-radius:4px">${c.lan_ip||'-'}</code></td><td style="font-family:var(--mono);font-size:10px;color:${c.vpn_active?'var(--amber)':'var(--tx3)'}">${c.vpn_active?'<span style="color:var(--amber);display:inline-flex;align-items:center;gap:3px">' + svgI('lock',11) + ' On</span>':'<span style="color:var(--tx3)">Off</span>'}</td><td>${chipC(c.confidence)}</td><td style="font-family:var(--mono);font-size:10px;color:var(--tx3)">${fmt(c.timestamp)}</td></tr>`;
       }).join('')
       :'<tr><td colspan="6" style="text-align:center;color:var(--tx3);padding:24px;font-family:var(--mono);font-size:11px">No check-ins today yet.</td></tr>';
@@ -1307,7 +1311,7 @@ async function initLeaveManagement(){
   }
   const grid=document.getElementById('lm-type-grid');
   if(grid)grid.innerHTML=Object.entries(LEAVE_TYPES).map(([k,v])=>`<button class="leave-type-btn" id="mgrltype-${k}" onclick="selectMgrLeaveType('${k}')" title="${v.label}"><i data-lucide="${v.icon}"></i>${v.label}</button>`).join('');
-  monthOpts('team-leave-month');
+  monthOpts('lm-cal-month');
   const fromEl=document.getElementById('lm-date-from'),toEl=document.getElementById('lm-date-to');
   // Default to next Monday if today is weekend
   const defaultDate=(()=>{
@@ -1358,7 +1362,8 @@ async function managerApplyLeave(){
   reIcons();
 }
 async function loadTeamLeave(){
-  const month=document.getElementById('team-leave-month')?.value;if(!month)return;
+  const monthEl=document.getElementById('lm-cal-month')||document.getElementById('team-leave-month');
+  const month=monthEl?.value;if(!month)return;
   let teamFilter='';
   if(MY_ROLE==='employee'&&MY_TEAM){
     // Employees scoped to own team only — no filter UI shown to them

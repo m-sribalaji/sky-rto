@@ -1279,12 +1279,14 @@ async def export_csv(month: str=None, request: Request=None,
             passed = wk_wfo >= target
             week_results.append("P" if passed else ("F" if target > 0 else "-"))
 
-        # Monthly totals
+        # Monthly totals (public holidays excluded from wfh count)
         past_days = [ds for ds in working_days if date.fromisoformat(ds) < today]
         for ds in past_days:
             r = records.get(ds)
             if ds in leaves:
                 leave += 1
+            elif ds in ph_dates:
+                leave += 1  # public holiday counts same as leave
             elif r:
                 s = await get_day_summary(dev.employee_id, ds, db)
                 dom = dominant_status_from_segments(s.get("segments", [])) or r.final_status or ""
@@ -1300,8 +1302,9 @@ async def export_csv(month: str=None, request: Request=None,
         # Notes
         notes = []
         if absent > 2: notes.append(f"{absent} untracked days")
-        rag = "On track" if rto_pct >= 60 else ("At risk" if rto_pct >= 40 else "Below target")
-        if wfo + wfh > 0: notes.append(rag)
+        # Use 12-day monthly target for notes
+        if wfo >= 12: notes.append("Monthly target met")
+        elif wfo + wfh > 0: notes.append(f"{wfo}/12 WFO days")
 
         w.writerow([team, dev.employee_name, dev.employee_id,
                     wfo, wfh, leave, absent,
