@@ -2176,11 +2176,11 @@ async function loadRhythm(){
   const bestCard = `
     <div class="card">
       <div class="card-title">Best Meeting Days <span class="card-sub">${team}</span></div>
-      ${bestDay ? `<div style="font-family:var(--mono);font-size:10px;color:var(--green);margin-bottom:10px">Best day: ${bestDay}</div>` : ''}
       <div style="display:flex;gap:8px;align-items:flex-end;height:56px;margin-bottom:8px">${bestBars}</div>
       <div style="font-family:var(--mono);font-size:10px;color:var(--tx3)">
         Based on last ${d.lookback_weeks} weeks · ${d.team_size} member${d.team_size!==1?'s':''}
         ${d.data_start ? ` · Data from ${d.data_start}` : ''}
+        ${bestDay ? ` · <span style="color:var(--green)">Best day: ${bestDay}</span>` : ''}
       </div>
     </div>`;
 
