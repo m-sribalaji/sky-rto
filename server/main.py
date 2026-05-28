@@ -1052,11 +1052,8 @@ async def get_compliance(month: str=None, team: str=None, request: Request=None,
             week_any   = week_wfo + week_wfh + week_leave
 
             # -- Grace period rule -----------------------------
-            # If the employee has ZERO activity this week (no checkin,
-            # no leave, no segment) - treat as "no data" not "missed".
-            # This covers weeks before app install, onboarding gaps etc.
-            # Only penalise weeks where the employee DID interact with
-            # the system but didn't meet the WFO target.
+            # Case 1: ZERO activity → no data, no penalty.
+            # Covers weeks before app install / onboarding gaps.
             if week_any == 0:
                 adjusted_target = max(0, 3 - week_leave)
                 weekly_results.append({
@@ -1065,8 +1062,36 @@ async def get_compliance(month: str=None, team: str=None, request: Request=None,
                     "wfo":           0,
                     "leave":         0,
                     "target":        adjusted_target,
-                    "passed":        True,   # no data = no penalty
+                    "passed":        True,
                     "no_data":       True,
+                })
+                continue
+
+            # Case 2: PARTIAL WEEK install grace period.
+            # If the employee had activity on fewer days than the number
+            # of working days in the week, they likely installed mid-week.
+            # Rule: active_days < min(3, working_days_in_week) → grace period.
+            # Examples:
+            #   Full week (5 days), installed Mon → active could be 1-5 → evaluated normally
+            #   Full week (5 days), installed Wed → active ≤ 3 → grace period
+            #   Short week (3 days, bank hol Mon/Tue) → active < 3 → grace
+            # "Active days" = days with any check-in OR leave (excludes public holidays)
+            working_days_in_week = sum(1 for ds in week if ds not in ph_dates)
+            grace_threshold = min(3, working_days_in_week)
+            # active_days = days with actual data (not just public holidays)
+            active_days = sum(1 for ds in week
+                              if date_status.get(ds) and ds not in ph_dates)
+            if active_days < grace_threshold:
+                adjusted_target = max(0, 3 - week_leave)
+                weekly_results.append({
+                    "week_start":    week[0],
+                    "week_end":      week[-1],
+                    "wfo":           week_wfo,
+                    "leave":         week_leave,
+                    "target":        adjusted_target,
+                    "passed":        True,   # partial week = grace, no penalty
+                    "no_data":       True,   # shown as "no data" in UI
+                    "partial_week":  True,   # distinguishes from zero-data grace
                 })
                 continue
 

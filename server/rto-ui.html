@@ -1243,7 +1243,11 @@ async function loadCompliance(){
   if(!d?.team?.length){tbody.innerHTML='<tr><td colspan="8" style="text-align:center;padding:24px;color:var(--tx3);font-family:var(--mono);font-size:11px">No data.</td></tr>';return;}
   tbody.innerHTML=d.team.map(r=>{
     // Build weekly tooltip
-    const weekTip=(r.weekly||[]).map(w=>w.no_data?`WK ${w.week_start.slice(5)}: No data (grace period)`:`WK ${w.week_start.slice(5)}: ${w.wfo}/${w.target} WFO ${w.passed?'Pass':'Miss'}${w.leave?` (${w.leave}d leave)`:''}`).join('&#10;');
+    const weekTip=(r.weekly||[]).map(w=>{
+      if(w.no_data && w.partial_week) return `WK ${w.week_start.slice(5)}: Partial week (grace period)`;
+      if(w.no_data) return `WK ${w.week_start.slice(5)}: No data (grace period)`;
+      return `WK ${w.week_start.slice(5)}: ${w.wfo}/${w.target} WFO ${w.passed?'Pass':'Miss'}${w.leave?` (${w.leave}d leave)`:''}`;
+    }).join('&#10;');
     // For weeks display: only count weeks that had actual data
     const realWeeks=r.weekly?r.weekly.filter(w=>!w.no_data):[];
     const realPassed=realWeeks.filter(w=>w.passed).length;
