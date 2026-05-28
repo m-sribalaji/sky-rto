@@ -1329,6 +1329,154 @@ async def export_csv(month: str=None, request: Request=None,
         headers={"Content-Disposition":
                  f"attachment; filename=rto_attendance_{month}.csv"})
 
+# ── ANALYTICS ENDPOINTS ──────────────────────────────────────────────────────
+# Powered by analytics.py — EWMA+Markov forecast and Jaccard team rhythm
+
+from analytics import (
+    compute_forecast, compute_team_rhythm,
+    build_attendance, _workdays_in_month, LEAVE_TYPES as _ANALYTICS_LEAVE_TYPES,
+)
+
+@app.get("/api/insights/{employee_id}")
+async def get_insights(employee_id: str, request: Request = None,
+                       db: AsyncSession = Depends(get_db)):
+    """
+    Personal WFO forecast for the next 14 working days + monthly progress.
+    Accessible by the employee themselves, their manager, or admin.
+    """
+    caller_id = get_caller_id(request) if request else None
+    # Access check: can only view own or managed team members
+    if caller_id and caller_id != employee_id:
+        managed = await get_managed_teams(caller_id, db)
+        if managed is not None:
+            dq = await db.execute(select(Device).where(Device.employee_id == employee_id))
+            dev_chk = dq.scalars().first()
+            if not dev_chk or dev_chk.team not in managed:
+                raise HTTPException(403, "Access denied")
+
+    dq = await db.execute(select(Device).where(Device.employee_id == employee_id))
+    device = dq.scalars().first()
+    if not device:
+        raise HTTPException(404, "Employee not registered")
+
+    today = date.today()
+    month = today.strftime("%Y-%m")
+
+    # Fetch last 12 weeks of checkins
+    cutoff = (today - timedelta(weeks=12)).isoformat()
+    ci_q = await db.execute(select(CheckIn).where(and_(
+        CheckIn.employee_id == employee_id,
+        CheckIn.date >= cutoff,
+    )).order_by(CheckIn.date))
+    checkins = [{"date": r.date, "status": r.final_status or r.auto_status or "wfh"}
+                for r in ci_q.scalars().all()]
+
+    # Fetch leaves
+    lv_q = await db.execute(select(LeaveRequest).where(and_(
+        LeaveRequest.employee_id == employee_id,
+        LeaveRequest.date >= cutoff,
+    )))
+    leaves = [{"date": l.date, "leave_type": l.leave_type}
+              for l in lv_q.scalars().all()]
+
+    # Public holidays
+    ph_q = await db.execute(select(PublicHoliday))
+    ph_dates = {h.date for h in ph_q.scalars().all()}
+
+    # Current month actual WFO count
+    seg_q = await db.execute(select(DaySegment).where(and_(
+        DaySegment.employee_id == employee_id,
+        DaySegment.date.like(f"{month}%"),
+    )))
+    segs_month = seg_q.scalars().all()
+    from segments import dominant_status_from_segments as _dom
+    date_status_month: dict = {}
+    for seg in segs_month:
+        ds = seg.date
+        st = seg.final_status or seg.status
+        if date_status_month.get(ds) != "wfo":
+            date_status_month[ds] = st
+    current_month_wfo = sum(1 for ds, st in date_status_month.items()
+                             if st == "wfo" and ds not in ph_dates)
+
+    result = compute_forecast(
+        employee_id         = employee_id,
+        employee_name       = device.employee_name,
+        checkins            = checkins,
+        leaves              = leaves,
+        ph_dates            = ph_dates,
+        today               = today,
+        forecast_days       = 14,
+        current_month_wfo   = current_month_wfo,
+        current_month_total_workdays = len(_workdays_in_month(today.year, today.month, ph_dates)),
+    )
+    return result
+
+
+@app.get("/api/rhythm/{team}")
+async def get_team_rhythm(team: str, request: Request = None,
+                          lookback_weeks: int = 8,
+                          db: AsyncSession = Depends(get_db)):
+    """
+    Team rhythm analysis: overlap matrix, best meeting days, heatmap.
+    Accessible by all team members, managers, and admins.
+    Employees can only query their own team.
+    """
+    caller_id = get_caller_id(request) if request else None
+    if caller_id:
+        dq = await db.execute(select(Device).where(Device.employee_id == caller_id))
+        caller_dev = dq.scalars().first()
+        caller_role = await get_role(caller_id, db) if caller_id else "employee"
+        if caller_role == "employee":
+            # Employee can only see their own team
+            if caller_dev and caller_dev.team != team:
+                raise HTTPException(403, "Employees can only view their own team rhythm")
+
+    # Get all team members
+    dq = await db.execute(select(Device).where(Device.team == team).order_by(Device.employee_name))
+    devices = dq.scalars().all()
+    if not devices:
+        raise HTTPException(404, f"No members found for team: {team}")
+
+    today = date.today()
+    cutoff = (today - timedelta(weeks=lookback_weeks + 2)).isoformat()
+
+    # Public holidays
+    ph_q = await db.execute(select(PublicHoliday))
+    ph_dates = {h.date for h in ph_q.scalars().all()}
+
+    members = []
+    for dev in devices:
+        ci_q = await db.execute(select(CheckIn).where(and_(
+            CheckIn.employee_id == dev.employee_id,
+            CheckIn.date >= cutoff,
+        )).order_by(CheckIn.date))
+        checkins = [{"date": r.date, "status": r.final_status or r.auto_status or "wfh"}
+                    for r in ci_q.scalars().all()]
+
+        lv_q = await db.execute(select(LeaveRequest).where(and_(
+            LeaveRequest.employee_id == dev.employee_id,
+            LeaveRequest.date >= cutoff,
+        )))
+        leaves = [{"date": l.date, "leave_type": l.leave_type}
+                  for l in lv_q.scalars().all()]
+
+        members.append({
+            "employee_id":   dev.employee_id,
+            "employee_name": dev.employee_name,
+            "checkins":      checkins,
+            "leaves":        leaves,
+        })
+
+    result = compute_team_rhythm(
+        members        = members,
+        ph_dates       = ph_dates,
+        today          = today,
+        lookback_weeks = lookback_weeks,
+    )
+    result["team"] = team
+    return result
+
 @app.get("/api/team-leave")
 async def get_team_leave(month: str=None, team: str=None,
                          request: Request=None, db: AsyncSession=Depends(get_db)):

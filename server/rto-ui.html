@@ -471,6 +471,21 @@ input::placeholder,textarea::placeholder{color:var(--tx3);}textarea{resize:verti
       </div>
     </div>
 
+
+    <!-- INSIGHTS -->
+    <div class="page" id="page-insights">
+      <div id="insights-content"><div class="loading"><div class="spinner"></div>Loading...</div></div>
+    </div>
+
+    <!-- TEAM RHYTHM -->
+    <div class="page" id="page-rhythm">
+      <div id="rhythm-team-filter" style="display:none;margin-bottom:14px">
+        <select id="rhythm-team-sel" onchange="loadRhythm()" style="width:auto;padding:5px 10px;font-size:12px;background:var(--bg2);border:1px solid var(--acc);border-radius:7px;color:var(--tx)">
+          <option value="">Select team</option>
+        </select>
+      </div>
+      <div id="rhythm-content"><div class="loading"><div class="spinner"></div>Loading...</div></div>
+    </div>
   </div>
 </main>
 </div>
@@ -508,7 +523,7 @@ const LEAVE_TYPES={
   half_day_pm:{label:'Half Day PM',icon:'sunset'},
   other:{label:'Other',icon:'file-text'},
 };
-const pageTitles={dashboard:'Dashboard',today:"Today's Status",mystatus:'My Status',history:'History',compliance:'WFO Compliance',leavemgmt:'Leave Management',teamassign:'Team Access',anomalies:'Anomalies',override:'Override',team:'Team',roles:'Role Management',config:'Configuration'};
+const pageTitles={dashboard:'Dashboard',today:"Today's Status",mystatus:'My Status',history:'History',compliance:'WFO Compliance',leavemgmt:'Leave Management',teamassign:'Team Access',anomalies:'Anomalies',override:'Override',team:'Team',roles:'Role Management',config:'Configuration',insights:'Insights',rhythm:'Team Rhythm'};
 
 // -- UTILS ----------------------------------------------
 async function get(p){
@@ -673,6 +688,10 @@ function buildNav(){
     <div class="nav-item" onclick="nav('team')"><i data-lucide="users"></i>Team</div>
     <div class="nav-item" onclick="nav('teamassign')"><i data-lucide="network"></i>Team Access</div>`;
   }
+  // Insights + Team Rhythm — visible to all roles
+  html+=`<div class="nav-grp" style="margin-top:8px">Analytics</div>
+  <div class="nav-item" onclick="nav('insights')"><i data-lucide="sparkles"></i>Insights</div>
+  <div class="nav-item" onclick="nav('rhythm')"><i data-lucide="activity"></i>Team Rhythm</div>`;
   if(isAdm){
     html+=`<div class="nav-grp" style="margin-top:8px">Admin</div>
     <div class="nav-item" onclick="nav('roles')"><i data-lucide="shield-check"></i>Roles</div>
@@ -709,6 +728,8 @@ function nav(id){
   if(id==='roles')loadRoles();
   if(id==='teamassign')loadTeamAssign();
   if(id==='config')loadConfig();
+  if(id==='insights')loadInsights();
+  if(id==='rhythm')loadRhythm();
   setTimeout(reIcons,150);
 }
 
@@ -1688,6 +1709,8 @@ async function initApp(){
       else if(a==='leavemgmt')  loadTeamLeave();   // only refresh the calendar, not the form
       else if(a==='anomalies')  loadAnomalies();
       else if(a==='team')       loadTeam();
+      else if(a==='insights') loadInsights();
+      else if(a==='rhythm')   loadRhythm();
       else nav(a); // for other pages (config, roles etc) full nav is fine
     }catch(e){}
   },60000);
@@ -1917,6 +1940,376 @@ if(document.readyState==='loading'){
 } else {
   initApp();
 }
+// ── INSIGHTS ──────────────────────────────────────────────────────────────
+async function loadInsights(){
+  const el = document.getElementById('insights-content');
+  el.innerHTML = '<div class="loading"><div class="spinner"></div>Loading your insights...</div>';
+
+  const empId = MY_ID;
+  // Fetch both forecast and compliance data in parallel
+  const [d, compData] = await Promise.all([
+    get(`/api/insights/${empId}`),
+    get(`/api/compliance?month=${TODAY.slice(0,7)}`),
+  ]);
+  if(!d){ el.innerHTML = '<div class="notice warn">Could not load insights.</div>'; return; }
+
+  if(d.insufficient_data){
+    el.innerHTML = `
+      <div class="card" style="max-width:560px">
+        <div class="card-title">Insights <span class="card-sub">Personal forecast</span></div>
+        <div class="notice info" style="margin:0">
+          <i data-lucide="info"></i>
+          <span>${d.message}</span>
+        </div>
+      </div>`;
+    reIcons(); return;
+  }
+
+  const m = d.monthly;
+  const pct = Math.round((m.actual_wfo / m.target) * 100);
+  const barW = Math.min(100, pct);
+  const barColor = pct >= 100 ? 'var(--green)' : pct >= 60 ? 'var(--amber)' : 'var(--red)';
+  const needed = m.needed;
+  const remaining = m.remaining_days;
+  const achievable = m.achievable;
+  const predicted = m.predicted_total || m.actual_wfo;
+
+  // Progress card
+  const progressCard = `
+    <div class="card">
+      <div class="card-title">My ${m.month} Progress <span class="card-sub">${d.confidence_label}</span></div>
+      <div style="margin:6px 0 14px">
+        <div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:6px">
+          <span style="font-family:var(--serif);font-size:28px;color:${barColor}">${m.actual_wfo}</span>
+          <span style="font-family:var(--mono);font-size:11px;color:var(--tx3)">/ ${m.target} WFO days</span>
+        </div>
+        <div style="height:6px;background:var(--bg2);border-radius:4px;overflow:hidden">
+          <div style="height:100%;width:${barW}%;background:${barColor};border-radius:4px;transition:width 0.6s ease"></div>
+        </div>
+        <div style="display:flex;justify-content:space-between;margin-top:6px">
+          <span style="font-family:var(--mono);font-size:10px;color:var(--tx3)">${m.elapsed_days} days elapsed</span>
+          <span style="font-family:var(--mono);font-size:10px;color:var(--tx3)">${remaining} days remaining</span>
+        </div>
+      </div>
+      ${needed > 0 ? `
+      <div style="display:flex;flex-direction:column;gap:6px">
+        <div style="font-family:var(--mono);font-size:11px;color:${achievable?'var(--amber)':'var(--red)'}">
+          ${needed} more WFO day${needed!==1?'s':''} needed ${achievable?`— achievable in ${remaining} remaining days`:'— target may be difficult to reach'}
+        </div>
+        ${d.confidence !== 'insufficient' ? `
+        <div style="font-family:var(--mono);font-size:10px;color:var(--tx3)">
+          Based on your pattern: predicted month-end total ~${predicted} days
+        </div>` : ''}
+      </div>` : `
+      <div style="font-family:var(--mono);font-size:11px;color:var(--green)">
+        Monthly target met!
+      </div>`}
+    </div>`;
+
+  // Day-of-week pattern card
+  const dowNames = ['Mon','Tue','Wed','Thu','Fri'];
+  const dowBars = Object.entries(d.dow_rates || {}).map(([dow, rate]) => {
+    const h = Math.round(rate * 48);
+    const c = rate >= 0.65 ? 'var(--green)' : rate >= 0.35 ? 'var(--amber)' : 'var(--red)';
+    return `<div style="display:flex;flex-direction:column;align-items:center;gap:4px;flex:1">
+      <div style="font-family:var(--mono);font-size:9px;color:var(--tx3)">${Math.round(rate*100)}%</div>
+      <div style="width:100%;height:48px;display:flex;align-items:flex-end">
+        <div style="width:100%;height:${h}px;background:${c};border-radius:3px 3px 0 0;min-height:3px"></div>
+      </div>
+      <div style="font-family:var(--mono);font-size:9px;color:var(--tx2)">${dowNames[dow]}</div>
+    </div>`;
+  }).join('');
+
+  const patternCard = `
+    <div class="card">
+      <div class="card-title">Your WFO Pattern <span class="card-sub">Day-of-week probability</span></div>
+      <div style="display:flex;gap:8px;align-items:flex-end;height:80px">${dowBars}</div>
+      <div style="font-family:var(--mono);font-size:10px;color:var(--tx3);margin-top:8px">
+        Based on ${d.active_weeks} week${d.active_weeks!==1?'s':''} of data — ${d.confidence_label}
+      </div>
+    </div>`;
+
+  // 14-day forecast card
+  const forecastRows = (d.forecast || []).map(f => {
+    const isWeekend = false; // server already excludes weekends
+    let statusHtml = '';
+    if(f.certain && f.status === 'leave'){
+      statusHtml = `<span class="chip c-leave" style="font-size:10px">${svgI('calendar-x',10)} ${f.leave_type?.replace(/_/g,' ')||'Leave'}</span>`;
+    } else if(f.certain && f.status === 'public_holiday'){
+      statusHtml = `<span class="chip c-leave" style="font-size:10px">${svgI('sparkles',10)} Holiday</span>`;
+    } else if(f.certain && f.status === 'wfo'){
+      statusHtml = `<span class="chip c-wfo" style="font-size:10px">${svgI('building',10)} WFO</span>`;
+    } else if(f.certain && f.status === 'wfh'){
+      statusHtml = `<span class="chip c-wfh" style="font-size:10px">${svgI('home',10)} WFH</span>`;
+    } else {
+      const prob = Math.round(f.probability * 100);
+      const c = prob >= 60 ? 'var(--green)' : prob >= 35 ? 'var(--amber)' : 'var(--blue)';
+      const label = prob >= 60 ? 'Likely WFO' : prob >= 35 ? 'Uncertain' : 'Likely WFH';
+      const band = f.prob_low !== undefined ? ` (${Math.round(f.prob_low*100)}-${Math.round(f.prob_high*100)}%)` : '';
+      statusHtml = `<span style="font-family:var(--mono);font-size:10px;color:${c}">${label} — ${prob}%${band}</span>`;
+    }
+    const isToday = f.date === TODAY;
+    return `<tr style="${isToday?'background:rgba(193,123,63,0.06)':''}">
+      <td style="font-family:var(--mono);font-size:10px;color:${isToday?'var(--acc)':'var(--tx3)'}">${f.date}</td>
+      <td style="font-family:var(--mono);font-size:10px;color:var(--tx2)">${f.dow_name}</td>
+      <td>${statusHtml}</td>
+    </tr>`;
+  }).join('');
+
+  const forecastCard = `
+    <div class="card">
+      <div class="card-title">14-Day Forecast <span class="card-sub">Next 2 working weeks</span></div>
+      <div class="tbl-wrap"><table>
+        <thead><tr><th>Date</th><th>Day</th><th>Prediction</th></tr></thead>
+        <tbody>${forecastRows}</tbody>
+      </table></div>
+      <div style="font-family:var(--mono);font-size:10px;color:var(--tx3);margin-top:8px">
+        Predictions use your historical pattern + day-to-day transitions. Leave and holidays are certain.
+      </div>
+    </div>`;
+
+  // Self-compliance card — employee sees their own RAG status
+  const myComp = (compData?.team||[]).find(r=>r.employee_id===empId);
+  let compCard = '';
+  if(myComp){
+    const ragCol = myComp.rag==='green'?'var(--green)':myComp.rag==='amber'?'var(--amber)':myComp.rag==='orange'?'#f97316':'var(--red)';
+    const ragLabel = myComp.rag==='green'?'Target met':myComp.rag==='amber'?'On track':myComp.rag==='orange'?'Weekly pattern uneven':'Monthly target missed';
+    const weekTip = (myComp.weekly||[]).map(w=>{
+      if(w.no_data && w.partial_week) return `WK ${w.week_start.slice(5)}: Partial week (grace)`;
+      if(w.no_data) return `WK ${w.week_start.slice(5)}: No data (grace period)`;
+      return `WK ${w.week_start.slice(5)}: ${w.wfo}/${w.target} WFO ${w.passed?'Pass':'Miss'}`;
+    }).join('\n');
+    const realWeeks=(myComp.weekly||[]).filter(w=>!w.no_data);
+    const realPassed=realWeeks.filter(w=>w.passed).length;
+    compCard = `
+      <div class="card">
+        <div class="card-title">My Compliance Status <span class="card-sub">${TODAY.slice(0,7)}</span></div>
+        <div style="display:flex;align-items:center;gap:14px;padding:10px 0">
+          <div style="width:14px;height:14px;border-radius:50%;background:${ragCol};flex-shrink:0"></div>
+          <div>
+            <div style="font-size:13px;font-weight:500;color:${ragCol}">${ragLabel}</div>
+            <div style="font-family:var(--mono);font-size:11px;color:var(--tx2);margin-top:2px">${myComp.status||'-'}</div>
+          </div>
+        </div>
+        <div style="display:flex;gap:18px;padding:10px 0;border-top:1px solid var(--b0)">
+          <div style="text-align:center">
+            <div style="font-family:var(--serif);font-size:22px;color:var(--green)">${myComp.wfo}</div>
+            <div style="font-family:var(--mono);font-size:9px;color:var(--tx3)">WFO days</div>
+          </div>
+          <div style="text-align:center">
+            <div style="font-family:var(--serif);font-size:22px;color:var(--blue)">${myComp.wfh}</div>
+            <div style="font-family:var(--mono);font-size:9px;color:var(--tx3)">WFH days</div>
+          </div>
+          <div style="text-align:center">
+            <div style="font-family:var(--serif);font-size:22px;color:var(--amber)">${myComp.leave}</div>
+            <div style="font-family:var(--mono);font-size:9px;color:var(--tx3)">Leave days</div>
+          </div>
+          <div style="flex:1"></div>
+          <div title="${weekTip}" style="text-align:center;cursor:default">
+            <div style="font-family:var(--serif);font-size:22px;color:${realWeeks.length===0?'var(--tx3)':realPassed===realWeeks.length?'var(--green)':realPassed>0?'var(--amber)':'var(--red)'}">${realWeeks.length===0?'-':realPassed+'/'+realWeeks.length}</div>
+            <div style="font-family:var(--mono);font-size:9px;color:var(--tx3)">weeks passed</div>
+          </div>
+        </div>
+      </div>`;
+  }
+
+  el.innerHTML = `<div class="two-col">${progressCard}${patternCard}</div>${compCard}${forecastCard}`;
+  reIcons();
+}
+
+// ── TEAM RHYTHM ────────────────────────────────────────────────────────────
+async function loadRhythm(){
+  const el = document.getElementById('rhythm-content');
+  el.innerHTML = '<div class="loading"><div class="spinner"></div>Loading team rhythm...</div>';
+
+  const isMgr = MY_ROLE==='manager'||MY_ROLE==='admin';
+
+  // Determine team to load
+  let team = MY_TEAM;
+  if(isMgr){
+    // Show team filter for managers/admins
+    const filterWrap = document.getElementById('rhythm-team-filter');
+    const filterSel  = document.getElementById('rhythm-team-sel');
+    if(filterWrap) filterWrap.style.display = 'block';
+    if(filterSel && filterSel.options.length <= 1){
+      const teams = MY_MANAGED_TEAMS || await _getAllTeams();
+      filterSel.innerHTML = '<option value="">Select team</option>' +
+        teams.map(t => `<option value="${t}">${t}</option>`).join('');
+    }
+    team = filterSel?.value || '';
+    if(!team){
+      el.innerHTML = '<div style="color:var(--tx3);font-family:var(--mono);font-size:12px;padding:20px 0">Select a team above to view their rhythm.</div>';
+      return;
+    }
+  }
+
+  if(!team){
+    el.innerHTML = '<div class="notice warn"><i data-lucide="triangle-alert"></i><span>No team assigned.</span></div>';
+    reIcons(); return;
+  }
+
+  const d = await get(`/api/rhythm/${encodeURIComponent(team)}`);
+  if(!d){ el.innerHTML = '<div class="notice warn">Could not load team rhythm.</div>'; reIcons(); return; }
+
+  const dowNames = ['Monday','Tuesday','Wednesday','Thursday','Friday'];
+  const dowShort = ['Mon','Tue','Wed','Thu','Fri'];
+
+  // ── Best days card ──────────────────────────────────────────────────────
+  const bestDays = (d.best_days || []).slice(0, 5);
+  const bestBars = bestDays.map((bd, i) => {
+    const h = Math.round(bd.probability * 56);
+    const c = i === 0 ? 'var(--green)' : i === 1 ? 'var(--green)' : 'var(--amber)';
+    const crown = i === 0 ? `<div style="font-size:10px;text-align:center">★</div>` : '';
+    return `<div style="display:flex;flex-direction:column;align-items:center;gap:3px;flex:1">
+      ${crown}
+      <div style="font-family:var(--mono);font-size:9px;color:var(--tx3)">${bd.label}</div>
+      <div style="width:100%;height:56px;display:flex;align-items:flex-end">
+        <div style="width:100%;height:${Math.max(h,3)}px;background:${c};border-radius:3px 3px 0 0;opacity:0.85"></div>
+      </div>
+      <div style="font-family:var(--mono);font-size:9px;color:var(--tx2)">${bd.dow_name.slice(0,3)}</div>
+    </div>`;
+  }).join('');
+
+  const bestCard = `
+    <div class="card">
+      <div class="card-title">Best Meeting Days <span class="card-sub">${team}</span></div>
+      <div style="display:flex;gap:8px;align-items:flex-end;height:90px;margin-bottom:4px">${bestBars}</div>
+      <div style="font-family:var(--mono);font-size:10px;color:var(--tx3)">
+        Based on last ${d.lookback_weeks} weeks · ${d.team_size} member${d.team_size!==1?'s':''}
+        ${d.data_start ? ` · Data from ${d.data_start}` : ''}
+      </div>
+    </div>`;
+
+  // ── Overlap matrix card ─────────────────────────────────────────────────
+  const overlapRows = (d.overlap_matrix || []).map(pair => {
+    const sc = pair.score;
+    const c  = sc >= 0.60 ? 'var(--green)' : sc >= 0.35 ? 'var(--amber)' : 'var(--red)';
+    const bar = Math.round(sc * 100);
+    return `<tr>
+      <td style="font-size:12px">${pair.a_name.split(' ')[0]} + ${pair.b_name.split(' ')[0]}</td>
+      <td>
+        <div style="display:flex;align-items:center;gap:8px">
+          <div style="flex:1;height:5px;background:var(--bg2);border-radius:3px;overflow:hidden">
+            <div style="height:100%;width:${bar}%;background:${c};border-radius:3px"></div>
+          </div>
+          <span style="font-family:var(--mono);font-size:10px;color:${c};min-width:32px">${bar}%</span>
+        </div>
+      </td>
+      <td style="font-family:var(--mono);font-size:10px;color:var(--tx3)">${pair.shared_days} shared days</td>
+      <td style="font-family:var(--mono);font-size:10px;color:var(--tx3)">${pair.label}</td>
+    </tr>`;
+  }).join('');
+
+  const overlapCard = `
+    <div class="card">
+      <div class="card-title">Team Overlap <span class="card-sub">Days in office together</span></div>
+      ${overlapRows ? `<div class="tbl-wrap"><table>
+        <thead><tr><th>Pair</th><th>Overlap score</th><th>Shared days</th><th>Assessment</th></tr></thead>
+        <tbody>${overlapRows}</tbody>
+      </table></div>` : '<div style="color:var(--tx3);font-family:var(--mono);font-size:11px">Not enough data yet.</div>'}
+    </div>`;
+
+  // ── Heatmap card ────────────────────────────────────────────────────────
+  const heatmap = d.heatmap || [];
+  const weeks = heatmap[0]?.weeks || [];
+  const weekLabels = weeks.map(w => {
+    const d2 = new Date(w.week_start + 'T12:00:00');
+    return d2.toLocaleDateString('en-GB',{month:'short',day:'numeric'});
+  });
+
+  const heatRows = heatmap.map(row => {
+    const cells = row.weeks.map(w => {
+      const r = w.rate;
+      const op = w.total_days === 0 ? 0.15 : 0.2 + r * 0.8;
+      const bg = w.total_days === 0 ? 'var(--bg3)' :
+                 r >= 0.6 ? `rgba(74,222,128,${op})` :
+                 r >= 0.3 ? `rgba(251,191,36,${op})` :
+                 `rgba(248,113,113,${op})`;
+      const title = w.total_days === 0 ? 'No data' :
+        `${w.wfo_days}/${w.total_days} WFO days (${Math.round(r*100)}%)`;
+      return `<td title="${title}" style="width:32px;height:26px;background:${bg};border-radius:3px;text-align:center;font-family:var(--mono);font-size:9px;color:var(--tx2);cursor:default">
+        ${w.total_days > 0 ? w.wfo_days : ''}
+      </td>`;
+    }).join('');
+    return `<tr>
+      <td style="font-size:11px;padding-right:12px;white-space:nowrap">${row.employee_name.split(' ')[0]}</td>
+      ${cells}
+    </tr>`;
+  }).join('');
+
+  const heatHeader = weekLabels.map(l =>
+    `<th style="font-family:var(--mono);font-size:9px;font-weight:400;color:var(--tx3);white-space:nowrap">${l}</th>`
+  ).join('');
+
+  const heatCard = `
+    <div class="card">
+      <div class="card-title">WFO Heatmap <span class="card-sub">Last ${d.lookback_weeks} weeks — darker = more WFO</span></div>
+      <div style="overflow-x:auto">
+        <table style="border-collapse:separate;border-spacing:3px">
+          <thead><tr><th></th>${heatHeader}</tr></thead>
+          <tbody>${heatRows}</tbody>
+        </table>
+      </div>
+      <div style="display:flex;gap:12px;margin-top:10px;align-items:center">
+        <div style="font-family:var(--mono);font-size:9px;color:var(--tx3)">Low</div>
+        ${[0.1,0.3,0.5,0.7,0.9].map(r=>`<div style="width:18px;height:10px;border-radius:2px;background:rgba(74,222,128,${0.2+r*0.8})"></div>`).join('')}
+        <div style="font-family:var(--mono);font-size:9px;color:var(--tx3)">High WFO</div>
+      </div>
+    </div>`;
+
+  // ── Gaps / suggestions card ─────────────────────────────────────────────
+  const gaps = d.gaps || [];
+  const gapsHtml = gaps.length ? gaps.map(g => `
+    <div style="display:flex;align-items:flex-start;gap:10px;padding:10px 12px;background:var(--bg2);border:1px solid rgba(251,191,36,0.2);border-radius:8px">
+      <i data-lucide="users" style="width:13px;height:13px;color:var(--amber);margin-top:2px;flex-shrink:0"></i>
+      <span style="font-size:12px;color:var(--tx2)">${g.message}</span>
+    </div>`).join('') :
+    '<div style="font-family:var(--mono);font-size:11px;color:var(--tx3)">No collaboration gaps detected.</div>';
+
+  const gapsCard = `
+    <div class="card">
+      <div class="card-title">Collaboration Insights <span class="card-sub">Alignment suggestions</span></div>
+      <div style="display:flex;flex-direction:column;gap:8px">${gapsHtml}</div>
+    </div>`;
+
+  // ── Individual patterns card ────────────────────────────────────────────
+  const indivRows = (d.individual || []).map(p => {
+    const rates = Object.entries(p.dow_rates || {});
+    const bars = rates.map(([dow, rate]) => {
+      const h = Math.round(rate * 32);
+      const c = rate >= 0.65 ? 'var(--green)' : rate >= 0.35 ? 'var(--amber)' : 'var(--red)';
+      return `<div style="display:flex;flex-direction:column;align-items:center;gap:1px">
+        <div style="width:14px;height:32px;display:flex;align-items:flex-end">
+          <div style="width:100%;height:${Math.max(h,2)}px;background:${c};border-radius:2px 2px 0 0"></div>
+        </div>
+        <div style="font-family:var(--mono);font-size:8px;color:var(--tx3)">${dowShort[dow]}</div>
+      </div>`;
+    }).join('');
+    const streak = p.current_streak_wfo;
+    const isMe = p.employee_id === MY_ID;
+    return `<div style="display:flex;align-items:center;gap:14px;padding:10px 12px;background:var(--bg2);border:1px solid ${isMe?'rgba(193,123,63,0.3)':'var(--b0)'};border-radius:8px">
+      <div style="width:32px;height:32px;border-radius:50%;background:${colorFor(p.employee_id)};display:flex;align-items:center;justify-content:center;font-size:10px;font-weight:600;color:#fff;flex-shrink:0">${iniOf(p.employee_name)}</div>
+      <div style="flex:1;min-width:0">
+        <div style="font-size:12px;font-weight:500">${p.employee_name}${isMe?' <span style="font-family:var(--mono);font-size:9px;color:var(--acc)">(you)</span>':''}</div>
+        <div style="font-family:var(--mono);font-size:9px;color:var(--tx3)">${p.confidence} · ${p.active_weeks}w data${streak>0?` · ${streak} WFO streak`:''}</div>
+      </div>
+      <div style="display:flex;gap:3px;align-items:flex-end">${bars}</div>
+    </div>`;
+  }).join('');
+
+  const indivCard = `
+    <div class="card">
+      <div class="card-title">Individual Patterns <span class="card-sub">Day-of-week WFO tendency</span></div>
+      <div style="display:flex;flex-direction:column;gap:8px">${indivRows}</div>
+    </div>`;
+
+  el.innerHTML = `
+    <div class="two-col">${bestCard}${overlapCard}</div>
+    ${heatCard}
+    <div class="two-col">${gapsCard}${indivCard}</div>`;
+  reIcons();
+}
+
 </script>
 </body>
 </html>
