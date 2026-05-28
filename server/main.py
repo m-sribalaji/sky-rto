@@ -679,12 +679,27 @@ async def get_today(team: str=None, request: Request=None,
         dev = dq.scalars().first()
         if team and (not dev or dev.team != team): continue
         if managed is not None and dev and dev.team not in managed: continue
+        # Check public holiday once per loop (cached after first call)
+        if not hasattr(get_today, '_ph_cache') or get_today._ph_cache[0] != today_str():
+            ph_chk = await db.execute(select(PublicHoliday).where(
+                PublicHoliday.date==today_str()))
+            ph_rec_t = ph_chk.scalars().first()
+            get_today._ph_cache = (today_str(), ph_rec_t)
+        else:
+            ph_rec_t = get_today._ph_cache[1]
+        # On public holiday: override display_status unless employee came in (wfo)
+        dom_today = dominant_status_from_segments(s.get("segments",[])) or r.final_status or r.auto_status
+        if ph_rec_t and dom_today != "wfo":
+            display_today = "public_holiday"
+        else:
+            display_today = s["display_status"]
         result.append({"employee_id": r.employee_id, "employee_name": r.employee_name,
                        "hostname": r.hostname, "team": dev.team if dev else None,
                        "status": r.final_status or r.auto_status,
-                       "dominant_status": dominant_status_from_segments(s.get("segments",[])) or r.final_status or r.auto_status,
-                       "display_status": s["display_status"], "split_label": s["split_label"],
+                       "dominant_status": dom_today,
+                       "display_status": display_today, "split_label": s["split_label"],
                        "is_split": s["is_split"], "segments": s["segments"], "leaves": s["leaves"],
+                       "is_public_holiday": ph_rec_t is not None,
                        "lan_ip": r.lan_ip, "vpn_active": r.vpn_active, "vpn_tunnel_ip": r.vpn_tunnel_ip,
                        "dns_servers": json.loads(r.dns_servers or "[]"), "is_ethernet": r.is_ethernet,
                        "confidence": r.confidence, "flagged": r.flagged, "flag_reason": r.flag_reason,
@@ -765,26 +780,32 @@ async def get_stats(team: str=None, request: Request=None,
     caller_id = get_caller_id(request) if request else None
     managed = await get_managed_teams(caller_id, db) if caller_id else None
     records = q.scalars().all()
-    # For each record, get dominant status (WFO priority for split days)
+    # Check if today is a public holiday
+    ph_today_q = await db.execute(select(PublicHoliday).where(PublicHoliday.date==today))
+    ph_today   = ph_today_q.scalars().first()
+    is_ph_today = ph_today is not None
     wfo = wfh = ambiguous = flagged = 0
+    total_filtered = 0
     for r in records:
-        # Apply team filter
         dq2 = await db.execute(select(Device).where(Device.employee_id==r.employee_id))
         dev2 = dq2.scalars().first()
         if team and (not dev2 or dev2.team != team): continue
         if managed is not None and dev2 and dev2.team not in managed: continue
+        total_filtered += 1
         s = await get_day_summary(r.employee_id, today, db)
         segs = s.get("segments", [])
         dom = dominant_status_from_segments(segs) or r.final_status or ""
-        if dom == "wfo":         wfo += 1
-        elif dom == "wfh":       wfh += 1
-        elif not dom or dom == "vpn_ambiguous": ambiguous += 1
-        else:                    wfh += 1
-        if r.flagged:            flagged += 1
-    return {"date": today,
+        if dom == "wfo":
+            wfo += 1  # WFO always counts even on holiday (came in)
+        elif dom == "wfh" and not is_ph_today:
+            wfh += 1  # WFH only counts on non-holiday days
+        elif (not dom or dom == "vpn_ambiguous") and not is_ph_today:
+            ambiguous += 1
+        if r.flagged: flagged += 1
+    return {"date": today, "is_public_holiday": is_ph_today,
             "wfo": wfo, "wfh": wfh,
             "ambiguous": ambiguous, "flagged": flagged,
-            "total": len(records)}
+            "total": total_filtered}
 
 @app.get("/api/week")
 async def get_week(team: str=None, request: Request=None,
@@ -796,10 +817,11 @@ async def get_week(team: str=None, request: Request=None,
         d = (date.today()-timedelta(days=i)).isoformat()
         q = await db.execute(select(CheckIn).where(CheckIn.date==d))
         recs = q.scalars().all()
-        # Use dominant status (WFO priority for split days)
+        # Check if this day is a public holiday
+        ph_d_q = await db.execute(select(PublicHoliday).where(PublicHoliday.date==d))
+        is_ph  = ph_d_q.scalars().first() is not None
         day_wfo = day_wfh = 0
         for r in recs:
-            # Apply team filter
             dq3 = await db.execute(select(Device).where(Device.employee_id==r.employee_id))
             dev3 = dq3.scalars().first()
             if team and (not dev3 or dev3.team != team): continue
@@ -807,11 +829,12 @@ async def get_week(team: str=None, request: Request=None,
             s = await get_day_summary(r.employee_id, d, db)
             segs = s.get("segments", [])
             dom = dominant_status_from_segments(segs) or r.final_status or ""
-            if dom == "wfo": day_wfo += 1
-            else:            day_wfh += 1
-        results.append({"date": d,
-                        "wfo": day_wfo,
-                        "wfh": day_wfh,
+            if dom == "wfo":
+                day_wfo += 1       # WFO counts even on holiday
+            elif not is_ph:
+                day_wfh += 1       # WFH only on non-holiday days
+        results.append({"date": d, "wfo": day_wfo, "wfh": day_wfh,
+                        "is_public_holiday": is_ph,
                         "ambiguous": sum(1 for r in recs if not r.final_status)})
     return {"week": results}
 

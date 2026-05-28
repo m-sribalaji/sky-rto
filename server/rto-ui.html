@@ -775,7 +775,14 @@ async function loadDashboard(){
     document.getElementById('st-amb').textContent=stats.ambiguous;
     document.getElementById('st-flg').textContent=stats.flagged;
     document.getElementById('st-wfo-sub').textContent=stats.wfo===1?'1 person':`${stats.wfo} people`;
-    document.getElementById('st-wfh-sub').textContent=stats.wfh===1?'1 person':`${stats.wfh} people`;
+    // On a public holiday, show holiday label instead of WFH count subtitle
+    if(stats.is_public_holiday){
+      document.getElementById('st-wfh-sub').textContent='Public Holiday';
+      document.getElementById('st-wfh').style.color='var(--amber)';
+    } else {
+      document.getElementById('st-wfh-sub').textContent=stats.wfh===1?'1 person':`${stats.wfh} people`;
+      document.getElementById('st-wfh').style.color='';
+    }
   }
   if(week?.week){
     const maxT=Math.max(...week.week.map(d=>d.wfo+d.wfh+d.ambiguous),1),H=64;
@@ -783,6 +790,11 @@ async function loadDashboard(){
       const t=d.wfo+d.wfh+d.ambiguous;
       const wH=Math.round((d.wfo/maxT)*H),fH=Math.round((d.wfh/maxT)*H),aH=Math.round((d.ambiguous/maxT)*H);
       const day=new Date(d.date+'T12:00:00').toLocaleDateString('en-GB',{weekday:'short'});
+      // Public holiday: show amber bar at minimum height so day is visible
+      if(d.is_public_holiday){
+        const phH=Math.max(wH, 8); // at least 8px so holiday is visible
+        return`<div class="bar-grp"><div class="bar-stack" style="height:${phH}px;opacity:0.5"><div class="bar-seg" style="height:${phH}px;background:var(--amber)"></div></div><div class="bar-lbl" style="color:var(--amber)">${day}</div></div>`;
+      }
       return`<div class="bar-grp"><div class="bar-stack" style="height:${wH+fH+aH}px"><div class="bar-seg" style="height:${aH}px;background:var(--amber);opacity:0.8"></div><div class="bar-seg" style="height:${fH}px;background:var(--blue);opacity:0.8"></div><div class="bar-seg" style="height:${wH}px;background:var(--green);opacity:0.8"></div></div><div class="bar-lbl">${day}</div></div>`;
     }).join('');
   }
@@ -1070,15 +1082,27 @@ async function loadMyHistory(){
 
 // -- HISTORY -------------------------------------------
 async function initHistory(){
-  // /api/team already filters by managed_teams server-side
+  // Preserve current selections before rebuilding dropdowns
+  const sel     = document.getElementById('hist-emp');
+  const monthSel= document.getElementById('hist-month');
+  const prevEmp  = sel?.value || '';
+  const prevMonth= monthSel?.value || '';
+
   const team=await get('/api/team');
-  const sel=document.getElementById('hist-emp');
   if(team?.team?.length){
     sel.innerHTML=team.team.map(m=>`<option value="${m.employee_id}">${m.employee_name} (${m.employee_id})</option>`).join('');
+    // Restore previously selected employee — don't reset to first
+    if(prevEmp && sel.querySelector(`option[value="${prevEmp}"]`)){
+      sel.value = prevEmp;
+    }
   } else {
     sel.innerHTML='<option value="">No employees available</option>';
   }
   monthOpts('hist-month');
+  // Restore previously selected month
+  if(prevMonth && monthSel.querySelector(`option[value="${prevMonth}"]`)){
+    monthSel.value = prevMonth;
+  }
   loadHistory();
 }
 async function loadHistory(){
@@ -1240,11 +1264,15 @@ async function exportCSV(){
 
 // -- LEAVE MANAGEMENT ----------------------------------
 async function initLeaveManagement(){
-  // /api/team already filters by managed_teams server-side
-  const team=await get('/api/team');
   const sel=document.getElementById('lm-emp');
+  const prevLmEmp = sel?.value || '';
+  const team=await get('/api/team');
   if(sel&&team?.team?.length){
     sel.innerHTML=team.team.map(m=>`<option value="${m.employee_id}">${m.employee_name} (${m.employee_id})</option>`).join('');
+    // Restore previously selected employee
+    if(prevLmEmp && sel.querySelector(`option[value="${prevLmEmp}"]`)){
+      sel.value = prevLmEmp;
+    }
   }
   const grid=document.getElementById('lm-type-grid');
   if(grid)grid.innerHTML=Object.entries(LEAVE_TYPES).map(([k,v])=>`<button class="leave-type-btn" id="mgrltype-${k}" onclick="selectMgrLeaveType('${k}')" title="${v.label}"><i data-lucide="${v.icon}"></i>${v.label}</button>`).join('');
@@ -1591,13 +1619,24 @@ async function initApp(){
         active.tagName==='TEXTAREA' ||
         active.tagName==='SELECT'
       );
-      // Also skip if any text input has content (leave form in progress)
       const hasInput = [...document.querySelectorAll(
         '.page.active input[type="text"], .page.active textarea'
       )].some(el=>el.value.trim().length>0);
       if(isTyping||hasInput) return;
       const a=document.querySelector('.page.active')?.id?.replace('page-','');
-      if(a) nav(a);
+      if(!a) return;
+      // Soft refresh: reload DATA only, never re-init dropdowns.
+      // nav() would call initHistory() which rebuilds and resets the
+      // employee dropdown — causing the "jumps back to first employee" bug.
+      if(a==='dashboard')   loadDashboard();
+      else if(a==='today')  loadToday();
+      else if(a==='mystatus') loadMyStatus();
+      else if(a==='history')  loadHistory();       // data only, dropdown untouched
+      else if(a==='compliance') loadCompliance();  // loadCompliance already preserves selection
+      else if(a==='leavemgmt')  loadTeamLeave();   // only refresh the calendar, not the form
+      else if(a==='anomalies')  loadAnomalies();
+      else if(a==='team')       loadTeam();
+      else nav(a); // for other pages (config, roles etc) full nav is fine
     }catch(e){}
   },60000);
 }
