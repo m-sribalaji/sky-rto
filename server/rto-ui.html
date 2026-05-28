@@ -343,7 +343,12 @@ input::placeholder,textarea::placeholder{color:var(--tx3);}textarea{resize:verti
         </div>
         <div class="card">
           <div class="card-title">Team leave calendar <span class="card-sub" id="team-leave-month-lbl">-</span></div>
-          <select id="team-leave-month" style="width:auto;padding:5px 8px;font-size:11px;margin-bottom:12px" onchange="loadTeamLeave()"></select>
+          <div style="display:flex;gap:8px;align-items:center;margin-bottom:12px;flex-wrap:wrap">
+            <select id="lm-cal-team-filter" onchange="loadTeamLeave()" style="display:none;width:auto;padding:4px 8px;font-size:11px;background:var(--bg2);border:1px solid var(--acc);border-radius:6px;color:var(--tx)">
+              <option value="">All teams</option>
+            </select>
+            <select id="team-leave-month" style="width:auto;padding:4px 8px;font-size:11px" onchange="loadTeamLeave()"></select>
+          </div>
           <div id="team-leave-list"><div class="loading"><div class="spinner"></div></div></div>
         </div>
       </div>
@@ -533,13 +538,15 @@ async function del(p,b={}){
 function renderSplitLabel(label){
   if(!label) return '';
   const parts = label.split(' → ');
+  // Employees: show status labels only, no transition timestamps
+  const showTime = (MY_ROLE==='manager'||MY_ROLE==='admin');
   const html = parts.map((part, i) => {
     const tokens = part.trim().split(' ');
     const status = tokens[0].toLowerCase();
     const time   = tokens[1] || null;
     const cls    = status==='wfo'?'seg-wfo':status==='wfh'?'seg-wfh':'seg-other';
     const arrow  = i > 0 ? '<span class="seg-arrow" style="color:var(--tx3);font-size:9px;margin:0 2px">&#8594;</span>' : '';
-    const timeBadge = time ? `<span class="seg-time">${time}</span>` : '';
+    const timeBadge = (time && showTime) ? `<span class="seg-time">${time}</span>` : '';
     return `${arrow}<span class="${cls}" style="font-size:10px;font-family:var(--mono);font-weight:500">${status.toUpperCase()}</span>${timeBadge}`;
   }).join('');
   return `<span class="split-pill">${html}</span>`;
@@ -750,18 +757,23 @@ async function loadSidebarUser(){
 
 // -- DASHBOARD -----------------------------------------
 async function loadDashboard(){
-  // Setup filter bar for manager/admin
+  // Setup filter bar — managers/admins only
+  // Employees never see the team filter or global employee search
   const isMgr = MY_ROLE==='manager'||MY_ROLE==='admin';
+  const filterBar = document.getElementById('dash-filter-bar');
+  const filterSel = document.getElementById('dash-team-filter');
+  const searchWrap = document.getElementById('dash-search-wrap');
   if(isMgr){
-    const filterBar = document.getElementById('dash-filter-bar');
-    const filterSel = document.getElementById('dash-team-filter');
-    const searchWrap = document.getElementById('dash-search-wrap');
     if(filterBar) filterBar.style.display='block';
     if(searchWrap) searchWrap.style.display='flex';
     if(filterSel){
       const teams = MY_MANAGED_TEAMS || await _getAllTeams();
       filterSel.innerHTML = teamFilterOpts(teams, DASH_TEAM_FILTER);
     }
+  } else {
+    // Employee: always hide filter bar and search
+    if(filterBar) filterBar.style.display='none';
+    if(searchWrap) searchWrap.style.display='none';
   }
   const tp = DASH_TEAM_FILTER ? `?team=${encodeURIComponent(DASH_TEAM_FILTER)}` : '';
   const[stats,today,week]=await Promise.all([
@@ -901,7 +913,14 @@ async function loadTeamTodayStatus(){
   document.getElementById('team-today-title').textContent = `${myTeam} - Today`;
 
   const data = await get(`/api/today/team?team=${encodeURIComponent(myTeam)}`);
-  const members = data?.members || [];
+  // Override status for public holidays — same logic as /api/today
+  const todayPH = await get('/api/stats');  // already fetched, has is_public_holiday
+  const members = (data?.members || []).map(m => {
+    if(todayPH?.is_public_holiday && m.status !== 'wfo'){
+      return {...m, status:'public_holiday', split_label:null};
+    }
+    return m;
+  });
 
   if(!members.length){
     el.innerHTML = `<div style="color:var(--tx3);font-family:var(--mono);font-size:12px;padding:12px 0">No team members found.</div>`;
@@ -1300,6 +1319,14 @@ async function initLeaveManagement(){
   })();
   if(fromEl&&!fromEl.value)fromEl.value=defaultDate;
   if(toEl&&!toEl.value)toEl.value=defaultDate;
+  // Populate team filter for calendar (managers/admins only)
+  const calTeamSel = document.getElementById('lm-cal-team-filter');
+  if(calTeamSel && (MY_ROLE==='manager'||MY_ROLE==='admin')){
+    calTeamSel.style.display='inline-block';
+    const teams = MY_MANAGED_TEAMS || await _getAllTeams();
+    const prev = calTeamSel.value || '';
+    calTeamSel.innerHTML='<option value="">All teams</option>'+teams.map(t=>`<option value="${t}"${t===prev?' selected':''}>${t}</option>`).join('');
+  }
   updateLeaveDayPreview();
   loadTeamLeave();
   reIcons();
@@ -1332,8 +1359,16 @@ async function managerApplyLeave(){
 }
 async function loadTeamLeave(){
   const month=document.getElementById('team-leave-month')?.value;if(!month)return;
-  // Employees only see their own team's leave; managers/admins see all
-  const teamFilter=(MY_ROLE==='employee'&&MY_TEAM)?`&team=${encodeURIComponent(MY_TEAM)}`:'';
+  let teamFilter='';
+  if(MY_ROLE==='employee'&&MY_TEAM){
+    // Employees scoped to own team only — no filter UI shown to them
+    teamFilter=`&team=${encodeURIComponent(MY_TEAM)}`;
+  } else {
+    // Managers/admins: use the cal filter dropdown
+    const calSel=document.getElementById('lm-cal-team-filter');
+    const t=calSel?.value||'';
+    if(t) teamFilter=`&team=${encodeURIComponent(t)}`;
+  }
   const d=await get(`/api/team-leave?month=${month}${teamFilter}`);
   const el=document.getElementById('team-leave-list');
   if(!d?.leaves?.length){el.innerHTML='<div style="color:var(--tx3);font-family:var(--mono);font-size:11px;padding:8px 0">No leave records this month.</div>';return;}
