@@ -110,7 +110,7 @@ input::placeholder,textarea::placeholder{color:var(--tx3);}textarea{resize:verti
 .leave-tag{display:inline-flex;align-items:center;gap:4px;padding:2px 7px;border-radius:4px;font-family:var(--mono);font-size:10px;background:var(--pbg);color:var(--purple);border:1px solid rgba(167,139,250,0.15);}
 .leave-tag svg{width:10px;height:10px;stroke-width:2;}
 .rag{width:8px;height:8px;border-radius:50%;flex-shrink:0;}
-.rag.green{background:var(--green);}.rag.amber{background:var(--amber);}.rag.red{background:var(--red);}.rag.grey{background:var(--tx3);}.rag.grey{background:var(--tx3);}
+.rag.green{background:var(--green);}.rag.amber{background:var(--amber);}.rag.orange{background:#f97316;}.rag.red{background:var(--red);}.rag.grey{background:var(--tx3);}
 .loading{display:flex;align-items:center;gap:10px;color:var(--tx3);font-family:var(--mono);font-size:11px;padding:20px 0;}
 .spinner{width:14px;height:14px;border:2px solid var(--b1);border-top-color:var(--acc);border-radius:50%;animation:spin 0.7s linear infinite;flex-shrink:0;}
 .split-pill{font-family:var(--mono);font-size:10px;display:inline-flex;align-items:center;gap:2px;flex-wrap:wrap;row-gap:2px;background:linear-gradient(105deg,rgba(96,165,250,0.05) 0%,rgba(74,222,128,0.07) 100%);border:1px solid rgba(74,222,128,0.12);border-radius:5px;padding:2px 6px;box-shadow:0 0 6px rgba(96,165,250,0.05);}
@@ -318,7 +318,7 @@ input::placeholder,textarea::placeholder{color:var(--tx3);}textarea{resize:verti
           <button class="btn btn-ghost btn-sm" onclick="exportCSV()"><i data-lucide="download"></i>Export CSV</button>
         </div>
       </div>
-      <div class="notice info"><i data-lucide="info"></i><span>Target: <strong>>= 12 WFO days/month</strong> (Green) - Each completed week: >= 3 WFO days adjusted for leave (Amber = on track, Red = weeks missed). Leave-approved days reduce that week's target.</span></div>
+      <div class="notice info"><i data-lucide="info"></i><span>Target: <strong>12 WFO days/month</strong> &mdash; <span style="color:var(--green)">Green</span> = met &nbsp;|&nbsp; <span style="color:var(--amber)">Amber</span> = in progress, on track &nbsp;|&nbsp; <span style="color:#f97316">Orange</span> = some weeks below 3 days, month ongoing &nbsp;|&nbsp; <span style="color:var(--red)">Red</span> = month ended, target missed.</span></div>
       <div class="tbl-wrap"><table>
         <thead><tr><th></th><th>Employee</th><th>Team</th><th>WFO</th><th>WFH</th><th>Leave</th><th>Status</th><th>Weeks</th></tr></thead>
         <tbody id="compliance-tbody"><tr><td colspan="8"><div class="loading" style="padding:16px 14px"><div class="spinner"></div></div></td></tr></tbody>
@@ -1251,7 +1251,7 @@ async function loadCompliance(){
     // For weeks display: only count weeks that had actual data
     const realWeeks=r.weekly?r.weekly.filter(w=>!w.no_data):[];
     const realPassed=realWeeks.filter(w=>w.passed).length;
-    const ragColor=r.rag==='green'?'var(--green)':r.rag==='amber'?'var(--amber)':r.rag==='grey'?'var(--tx3)':'var(--red)';
+    const ragColor=r.rag==='green'?'var(--green)':r.rag==='amber'?'var(--amber)':r.rag==='orange'?'#f97316':r.rag==='grey'?'var(--tx3)':'var(--red)';
     const wfoColor=r.rag==='grey'?'var(--tx3)':r.wfo>=12?'var(--green)':'var(--tx2)';
     return`<tr>
       <td><div class="rag ${r.rag}" title="${r.status||''}"></div></td>

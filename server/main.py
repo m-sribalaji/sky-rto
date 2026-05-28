@@ -1112,13 +1112,19 @@ async def get_compliance(month: str=None, team: str=None, request: Request=None,
         all_weeks_ok = weeks_total == 0 or weeks_passed == weeks_total
 
         # -- RAG determination --------------------------------
-        # No data at all -> grey, don't penalise
-        # Green : >=12 WFO days in month (primary target met)
-        # Amber : <12 WFO days BUT all completed weeks passed
-        # Red   : <12 WFO days AND any completed week missed its adjusted target
-        # Grey only if truly no data at all - no checkins, no leave, no segments
+        # Green  : 12+ WFO days — monthly target fully met
+        # Amber  : below 12, month in progress, no weekly misses — on track
+        # Orange : below 12, month in progress, but at least one week missed 3 days
+        #          (heads-up: weekly pattern is off, but month not over yet)
+        # Red    : month complete AND below 12 WFO days — real compliance failure
+        # Grey   : no data at all
         total_activity = len(records) + len(date_status)
         working = wfo + wfh
+
+        # Is the month fully completed?
+        month_complete = bool(completed_weeks) and len(completed_weeks) == len(weeks)
+        needed = max(0, 12 - wfo)
+        missed_weeks = weeks_total - weeks_passed
 
         if total_activity == 0:
             rag    = "grey"
@@ -1126,13 +1132,18 @@ async def get_compliance(month: str=None, team: str=None, request: Request=None,
         elif wfo >= 12:
             rag    = "green"
             status = "Monthly target met"
-        elif all_weeks_ok:
-            rag    = "amber"
-            status = f"{wfo}/12 days - weekly on track"
-        else:
-            missed = weeks_total - weeks_passed
+        elif month_complete:
+            # Month over, below 12 — hard red
             rag    = "red"
-            status = f"{wfo}/12 days - {missed} week{'s' if missed!=1 else ''} missed"
+            status = f"{wfo}/12 days - monthly target missed"
+        elif not all_weeks_ok:
+            # Month ongoing but weekly pattern has gaps — orange warning
+            rag    = "orange"
+            status = f"{wfo}/12 days - {missed_weeks} week{'s' if missed_weeks!=1 else ''} below 3 days"
+        else:
+            # Month ongoing, all weeks fine — amber (behind but consistent)
+            rag    = "amber"
+            status = f"{wfo}/12 days - {needed} more WFO day{'s' if needed!=1 else ''} needed"
 
         pct = round((wfo / working) * 100) if working else 0
 
