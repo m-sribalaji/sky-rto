@@ -20,7 +20,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Python server files
-COPY config.py database.py detection.py main.py segments.py notifier.py ./
+COPY config.py database.py detection.py main.py segments.py notifier.py analytics.py ./
 
 # Static + template files
 COPY rto-ui.html admin.html ./
