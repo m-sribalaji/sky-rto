@@ -377,7 +377,20 @@ async def _upsert_checkin(device, today, public_ip, p, result, db):
     rec.public_ip=public_ip; rec.lan_ip=p.lan_ip; rec.vpn_tunnel_ip=p.vpn_tunnel_ip
     rec.vpn_active=bool(p.vpn_tunnel_ip); rec.is_ethernet=p.is_ethernet
     rec.dns_servers=json.dumps(p.dns_servers or []); rec.dns_domains=json.dumps(p.dns_domains or [])
-    rec.platform=p.platform; rec.auto_status=result.auto_status; rec.final_status=result.auto_status
+    rec.platform=p.platform; rec.auto_status=result.auto_status
+    # final_status must reflect WFO priority across all segments for the day.
+    # A split day (WFH→WFO) must store "wfo" not the last raw detection.
+    # Re-derive from all segments so CheckIn.final_status is always the dominant status.
+    segs_q = await db.execute(select(DaySegment).where(and_(
+        DaySegment.employee_id == device.employee_id,
+        DaySegment.date == today,
+    )))
+    all_segs = segs_q.scalars().all()
+    if all_segs:
+        seg_data = [{"status": s.final_status or s.status} for s in all_segs]
+        rec.final_status = dominant_status_from_segments(seg_data) or result.auto_status
+    else:
+        rec.final_status = result.auto_status
     rec.confidence=result.confidence; rec.flagged=result.flagged; rec.flag_reason=result.flag_reason
     await db.commit()
 
@@ -1368,8 +1381,29 @@ async def get_insights(employee_id: str, request: Request = None,
         CheckIn.employee_id == employee_id,
         CheckIn.date >= cutoff,
     )).order_by(CheckIn.date))
+    raw_checkins = ci_q.scalars().all()
+
+    # Correct stale final_status for split days:
+    # CheckIn.final_status should always reflect dominant segment status (WFO priority).
+    # Old records written before this fix may have the wrong status stored.
+    corrected = False
+    for r in raw_checkins:
+        segs_q2 = await db.execute(select(DaySegment).where(and_(
+            DaySegment.employee_id == employee_id,
+            DaySegment.date == r.date,
+        )))
+        segs2 = segs_q2.scalars().all()
+        if segs2:
+            seg_data2 = [{"status": s.final_status or s.status} for s in segs2]
+            correct_status = dominant_status_from_segments(seg_data2) or r.auto_status
+            if r.final_status != correct_status:
+                r.final_status = correct_status
+                corrected = True
+    if corrected:
+        await db.commit()
+
     checkins = [{"date": r.date, "status": r.final_status or r.auto_status or "wfh"}
-                for r in ci_q.scalars().all()]
+                for r in raw_checkins]
 
     # Fetch leaves
     lv_q = await db.execute(select(LeaveRequest).where(and_(
