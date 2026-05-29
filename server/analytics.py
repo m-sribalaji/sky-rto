@@ -234,7 +234,14 @@ def compute_dow_rates(
         records_by_week[wk].append((d.weekday(), st))
 
     sorted_weeks = sorted(records_by_week.keys())
-    active_weeks = len(sorted_weeks)
+    # Fix 6: only count weeks where employee had ≥3 working days of data
+    # Prevents mid-week install inflating active_weeks prematurely
+    active_weeks = sum(
+        1 for wk in sorted_weeks
+        if len(records_by_week[wk]) >= 3
+    )
+    # But still use all weeks for EWMA (just not for confidence gating)
+    active_weeks_for_ewma = len(sorted_weeks)
 
     if active_weeks == 0:
         empty_interval = {"low": 0.05, "high": 0.95, "n": 0}
@@ -245,19 +252,42 @@ def compute_dow_rates(
             {i: "insufficient" for i in range(5)},
         )
 
+    # Store (actual_date_str, was_wfo) per weekday for calendar-aware decay (Fix 1)
+    dow_obs_dates: dict[int, list[tuple[str, bool]]] = defaultdict(list)
+    for wk in sorted_weeks:
+        for dow, st in records_by_week[wk]:
+            # Find a representative date for this (week, dow) — reconstruct from ISO week
+            yr_w, w_num = int(wk.split("-W")[0]), int(wk.split("-W")[1])
+            monday = date.fromisocalendar(yr_w, w_num, 1)
+            day_date = monday + timedelta(days=dow)
+            dow_obs_dates[dow].append((day_date.isoformat(), st == "wfo"))
+
+    # Sort each weekday's observations by date (oldest first)
+    for dow in dow_obs_dates:
+        dow_obs_dates[dow].sort(key=lambda x: x[0])
+
+    # For adaptive alpha we still need (week_idx, was_wfo) form
     dow_obs: dict[int, list[tuple[int, bool]]] = defaultdict(list)
     for week_idx, wk in enumerate(sorted_weeks):
         for dow, st in records_by_week[wk]:
             dow_obs[dow].append((week_idx, st == "wfo"))
 
-    n_weeks = len(sorted_weeks)
+    n_weeks = active_weeks_for_ewma  # use all weeks for EWMA decay
+    # Current week start — used for calendar distance (Fix 1)
+    today_ref = max(
+        (date.fromisoformat(ds) for ds in att if att[ds] not in ("leave","public_holiday")),
+        default=date.today()
+    )
+    current_week_start = today_ref - timedelta(days=today_ref.weekday())
+
     dow_rates:      dict[int, float] = {}
     dow_intervals:  dict[int, dict]  = {}
     dow_confidence: dict[int, str]   = {}
 
     for dow in range(5):
-        obs = dow_obs.get(dow, [])
-        n   = len(obs)
+        obs       = dow_obs.get(dow, [])
+        obs_dates = dow_obs_dates.get(dow, [])
+        n         = len(obs)
 
         if n == 0:
             dow_rates[dow]      = 0.40
@@ -268,13 +298,17 @@ def compute_dow_rates(
         # Adaptive alpha for this weekday's observations
         alpha = _adaptive_alpha(obs, n_weeks)
 
-        # EWMA with adaptive alpha
-        ewma_val = None
-        for week_idx, was_wfo in obs:
-            recency_exp = n_weeks - week_idx - 1
-            w = alpha * ((1 - alpha) ** recency_exp)
+        # Fix 1 + Fix 5 (EWMA init prior):
+        # - Calendar-aware recency_exp: weeks since observation, not list index
+        # - Init ewma_val with prior (0.40) instead of first raw value
+        ewma_val = 0.40  # Bayesian prior: neutral before any data (Fix 5)
+        for ds_str, was_wfo in obs_dates:
+            obs_date = date.fromisoformat(ds_str)
+            obs_week_start = obs_date - timedelta(days=obs_date.weekday())
+            weeks_ago = max(0, (current_week_start - obs_week_start).days // 7)
+            w = alpha * ((1 - alpha) ** weeks_ago)
             v = 1.0 if was_wfo else 0.0
-            ewma_val = v if ewma_val is None else (1 - w) * ewma_val + w * v
+            ewma_val = (1 - w) * ewma_val + w * v
 
         rate = max(0.05, min(0.95, ewma_val or 0.40))
         dow_rates[dow] = rate
@@ -332,9 +366,11 @@ def _build_personal_markov(att: dict[str, str], ph_dates: set[str],
         personal[(prev_st, "wfo")] = p_wfo / base_wfo_rate
         personal[(None,    "wfo")] = 1.0
 
-    # Clamp multipliers to reasonable range
+    # Wider clamp: allows sharper negative/positive habits
+    # 0.25 floor: allows strong 'no consecutive WFO' patterns
+    # 2.50 ceiling: allows strong clustering without extreme swings
     for k in personal:
-        personal[k] = max(0.50, min(2.00, personal[k]))
+        personal[k] = max(0.25, min(2.50, personal[k]))
 
     return personal
 
@@ -384,7 +420,10 @@ def compute_forecast(
 
     # Insufficiency check based on per-weekday observation counts
     # Use global active_weeks as primary gate (fastest check)
-    global_conf = _confidence_tier(active_weeks * 3)  # ~3 obs per week avg
+    # Fix 3: derive global confidence from actual observation count
+    # sum of per-weekday Wilson n values is the true data volume
+    total_actual_obs = sum(iv.get('n', 0) for iv in dow_intervals.values())
+    global_conf = _confidence_tier(total_actual_obs)
     if active_weeks < 2:
         return {
             "employee_id":      employee_id,
@@ -600,30 +639,40 @@ def compute_team_rhythm(
     }
 
 def _compute_best_days(members, windowed, ph_dates):
-    dow_counts: dict[int, list[float]] = defaultdict(list)
+    # Fix 4: weighted average by observation count per weekday
+    # Members with more data anchor the recommendation more strongly
+    # than new joiners with 1-2 weeks of history
+    dow_weighted_sum:   dict[int, float] = defaultdict(float)
+    dow_weight_total:   dict[int, float] = defaultdict(float)
+    dow_member_count:   dict[int, int]   = defaultdict(int)
+
     for m in members:
         att = windowed.get(m["employee_id"], {})
-        dow_rates, active_weeks, _, _ = compute_dow_rates(att, ph_dates)
+        dow_rates, active_weeks, dow_intervals, _ = compute_dow_rates(att, ph_dates)
         if active_weeks < 2:
             continue
         for dow, rate in dow_rates.items():
-            dow_counts[dow].append(rate)
+            n_obs = dow_intervals.get(dow, {}).get("n", 0)
+            weight = max(1, n_obs)   # at least weight 1 so member is counted
+            dow_weighted_sum[dow]  += rate * weight
+            dow_weight_total[dow]  += weight
+            dow_member_count[dow]  += 1
 
     n = len(members)
     dow_names = ["Monday","Tuesday","Wednesday","Thursday","Friday"]
     result = []
     for dow in range(5):
-        rates = dow_counts.get(dow, [])
-        avg_prob  = (sum(rates) / len(rates)) if rates else 0.0
-        supported = len(rates)  # how many members contributed data
+        total_w = dow_weight_total.get(dow, 0)
+        supported = dow_member_count.get(dow, 0)
+        avg_prob  = (dow_weighted_sum[dow] / total_w) if total_w > 0 else 0.0
         result.append({
-            "dow":          dow,
-            "dow_name":     dow_names[dow],
-            "avg_count":    round(avg_prob * n, 1),
-            "probability":  round(avg_prob, 3),
+            "dow":               dow,
+            "dow_name":          dow_names[dow],
+            "avg_count":         round(avg_prob * n, 1),
+            "probability":       round(avg_prob, 3),
             "members_with_data": supported,
-            "label":        f"~{avg_prob*n:.1f} of {n} in office"
-                            + ("" if supported == n else f" ({supported}/{n} with data)"),
+            "label":             f"~{avg_prob*n:.1f} of {n} in office"
+                                 + ("" if supported == n else f" ({supported}/{n} with data)"),
         })
     result.sort(key=lambda x: x["probability"], reverse=True)
     return result
