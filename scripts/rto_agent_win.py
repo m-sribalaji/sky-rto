@@ -280,23 +280,32 @@ def start_wts_watcher():
     user32   = _windll.user32
     kernel32 = _windll.kernel32
 
+    # On 64-bit Windows, WPARAM = UINT_PTR, LPARAM = LONG_PTR.
+    # Must use c_size_t / c_ssize_t — NOT c_void_p.
+    # c_void_p overflows on large pointer values causing:
+    # "ctypes.ArgumentError: argument 4: OverflowError: int too long to convert"
     WndProcType = ctypes.WINFUNCTYPE(  # type: ignore[attr-defined]
-        ctypes.c_long,
-        ctypes.c_void_p, ctypes.c_uint,
-        ctypes.c_void_p, ctypes.c_void_p,
+        ctypes.c_ssize_t,               # LRESULT  (signed pointer-sized)
+        ctypes.c_void_p,                # HWND
+        ctypes.c_uint,                  # UINT  message
+        ctypes.c_size_t,                # WPARAM = UINT_PTR (unsigned)
+        ctypes.c_ssize_t,               # LPARAM = LONG_PTR (signed)
     )
 
     def wnd_proc(hwnd, msg, wparam, lparam):
-        if msg == WM_WTSSESSION_CHANGE:
-            if wparam == WTS_SESSION_UNLOCK:
-                logger.info("WTS_SESSION_UNLOCK - screen unlocked")
-                threading.Thread(
-                    target=trigger_checkin,
-                    kwargs={"trigger": "screen_unlock"},
-                    daemon=True,
-                ).start()
-            elif wparam == WTS_SESSION_LOCK:
-                logger.info("WTS_SESSION_LOCK - screen locked")
+        try:
+            if msg == WM_WTSSESSION_CHANGE:
+                if wparam == WTS_SESSION_UNLOCK:
+                    logger.info("WTS_SESSION_UNLOCK - screen unlocked")
+                    threading.Thread(
+                        target=trigger_checkin,
+                        kwargs={"trigger": "screen_unlock"},
+                        daemon=True,
+                    ).start()
+                elif wparam == WTS_SESSION_LOCK:
+                    logger.info("WTS_SESSION_LOCK - screen locked")
+        except Exception as e:
+            logger.error(f"wnd_proc error: {e}")
         return user32.DefWindowProcW(hwnd, msg, wparam, lparam)
 
     proc = WndProcType(wnd_proc)
@@ -319,8 +328,8 @@ def start_wts_watcher():
         _fields_ = [
             ("hwnd",    ctypes.c_void_p),
             ("message", ctypes.c_uint),
-            ("wParam",  ctypes.c_void_p),
-            ("lParam",  ctypes.c_void_p),
+            ("wParam",  ctypes.c_size_t),   # UINT_PTR — unsigned
+            ("lParam",  ctypes.c_ssize_t),  # LONG_PTR — signed
             ("time",    ctypes.c_uint),
             ("pt",      ctypes.c_long * 2),
         ]
@@ -369,12 +378,15 @@ def start_polling_fallback():
     def _is_locked():
         if sys.platform != "win32":
             return False
-        _u32 = ctypes.windll.user32  # type: ignore[attr-defined]
-        desktop = _u32.OpenInputDesktop(0, False, 0x0100)
-        if desktop:
-            _u32.CloseDesktop(desktop)
+        try:
+            _u32 = ctypes.windll.user32  # type: ignore[attr-defined]
+            desktop = _u32.OpenInputDesktop(0, False, 0x0100)
+            if desktop:
+                _u32.CloseDesktop(desktop)
+                return False
+            return True
+        except Exception:
             return False
-        return True
 
     while True:
         try:
