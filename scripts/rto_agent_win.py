@@ -265,6 +265,13 @@ def start_wts_watcher():
     WM_WTSSESSION_CHANGE fires instantly on screen unlock.
     Zero CPU between events — sits in Windows message pump.
     No pywin32 required.
+
+    Key fix: explicit 64-bit integer types for WPARAM/LPARAM.
+    Windows messages use UINT_PTR/LONG_PTR which are 64-bit on x64.
+    Using c_void_p or c_ssize_t causes OverflowError on some messages.
+    Correct types: c_uint64 (WPARAM) and c_int64 (LPARAM).
+    Also: DefWindowProcW argtypes must be set explicitly or ctypes
+    uses default marshalling which also overflows.
     """
     if sys.platform != "win32":
         raise RuntimeError("WTS watcher only runs on Windows")
@@ -272,40 +279,44 @@ def start_wts_watcher():
     WTS_SESSION_UNLOCK   = 8
     WTS_SESSION_LOCK     = 7
     WM_WTSSESSION_CHANGE = 0x02B1
-    HWND_MESSAGE         = ctypes.c_void_p(-3)
-    WS_OVERLAPPEDWINDOW  = 0x00CF0000
-    CW_USEDEFAULT        = 0x80000000
 
-    _windll = ctypes.windll  # type: ignore[attr-defined]
+    _windll  = ctypes.windll   # type: ignore[attr-defined]
     user32   = _windll.user32
     kernel32 = _windll.kernel32
 
-    # On 64-bit Windows, WPARAM = UINT_PTR, LPARAM = LONG_PTR.
-    # Must use c_size_t / c_ssize_t — NOT c_void_p.
-    # c_void_p overflows on large pointer values causing:
-    # "ctypes.ArgumentError: argument 4: OverflowError: int too long to convert"
+    # Explicit 64-bit types — the only reliable way on 64-bit Windows.
+    # c_uint64 = WPARAM (UINT_PTR, unsigned 64-bit)
+    # c_int64  = LPARAM (LONG_PTR, signed 64-bit)
+    # c_int64  = LRESULT (return value, signed 64-bit)
+    WPARAM  = ctypes.c_uint64
+    LPARAM  = ctypes.c_int64
+    LRESULT = ctypes.c_int64
+    HWND    = ctypes.c_void_p
+
     WndProcType = ctypes.WINFUNCTYPE(  # type: ignore[attr-defined]
-        ctypes.c_ssize_t,               # LRESULT  (signed pointer-sized)
-        ctypes.c_void_p,                # HWND
-        ctypes.c_uint,                  # UINT  message
-        ctypes.c_size_t,                # WPARAM = UINT_PTR (unsigned)
-        ctypes.c_ssize_t,               # LPARAM = LONG_PTR (signed)
+        LRESULT,
+        HWND,
+        ctypes.c_uint,   # message
+        WPARAM,
+        LPARAM,
     )
 
+    # Set DefWindowProcW argtypes explicitly — prevents default marshalling
+    # from overflowing on large pointer-valued lparam arguments
+    user32.DefWindowProcW.restype  = LRESULT
+    user32.DefWindowProcW.argtypes = [HWND, ctypes.c_uint, WPARAM, LPARAM]
+
     def wnd_proc(hwnd, msg, wparam, lparam):
-        try:
-            if msg == WM_WTSSESSION_CHANGE:
-                if wparam == WTS_SESSION_UNLOCK:
-                    logger.info("WTS_SESSION_UNLOCK - screen unlocked")
-                    threading.Thread(
-                        target=trigger_checkin,
-                        kwargs={"trigger": "screen_unlock"},
-                        daemon=True,
-                    ).start()
-                elif wparam == WTS_SESSION_LOCK:
-                    logger.info("WTS_SESSION_LOCK - screen locked")
-        except Exception as e:
-            logger.error(f"wnd_proc error: {e}")
+        if msg == WM_WTSSESSION_CHANGE:
+            if wparam == WTS_SESSION_UNLOCK:
+                logger.info("WTS_SESSION_UNLOCK - screen unlocked")
+                threading.Thread(
+                    target=trigger_checkin,
+                    kwargs={"trigger": "screen_unlock"},
+                    daemon=True,
+                ).start()
+            elif wparam == WTS_SESSION_LOCK:
+                logger.info("WTS_SESSION_LOCK - screen locked")
         return user32.DefWindowProcW(hwnd, msg, wparam, lparam)
 
     proc = WndProcType(wnd_proc)
@@ -316,25 +327,41 @@ def start_wts_watcher():
             ("lpfnWndProc",   WndProcType),
             ("cbClsExtra",    ctypes.c_int),
             ("cbWndExtra",    ctypes.c_int),
-            ("hInstance",     ctypes.c_void_p),
-            ("hIcon",         ctypes.c_void_p),
-            ("hCursor",       ctypes.c_void_p),
-            ("hbrBackground", ctypes.c_void_p),
+            ("hInstance",     HWND),
+            ("hIcon",         HWND),
+            ("hCursor",       HWND),
+            ("hbrBackground", HWND),
             ("lpszMenuName",  ctypes.c_wchar_p),
             ("lpszClassName", ctypes.c_wchar_p),
         ]
 
     class MSG(ctypes.Structure):
         _fields_ = [
-            ("hwnd",    ctypes.c_void_p),
+            ("hwnd",    HWND),
             ("message", ctypes.c_uint),
-            ("wParam",  ctypes.c_size_t),   # UINT_PTR — unsigned
-            ("lParam",  ctypes.c_ssize_t),  # LONG_PTR — signed
+            ("wParam",  WPARAM),
+            ("lParam",  LPARAM),
             ("time",    ctypes.c_uint),
             ("pt",      ctypes.c_long * 2),
         ]
 
-    hinstance = kernel32.GetModuleHandleW(None)
+    # Set argtypes on all user32 functions we call
+    user32.RegisterClassW.argtypes    = [ctypes.c_void_p]
+    user32.RegisterClassW.restype     = ctypes.c_uint16
+    user32.CreateWindowExW.argtypes   = [
+        ctypes.c_ulong, ctypes.c_wchar_p, ctypes.c_wchar_p,
+        ctypes.c_ulong, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+        HWND, HWND, HWND, ctypes.c_void_p,
+    ]
+    user32.CreateWindowExW.restype    = HWND
+    user32.GetMessageW.argtypes       = [ctypes.c_void_p, HWND, ctypes.c_uint, ctypes.c_uint]
+    user32.GetMessageW.restype        = ctypes.c_int
+    user32.TranslateMessage.argtypes  = [ctypes.c_void_p]
+    user32.TranslateMessage.restype   = ctypes.c_int
+    user32.DispatchMessageW.argtypes  = [ctypes.c_void_p]
+    user32.DispatchMessageW.restype   = LRESULT
+
+    hinstance  = kernel32.GetModuleHandleW(None)
     class_name = "RTOTrackerWatcher"
 
     wc = WNDCLASSW()
@@ -344,10 +371,11 @@ def start_wts_watcher():
 
     user32.RegisterClassW(ctypes.byref(wc))
 
+    HWND_MESSAGE_VAL = ctypes.c_void_p(-3)
     hwnd = user32.CreateWindowExW(
         0, class_name, "RTO Tracker Watcher",
         0, 0, 0, 0, 0,
-        HWND_MESSAGE, None, hinstance, None,
+        HWND_MESSAGE_VAL, None, hinstance, None,
     )
 
     if not hwnd:
@@ -355,18 +383,19 @@ def start_wts_watcher():
 
     # Register for WTS session notifications
     wtsapi32 = _windll.wtsapi32
-    NOTIFY_FOR_THIS_SESSION = 0
-    wtsapi32.WTSRegisterSessionNotification(hwnd, NOTIFY_FOR_THIS_SESSION)
+    wtsapi32.WTSRegisterSessionNotification.argtypes = [HWND, ctypes.c_ulong]
+    wtsapi32.WTSRegisterSessionNotification.restype  = ctypes.c_int
+    wtsapi32.WTSRegisterSessionNotification(hwnd, 0)
 
     logger.info("WTS ctypes notifications registered - entering message loop")
 
-    msg = MSG()
+    msg_buf = MSG()
     while True:
-        ret = user32.GetMessageW(ctypes.byref(msg), None, 0, 0)
+        ret = user32.GetMessageW(ctypes.byref(msg_buf), None, 0, 0)
         if ret == 0 or ret == -1:
             break
-        user32.TranslateMessage(ctypes.byref(msg))
-        user32.DispatchMessageW(ctypes.byref(msg))
+        user32.TranslateMessage(ctypes.byref(msg_buf))
+        user32.DispatchMessageW(ctypes.byref(msg_buf))
 
 
 # ── OPENINPUTDESKTOP POLLING (fallback) ───────────────────────────────────────
