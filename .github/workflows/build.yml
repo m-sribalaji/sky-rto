@@ -35,9 +35,19 @@ jobs:
 
       - name: Inject version into checkin_core.py
         run: |
-          BUILD_VER="0.0.${{ github.run_number }}"
-          sed -i "s/_BAKED_VERSION.*=.*\"0.0.0\"/_BAKED_VERSION         = \"${BUILD_VER}\"/" client/checkin_core.py
-          echo "Version set to ${BUILD_VER}"
+          python3 -c "
+import re, sys
+ver = '0.0.${{ github.run_number }}'
+path = 'client/checkin_core.py'
+content = open(path).read()
+content = re.sub(
+    r'_BAKED_VERSION\s*=\s*"0\.0\.0"',
+    f'_BAKED_VERSION         = "{ver}"',
+    content
+)
+open(path, 'w').write(content)
+print(f'Version set to {ver}')
+"
           grep "_BAKED_VERSION" client/checkin_core.py
 
       - name: Build rto-mac-arm64
@@ -98,9 +108,19 @@ jobs:
       - name: Inject version into checkin_core.py
         shell: bash
         run: |
-          BUILD_VER="0.0.${{ github.run_number }}"
-          sed -i "s/_BAKED_VERSION.*=.*\"0.0.0\"/_BAKED_VERSION         = \"${BUILD_VER}\"/" client/checkin_core.py
-          echo "Version set to ${BUILD_VER}"
+          python3 -c "
+import re
+ver = '0.0.${{ github.run_number }}'
+path = 'client/checkin_core.py'
+content = open(path).read()
+content = re.sub(
+    r'_BAKED_VERSION\s*=\s*"0\.0\.0"',
+    f'_BAKED_VERSION         = "{ver}"',
+    content
+)
+open(path, 'w').write(content)
+print(f'Version set to {ver}')
+"
           grep "_BAKED_VERSION" client/checkin_core.py
 
       - name: Build rto-win.exe
