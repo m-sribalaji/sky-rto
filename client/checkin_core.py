@@ -1098,4 +1098,5 @@ def run_retry():
     remaining = json.loads(QUEUE_FILE.read_text()) if QUEUE_FILE.exists() else []
     if remaining:
         print(f"    [FAIL] {len(remaining)} record(s) still failed - check logs.")
+        
     print()

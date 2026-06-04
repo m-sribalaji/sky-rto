@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-rto_agent_mac.py - RTO Attendance Agent (macOS)
+rto_agent_mac.py - RTO Attendance Agent(macOS)
 
 Compiled into a standalone binary by PyInstaller — no Python needed on
 the target machine.

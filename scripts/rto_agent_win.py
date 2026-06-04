@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-rto_agent_win.py - RTO Attendance Agent (Windows)
+rto_agent_win.py - RTO Attendance Agent(Windows)
 
 Compiled into a standalone .exe by PyInstaller — no Python needed on
 the target machine.

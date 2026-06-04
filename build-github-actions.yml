@@ -1,4 +1,4 @@
-name: Build RTO Tracker Binaries
+name: Build SkyRTO Tracker Binaries
 
 permissions:
   contents: write
