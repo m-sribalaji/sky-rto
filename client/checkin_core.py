@@ -25,18 +25,14 @@ import urllib.request, urllib.error
 from pathlib import Path
 from datetime import date, datetime
 
-# ── HARDCODED DEFAULTS (baked into binary) ──────────────────────────────────
-_BAKED_SERVER_URL      = "http://10.131.80.141:8989"
-_BAKED_TEAMS_WEBHOOK   = (
-    "https://skyglobal.webhook.office.com/webhookb2/"
-    "0d7bdc66-6a73-45fb-a24b-385d4e0cda96@68b865d5-cf18-4b2b-82a4-a4eddb9c5237/"
-    "IncomingWebhook/a525a07c9ccd4bbc83366d86b04f0302/"
-    "4ea4908b-0ad1-44e4-982b-b8aa39c45886/"
-    "V28h2KNMh38ha3v9UR5RdOiiyen2KNykniOao3hJZFQq41"
-)
+# ── HARDCODED DEFAULTS (baked into binary at build time) ────────────────────
+# These placeholders are replaced by inject_version.py during GitHub Actions.
+# The source code never contains real server URLs or webhook tokens.
+_BAKED_SERVER_URL      = "__SERVER_URL__"       # injected from GitHub Secret
+_BAKED_TEAMS_WEBHOOK   = "__TEAMS_WEBHOOK__"    # injected from GitHub Secret
 _BAKED_NOTIFY_LEVEL    = "all"
-_BAKED_GITHUB_REPO     = "m-sribalaji/sky-rto"   # used for auto-update checks
-_BAKED_VERSION         = "0.0.0"                  # replaced by build script at compile time
+_BAKED_GITHUB_REPO     = "m-sribalaji/sky-rto"  # used for auto-update checks
+_BAKED_VERSION         = "0.0.0"                # injected at build time
 
 # ── PATHS ───────────────────────────────────────────────────────────────────
 CONFIG_DIR   = Path.home() / ".rto_tracker"
@@ -591,7 +587,7 @@ def check_and_apply_update() -> bool:
 
     logger.info(f"[update] Checking for updates (current: v{_BAKED_VERSION})")
 
-    # Query GitHub API for latest release
+    # Public repo — check GitHub API directly, no auth needed
     try:
         import ssl as _ssl
         ssl_ctx = None

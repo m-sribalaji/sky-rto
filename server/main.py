@@ -1857,6 +1857,27 @@ async def admin_delete_row(
     await db.commit()
     return {"deleted": True, "cascade": table_name == "devices"}
 
+@app.get("/api/version")
+async def get_version():
+    """
+    Returns the latest available client binary version.
+    Used by agents for auto-update — avoids GitHub API auth for private repos.
+    Build script writes version to /app/data/client_version.txt on each deploy.
+    """
+    from pathlib import Path as _Path
+    version_file = _Path("/app/data/client_version.txt")
+    try:
+        ver = version_file.read_text().strip() if version_file.exists() else "0.0.0"
+    except Exception:
+        ver = "0.0.0"
+    build_num = ver.split(".")[-1] if ver != "0.0.0" else "0"
+    return {
+        "version": ver,
+        "mac_url": f"https://github.com/m-sribalaji/sky-rto/releases/download/build-{build_num}/rto-mac-arm64",
+        "win_url": f"https://github.com/m-sribalaji/sky-rto/releases/download/build-{build_num}/rto-win.exe",
+    }
+
+
 @app.get("/health")
 async def health():
     return {"status": "ok", "service": APP_TITLE, "port": PORT, "version": "2.0"}

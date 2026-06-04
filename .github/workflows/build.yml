@@ -33,12 +33,14 @@ jobs:
         run: |
           pip install pyinstaller pyobjc-framework-Cocoa certifi
 
-      - name: Inject version into checkin_core.py
+      - name: Inject version and secrets into checkin_core.py
         env:
           BUILD_NUM: ${{ github.run_number }}
+          BAKED_SERVER_URL: ${{ secrets.BAKED_SERVER_URL }}
+          BAKED_TEAMS_WEBHOOK: ${{ secrets.BAKED_TEAMS_WEBHOOK }}
         run: |
           python3 inject_version.py "0.0.${BUILD_NUM}" client/checkin_core.py
-          grep "_BAKED_VERSION" client/checkin_core.py
+          grep "_BAKED_VERSION\|_BAKED_SERVER_URL" client/checkin_core.py
 
       - name: Build rto-mac-arm64
         run: |
@@ -95,13 +97,15 @@ jobs:
         run: |
           pip install pyinstaller pywin32 certifi
 
-      - name: Inject version into checkin_core.py
+      - name: Inject version and secrets into checkin_core.py
+        shell: bash
         env:
           BUILD_NUM: ${{ github.run_number }}
-        shell: bash
+          BAKED_SERVER_URL: ${{ secrets.BAKED_SERVER_URL }}
+          BAKED_TEAMS_WEBHOOK: ${{ secrets.BAKED_TEAMS_WEBHOOK }}
         run: |
           python3 inject_version.py "0.0.${BUILD_NUM}" client/checkin_core.py
-          grep "_BAKED_VERSION" client/checkin_core.py
+          grep "_BAKED_VERSION\|_BAKED_SERVER_URL" client/checkin_core.py
 
       - name: Build rto-win.exe
         shell: bash
