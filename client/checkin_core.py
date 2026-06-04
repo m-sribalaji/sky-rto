@@ -405,9 +405,8 @@ def queue_checkin(payload: dict):
     logger.info(f"Queued check-in for {payload.get('date')} (server unreachable)")
 
 def flush_queue(server: str) -> tuple:
-    """Flush pending offline queue to server.
-    Returns (count, synced_payloads_with_responses) so caller can notify.
-    """
+    """Flush offline queue. Returns (count, [(payload, response)]) so caller
+    can send per-record WFH/WFO Teams cards for each synced check-in."""
     if not QUEUE_FILE.exists(): return 0, []
     try: queue = json.loads(QUEUE_FILE.read_text())
     except Exception: return 0, []
@@ -683,22 +682,21 @@ def run_checkin(force: bool = False):
                     if NOTIFIER_AVAILABLE:
                         wh, lvl, srv = _get_notify_cfg(cfg)
                         emp_name = cfg.get("employee_name", hostname)
-                        # Send individual check-in cards for each flushed record
+                        # Send individual check-in card per flushed record
                         for f_payload, f_resp in flushed_results:
                             if f_resp.get("action") == "ok":
-                                f_status = f_resp.get("status")
-                                f_conf   = f_resp.get("confidence", "")
-                                f_date   = f_payload.get("date", "")
+                                f_status = f_resp.get("status","")
+                                f_conf   = f_resp.get("confidence","")
                                 if f_status == "wfo":
-                                    notify_checkin_wfo(
-                                        emp_name, f_payload.get("lan_ip"), f_conf,
+                                    notify_checkin_wfo(emp_name,
+                                        f_payload.get("lan_ip"), f_conf,
                                         webhook=wh, level=lvl, server_url=srv)
                                 elif f_status == "wfh":
-                                    notify_checkin_wfh(
-                                        emp_name, f_payload.get("lan_ip"), f_conf,
+                                    notify_checkin_wfh(emp_name,
+                                        f_payload.get("lan_ip"), f_conf,
                                         vpn=bool(f_payload.get("vpn_tunnel_ip")),
                                         webhook=wh, level=lvl, server_url=srv)
-                        # Also send a summary queue-flushed card
+                        # Summary card
                         notify_queue_flushed(emp_name, flushed,
                                              webhook=wh, level=lvl, server_url=srv)
             logger.info(f"Same location ({local_class}), same day - skipping"); return
@@ -723,9 +721,9 @@ def run_checkin(force: bool = False):
                 cfg["last_status"]         = local_class
                 cfg["last_detected_class"] = local_class
                 save_config(cfg)
-                # Desktop notification only — Teams webhook also needs internet,
-                # so don't attempt it when the server (and likely internet) is
-                # unreachable. The check-in card will fire when VPN reconnects
+                # Desktop notification only when offline —
+                # Teams webhook also needs internet so don't attempt it.
+                # The proper WFH/WFO Teams card fires when VPN reconnects
                 # and the queue is flushed.
                 _desktop_notify("RTO Tracker",
                     f"Server offline. {local_class.upper()} check-in saved locally "
@@ -741,18 +739,18 @@ def run_checkin(force: bool = False):
             if NOTIFIER_AVAILABLE:
                 wh, lvl, srv = _get_notify_cfg(cfg)
                 emp_name = cfg.get("employee_name", hostname)
-                # Send individual check-in cards for each flushed record
+                # Send individual check-in card per flushed record
                 for f_payload, f_resp in flushed_results:
                     if f_resp.get("action") == "ok":
-                        f_status = f_resp.get("status")
-                        f_conf   = f_resp.get("confidence", "")
+                        f_status = f_resp.get("status","")
+                        f_conf   = f_resp.get("confidence","")
                         if f_status == "wfo":
-                            notify_checkin_wfo(
-                                emp_name, f_payload.get("lan_ip"), f_conf,
+                            notify_checkin_wfo(emp_name,
+                                f_payload.get("lan_ip"), f_conf,
                                 webhook=wh, level=lvl, server_url=srv)
                         elif f_status == "wfh":
-                            notify_checkin_wfh(
-                                emp_name, f_payload.get("lan_ip"), f_conf,
+                            notify_checkin_wfh(emp_name,
+                                f_payload.get("lan_ip"), f_conf,
                                 vpn=bool(f_payload.get("vpn_tunnel_ip")),
                                 webhook=wh, level=lvl, server_url=srv)
                 # Summary card

@@ -544,6 +544,21 @@ Examples:
     # ── Background agent mode ────────────────────────────────────────────────
     logger.info(f"rto_agent_win starting | binary={BINARY_PATH} | poll={POLL_INTERVAL}s")
 
+    # ── Single-instance guard (Windows Mutex) ────────────────────────────────
+    # Prevents two agent processes running simultaneously.
+    # This happens when both HKCU\Run key AND Startup shortcut are registered,
+    # or when the user double-clicks the binary while agent is already running.
+    if sys.platform == "win32":
+        _mutex_name = "Global\\SkyRTOTrackerAgent"
+        try:
+            _mutex = ctypes.windll.kernel32.CreateMutexW(None, True, _mutex_name)
+            _last_err = ctypes.windll.kernel32.GetLastError()
+            if _last_err == 183:  # ERROR_ALREADY_EXISTS
+                logger.info("Another agent instance is already running - exiting.")
+                sys.exit(0)
+        except Exception as e:
+            logger.warning(f"Mutex creation failed: {e} - continuing without single-instance guard")
+
     # First run: startup not yet registered
     if not is_startup_installed():
         first_run_setup()
