@@ -442,7 +442,6 @@ def flush_queue(server: str) -> tuple:
 # ── API ──────────────────────────────────────────────────────────────────────
 def api_post(url, payload, timeout=10):
     try:
-        import urllib.request
         data = json.dumps(payload).encode()
         req  = urllib.request.Request(url, data=data,
                    headers={

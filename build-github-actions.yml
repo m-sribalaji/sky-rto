@@ -33,6 +33,13 @@ jobs:
         run: |
           pip install pyinstaller pyobjc-framework-Cocoa certifi
 
+      - name: Inject version into checkin_core.py
+        run: |
+          BUILD_VER="0.0.${{ github.run_number }}"
+          sed -i "s/_BAKED_VERSION.*=.*\"0.0.0\"/_BAKED_VERSION         = \"${BUILD_VER}\"/" client/checkin_core.py
+          echo "Version set to ${BUILD_VER}"
+          grep "_BAKED_VERSION" client/checkin_core.py
+
       - name: Build rto-mac-arm64
         run: |
           pyinstaller \
@@ -72,7 +79,6 @@ jobs:
           name: rto-mac-arm64
           path: dist/rto-mac-arm64
 
-  
   # ── Windows x64 ─────────────────────────────────────────────────────────
   build-windows:
     runs-on: windows-latest
@@ -88,6 +94,14 @@ jobs:
       - name: Install build dependencies
         run: |
           pip install pyinstaller pywin32 certifi
+
+      - name: Inject version into checkin_core.py
+        shell: bash
+        run: |
+          BUILD_VER="0.0.${{ github.run_number }}"
+          sed -i "s/_BAKED_VERSION.*=.*\"0.0.0\"/_BAKED_VERSION         = \"${BUILD_VER}\"/" client/checkin_core.py
+          echo "Version set to ${BUILD_VER}"
+          grep "_BAKED_VERSION" client/checkin_core.py
 
       - name: Build rto-win.exe
         shell: bash
@@ -131,7 +145,7 @@ jobs:
           name: rto-win
           path: dist/rto-win.exe
 
-  # ── Bundle all 2 into a GitHub Release ──────────────────────────────────
+  # ── Bundle into a GitHub Release ────────────────────────────────────────
   release:
     needs: [build-mac-arm64, build-windows]
     runs-on: ubuntu-latest
@@ -147,9 +161,10 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: "build-${{ github.run_number }}"
-          name: "sky-rto"
+          name: "sky-rto build-${{ github.run_number }}"
           body: |
             Auto-built from commit ${{ github.sha }}
+            Version: 0.0.${{ github.run_number }}
 
             **Download the right file for your machine:**
             - `rto-mac-arm64` — Mac with Apple Silicon (M1 / M2 / M3)
@@ -163,8 +178,11 @@ jobs:
 
             **Windows install:**
             1. Download `rto-win.exe`
-            2. Double-click it
+            2. Double-click it — SmartScreen: click More info → Run anyway
             3. Browser opens for registration — done
+
+            **Already installed? No action needed.**
+            The agent updates itself automatically on next startup.
           files: |
             dist/rto-mac-arm64/rto-mac-arm64
             dist/rto-win/rto-win.exe
