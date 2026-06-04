@@ -10,6 +10,18 @@ when removing old files do before installing distribution:
 rm ~/.rto_tracker/.last_missed_check
 rm ~/.rto_tracker/config.json
 
+# Stop the launchd agent
+launchctl unload ~/Library/LaunchAgents/com.sky.rto.plist
+
+# Kill any leftover process
+pkill -f "rto-mac-arm64" 2>/dev/null || true
+pkill -f "rto_agent_mac" 2>/dev/null || true
+
+# Clear all cached state (forces fresh start)
+rm -rf ~/.rto_tracker/checkin.log
+rm -rf ~/.rto_tracker/config.json
+rm -rf ~/.rto_tracker/pending_queue.json
+rm -rf ~/.rto_tracker/.rto.lock
 
 ########## WIN
 
@@ -36,3 +48,15 @@ Remove-Item -Force -ErrorAction SilentlyContinue `
   (Join-Path $base "pending_queue.json") `
   (Join-Path $base "checkin.log") `
   (Join-Path $base "rto_agent.log")
+
+  # Kill all running instances
+Get-Process | Where-Object {$_.Name -like "*rto*"} | Stop-Process -Force
+
+# Clear cached state
+Remove-Item "$env:USERPROFILE\.rto_tracker\*" -Force -Recurse -ErrorAction SilentlyContinue
+
+# Mac
+./rto-mac-arm64 --uninstall
+
+# Windows
+rto-win.exe --uninstall
