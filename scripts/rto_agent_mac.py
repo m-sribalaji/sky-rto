@@ -43,6 +43,7 @@ if not getattr(sys, 'frozen', False):
         _sys.path.insert(0, _client)
 from checkin_core import (
     run_checkin,
+    check_and_apply_update,
     run_reset,
     run_retry,
     load_config,
@@ -449,6 +450,13 @@ Examples:
 
     # ── Background agent mode ────────────────────────────────────────────────
     logger.info(f"rto_agent_mac starting | binary={BINARY_PATH} | poll={POLL_INTERVAL}s")
+
+    # Check for updates once per day — silent, non-blocking
+    # If update found: downloads, replaces binary, restarts in-place
+    try:
+        check_and_apply_update()
+    except Exception as _ue:
+        logger.debug(f"Update check skipped: {_ue}")
 
     # First run: launchd not yet installed -> do full setup then enter loop
     if not is_launchd_installed():

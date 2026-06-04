@@ -58,6 +58,7 @@ if not getattr(sys, 'frozen', False):
         _sys.path.insert(0, _client)
 from checkin_core import (
     run_checkin,
+    check_and_apply_update,
     run_reset,
     run_retry,
     load_config,
@@ -543,6 +544,12 @@ Examples:
 
     # ── Background agent mode ────────────────────────────────────────────────
     logger.info(f"rto_agent_win starting | binary={BINARY_PATH} | poll={POLL_INTERVAL}s")
+
+    # Check for updates once per day — silent, non-blocking
+    try:
+        check_and_apply_update()
+    except Exception as _ue:
+        logger.debug(f"Update check skipped: {_ue}")
 
     # ── Single-instance guard (Windows Mutex) ────────────────────────────────
     # Prevents two agent processes running simultaneously.
