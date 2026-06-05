@@ -20,6 +20,7 @@ class Device(Base):
     team          = Column(String, nullable=True)
     platform      = Column(String, nullable=True)
     registered_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    api_token     = Column(String, nullable=True, index=True)  # per-device secret token
 
 class Role(Base):
     """employee_id -> admin | manager | employee (default if not in table)"""

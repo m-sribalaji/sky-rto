@@ -132,6 +132,10 @@ def _get_notify_cfg(cfg: dict) -> tuple:
         cfg.get("server_url", _BAKED_SERVER_URL),
     )
 
+def _get_auth_headers(cfg: dict) -> dict:
+    employee_id = cfg.get("employee_id")
+    return {"X-Employee-Id": employee_id} if employee_id else {}
+
 # ── NETWORK SIGNAL COLLECTION ────────────────────────────────────────────────
 import ipaddress as _ipaddress
 
@@ -403,9 +407,10 @@ def queue_checkin(payload: dict):
     QUEUE_FILE.write_text(json.dumps(queue, indent=2))
     logger.info(f"Queued check-in for {payload.get('date')} (server unreachable)")
 
-def flush_queue(server: str) -> tuple:
+def flush_queue(server: str, cfg: dict = None) -> tuple:
     """Flush offline queue. Returns (count, [(payload, response)]) so caller
     can send per-record WFH/WFO Teams cards for each synced check-in."""
+    cfg = cfg or load_config()
     if not QUEUE_FILE.exists(): return 0, []
     try: queue = json.loads(QUEUE_FILE.read_text())
     except Exception: return 0, []
@@ -419,7 +424,7 @@ def flush_queue(server: str) -> tuple:
             if _dt.strptime(date_str, "%Y-%m-%d").weekday() >= 5:
                 synced.append(payload); continue
         except Exception: pass
-        resp = api_post(f"{server}/api/checkin", payload)
+        resp = api_post(f"{server}/api/checkin", payload, auth_headers=_get_auth_headers(cfg))
         if resp and resp.get("action") in ("ok", "already_checked_in",
                                             "confirm_needed", "override_locked",
                                             "leave_recorded"):
@@ -436,16 +441,19 @@ def flush_queue(server: str) -> tuple:
     return len(synced), synced_results
 
 # ── API ──────────────────────────────────────────────────────────────────────
-def api_post(url, payload, timeout=10):
+def api_post(url, payload, timeout=10, auth_headers: dict = None):
     try:
         data = json.dumps(payload).encode()
+        hdrs = {
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "Accept-Encoding": "identity",
+            "Connection": "close",
+        }
+        if auth_headers:
+            hdrs.update(auth_headers)
         req  = urllib.request.Request(url, data=data,
-                   headers={
-                       "Content-Type": "application/json",
-                       "Accept": "application/json",
-                       "Accept-Encoding": "identity",
-                       "Connection": "close",
-                   }, method="POST")
+                   headers=hdrs, method="POST")
         with urllib.request.urlopen(req, timeout=timeout) as r:
             return json.loads(r.read().decode())
     except Exception as e:
@@ -768,7 +776,7 @@ def check_missed_yesterday(server: str, hostname: str, cfg: dict, today: str):
                 cached_payload.get("is_ethernet", False),
             )
             if server_reachable(server):
-                resp = api_post(f"{server}/api/checkin", cached_payload)
+                resp = api_post(f"{server}/api/checkin", cached_payload, auth_headers=_get_auth_headers(cfg))
                 if resp and resp.get("action") in ("ok", "already_checked_in"):
                     logger.info(f"Soft miss auto-resolved: {day}")
                     try:
@@ -839,7 +847,7 @@ def run_checkin(force: bool = False):
         changed = location_changed(cfg, local_class)
         if not force and not changed:
             if QUEUE_FILE.exists() and server_reachable(server):
-                flushed, flushed_results = flush_queue(server)
+                flushed, flushed_results = flush_queue(server, cfg)
                 if flushed > 0:
                     logger.info(f"Flushed {flushed} queued offline record(s)")
                     if NOTIFIER_AVAILABLE:
@@ -896,7 +904,7 @@ def run_checkin(force: bool = False):
                        "Server unreachable. Connect Sky VPN for attendance tracking.")
             return
 
-        flushed, flushed_results = flush_queue(server)
+        flushed, flushed_results = flush_queue(server, cfg)
         if flushed > 0:
             logger.info(f"Flushed {flushed} offline record(s)")
             if NOTIFIER_AVAILABLE:
@@ -950,6 +958,7 @@ def run_checkin(force: bool = False):
                     cfg.pop("last_reg_attempt_ts", None)
                     cfg.pop("last_reg_attempt_date", None)
                     cfg["employee_name"] = emp_name
+                    cfg["employee_id"] = check.get("employee_id")
                     save_config(cfg)
                     if NOTIFIER_AVAILABLE:
                         wh, lvl, srv = _get_notify_cfg(cfg)
@@ -971,7 +980,7 @@ def run_checkin(force: bool = False):
         # Missed day check (once per day)
         check_missed_yesterday(server, hostname, cfg, today)
 
-        response = api_post(f"{server}/api/checkin", payload)
+        response = api_post(f"{server}/api/checkin", payload, auth_headers=_get_auth_headers(cfg))
         if not response:
             logger.error("[FAIL] Check-in POST failed - queuing for retry")
             if local_class in ("wfo", "wfh"):
@@ -992,6 +1001,7 @@ def run_checkin(force: bool = False):
                 dev_check = api_get(f"{server}/api/device/{hostname}")
                 if dev_check and dev_check.get("employee_name"):
                     cfg["employee_name"] = dev_check["employee_name"]
+                    cfg["employee_id"] = dev_check.get("employee_id")
             save_config(cfg)
             if NOTIFIER_AVAILABLE:
                 wh, lvl, srv = _get_notify_cfg(cfg)
@@ -1008,7 +1018,7 @@ def run_checkin(force: bool = False):
             existing_status = response.get("status")
             if local_class in ("wfo", "wfh") and existing_status != local_class and force:
                 force_payload = {**payload, "force_update": True}
-                resp2 = api_post(f"{server}/api/checkin", force_payload)
+                resp2 = api_post(f"{server}/api/checkin", force_payload, auth_headers=_get_auth_headers(cfg))
                 if resp2 and resp2.get("action") == "ok":
                     status = resp2.get("status")
                     logger.info(f"[OK] Status updated: {status}")
@@ -1093,10 +1103,9 @@ def run_retry():
         print(f"\n    [WARN] Server unreachable at {server}")
         print(f"  Connect VPN and try again.\n"); return
 
-    flushed = flush_queue(server)
+    flushed, _ = flush_queue(server, cfg)
     print(f"\n    [OK] Synced {flushed} record(s) to server.")
     remaining = json.loads(QUEUE_FILE.read_text()) if QUEUE_FILE.exists() else []
     if remaining:
         print(f"    [FAIL] {len(remaining)} record(s) still failed - check logs.")
-        
     print()

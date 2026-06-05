@@ -183,6 +183,16 @@ async def require_role(request: Request, db: AsyncSession,
         raise HTTPException(403, f"Requires {minimum} role. Your role: {role}.")
     return eid
 
+async def require_registered_caller(request: Request, db: AsyncSession):
+    eid = get_caller_id(request)
+    if not eid:
+        raise HTTPException(401, "X-Employee-Id header required.")
+    q = await db.execute(select(Device).where(Device.employee_id == eid))
+    device = q.scalars().first()
+    if not device:
+        raise HTTPException(404, "Not registered")
+    return device
+
 # -- 1. REGISTER -------------------------------------------
 @app.post("/api/register")
 async def register(p: RegisterPayload, db: AsyncSession = Depends(get_db)):
@@ -214,7 +224,8 @@ async def get_device(hostname: str, db: AsyncSession = Depends(get_db)):
 
 # -- 2. ROLES ----------------------------------------------
 @app.get("/api/roles")
-async def get_roles(db: AsyncSession = Depends(get_db)):
+async def get_roles(request: Request, db: AsyncSession = Depends(get_db)):
+    await require_role(request, db, "admin")
     q = await db.execute(select(Role).order_by(Role.role))
     return {"roles": [{"employee_id": r.employee_id, "role": r.role,
                        "assigned_by": r.assigned_by,
@@ -681,6 +692,7 @@ async def record_missed(p: MissedDayPayload, db: AsyncSession=Depends(get_db)):
 @app.get("/api/today")
 async def get_today(team: str=None, request: Request=None,
                     db: AsyncSession=Depends(get_db)):
+    await require_registered_caller(request, db)
     q = await db.execute(select(CheckIn).where(
         CheckIn.date==today_str()).order_by(desc(CheckIn.timestamp)))
     caller_id = get_caller_id(request) if request else None
@@ -724,6 +736,7 @@ async def get_today(team: str=None, request: Request=None,
 @app.get("/api/today/team")
 async def get_today_team(team: str, request: Request=None, db: AsyncSession=Depends(get_db)):
     """All members of a team with today's status - includes those not yet checked in."""
+    await require_registered_caller(request, db)
     # Get all devices in this team
     dq = await db.execute(select(Device).where(Device.team==team).order_by(Device.employee_name))
     devices = dq.scalars().all()
@@ -774,12 +787,8 @@ async def get_today_team(team: str, request: Request=None, db: AsyncSession=Depe
 @app.get("/api/me")
 async def get_me(request: Request, db: AsyncSession=Depends(get_db)):
     """Return device info for the calling employee - used by client to get team."""
-    eid = get_caller_id(request)
-    if not eid: raise HTTPException(400, "X-Employee-Id header required")
-    dq  = await db.execute(select(Device).where(Device.employee_id==eid))
-    dev = dq.scalars().first()
-    if not dev: raise HTTPException(404, "Not registered")
-    rq  = await db.execute(select(Role).where(Role.employee_id==eid))
+    dev = await require_registered_caller(request, db)
+    rq  = await db.execute(select(Role).where(Role.employee_id==dev.employee_id))
     role = rq.scalars().first()
     return {"employee_id": dev.employee_id, "employee_name": dev.employee_name,
             "team": dev.team, "platform": dev.platform,
@@ -788,6 +797,7 @@ async def get_me(request: Request, db: AsyncSession=Depends(get_db)):
 @app.get("/api/stats")
 async def get_stats(team: str=None, request: Request=None,
                     db: AsyncSession=Depends(get_db)):
+    await require_registered_caller(request, db)
     today = today_str()
     q = await db.execute(select(CheckIn).where(CheckIn.date==today))
     caller_id = get_caller_id(request) if request else None
@@ -823,6 +833,7 @@ async def get_stats(team: str=None, request: Request=None,
 @app.get("/api/week")
 async def get_week(team: str=None, request: Request=None,
                    db: AsyncSession=Depends(get_db)):
+    await require_registered_caller(request, db)
     results = []
     caller_id_w = get_caller_id(request) if request else None
     managed_w = await get_managed_teams(caller_id_w, db) if caller_id_w else None
@@ -854,6 +865,7 @@ async def get_week(team: str=None, request: Request=None,
 @app.get("/api/history/{employee_id}")
 async def get_history(employee_id: str, month: str=None,
                       request: Request=None, db: AsyncSession=Depends(get_db)):
+    await require_registered_caller(request, db)
     if not month: month=date.today().strftime("%Y-%m")
     # Access check: manager can only view employees in their managed teams
     caller_id = get_caller_id(request) if request else None
@@ -913,6 +925,7 @@ async def get_anomalies(db: AsyncSession=Depends(get_db)):
 
 @app.get("/api/team")
 async def get_team(request: Request=None, db: AsyncSession=Depends(get_db)):
+    await require_registered_caller(request, db)
     caller_id = get_caller_id(request) if request else None
     managed = await get_managed_teams(caller_id, db) if caller_id else None
     dq = await db.execute(select(Device).order_by(Device.employee_name))
@@ -1357,6 +1370,7 @@ async def get_insights(employee_id: str, request: Request = None,
     Personal WFO forecast for the next 14 working days + monthly progress.
     Accessible by the employee themselves, their manager, or admin.
     """
+    await require_registered_caller(request, db)
     caller_id = get_caller_id(request) if request else None
     # Access check: can only view own or managed team members
     if caller_id and caller_id != employee_id:
@@ -1456,6 +1470,7 @@ async def get_team_rhythm(team: str, request: Request = None,
     Accessible by all team members, managers, and admins.
     Employees can only query their own team.
     """
+    await require_registered_caller(request, db)
     caller_id = get_caller_id(request) if request else None
     if caller_id:
         dq = await db.execute(select(Device).where(Device.employee_id == caller_id))
@@ -1514,6 +1529,7 @@ async def get_team_rhythm(team: str, request: Request = None,
 @app.get("/api/team-leave")
 async def get_team_leave(month: str=None, team: str=None,
                          request: Request=None, db: AsyncSession=Depends(get_db)):
+    await require_registered_caller(request, db)
     if not month: month=date.today().strftime("%Y-%m")
     caller_id_tl = get_caller_id(request) if request else None
     managed_tl = await get_managed_teams(caller_id_tl, db) if caller_id_tl else None

@@ -708,6 +708,27 @@ function buildTopbarActions(){
   reIcons();
 }
 
+function showUnregisteredState(msg='This browser is not linked to a registered employee.'){
+  MY_ID=''; MY_ROLE='employee'; MY_NAME=''; MY_TEAM=''; MY_MANAGED_TEAMS=null;
+  document.getElementById('sb-ava').textContent='?';
+  document.getElementById('sb-ava').style.background='';
+  document.getElementById('sb-name').textContent='Not registered';
+  document.getElementById('sb-id').textContent='Open your registration link';
+  const badge=document.getElementById('sb-role-badge');
+  badge.textContent='Guest';
+  badge.className='u-role';
+  document.getElementById('sb-nav').innerHTML='<div class="nav-grp">Overview</div><div class="nav-item active"><i data-lucide="layout-dashboard"></i>Dashboard</div>';
+  document.getElementById('topbar-actions').innerHTML='';
+  ['st-wfo','st-wfh','st-amb','st-flg'].forEach(id=>{const el=document.getElementById(id);if(el)el.textContent='-';});
+  const sub=document.getElementById('st-wfo-sub'); if(sub)sub.textContent='Registration required';
+  const sub2=document.getElementById('st-wfh-sub'); if(sub2)sub2.textContent='Registration required';
+  const empty=`<div class="notice warn" style="margin:0">${svgI('triangle-alert')}<span>${msg} Register from the RTO agent link on this device, then reopen the dashboard.</span></div>`;
+  const bar=document.getElementById('bar-chart'); if(bar)bar.innerHTML=empty;
+  const donut=document.getElementById('donut-wrap'); if(donut)donut.innerHTML=empty;
+  const body=document.getElementById('dash-tbody'); if(body)body.innerHTML=`<tr><td colspan="6">${empty}</td></tr>`;
+  reIcons();
+}
+
 function nav(id){
   document.querySelectorAll('.page').forEach(p=>p.classList.remove('active'));
   document.querySelectorAll('.nav-item').forEach(n=>n.classList.remove('active'));
@@ -735,16 +756,21 @@ function nav(id){
 
 // -- SIDEBAR USER --------------------------------------
 async function loadSidebarUser(){
-  // Set MY_ID from localStorage FIRST so all subsequent get() calls include the header
   const stored = localStorage.getItem('rto_my_employee_id');
-  if(stored) MY_ID = stored;
+  if(!stored){
+    showUnregisteredState();
+    return false;
+  }
 
-  const[team,roles]=await Promise.all([get('/api/team'),get('/api/roles')]);
-  const roleMap={};
-  (roles?.roles||[]).forEach(r=>roleMap[r.employee_id]=r.role);
-  if(!team?.team?.length){document.getElementById('sb-name').textContent='No team yet';return;}
-  const me=stored?(team.team.find(m=>m.employee_id===stored)||team.team[0]):team.team[0];
-  MY_ID=me.employee_id; MY_ROLE=roleMap[MY_ID]||'employee'; MY_NAME=me.employee_name; MY_TEAM=me.team||'';
+  MY_ID = stored;
+  const meResp = await fetch(`${API}/api/me`,{headers:{'X-Employee-Id':stored}});
+  if(!meResp.ok){
+    localStorage.removeItem('rto_my_employee_id');
+    showUnregisteredState('Saved employee identity is no longer registered.');
+    return false;
+  }
+  const me = await meResp.json();
+  MY_ID=me.employee_id; MY_ROLE=me.role||'employee'; MY_NAME=me.employee_name; MY_TEAM=me.team||'';
   // Clear caches so subsequent calls use the correct employee ID with proper filtering
   _allTeamsCache = null;
   _allEmployeesCache = null;
@@ -755,7 +781,6 @@ async function loadSidebarUser(){
       if(mt.ok){const mtd=await mt.json();MY_MANAGED_TEAMS=mtd.managed_teams||null;}
     }catch(e){}
   }
-  if(!stored)localStorage.setItem('rto_my_employee_id',MY_ID);
   const ini=iniOf(me.employee_name),color=colorFor(me.employee_id);
   document.getElementById('sb-ava').textContent=ini;
   document.getElementById('sb-ava').style.background=color;
@@ -774,6 +799,7 @@ async function loadSidebarUser(){
     const s=await get('/api/stats');
     if(s){const b=document.getElementById('nb-anomalies');if(b)b.textContent=s.flagged;}
   }
+  return true;
 }
 
 // -- DASHBOARD -----------------------------------------
@@ -1669,14 +1695,15 @@ async function initApp(){
   document.getElementById('pg-date').textContent=' - '+new Date().toLocaleDateString('en-GB',{weekday:'long',day:'numeric',month:'long',year:'numeric'});
   reIcons();
   checkServer();
+  let ready = false;
   try {
-    await loadSidebarUser();
+    ready = await loadSidebarUser();
   } catch(e) {
     console.error('Sidebar load failed:', e);
-    document.getElementById('sb-name').textContent='Error loading';
+    showUnregisteredState('Unable to verify this browser identity.');
   }
   try {
-    loadDashboard();
+    if(ready) loadDashboard();
   } catch(e) {
     console.error('Dashboard load failed:', e);
   }
