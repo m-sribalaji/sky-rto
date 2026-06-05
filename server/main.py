@@ -1,6 +1,7 @@
 import json
 # main.py - RTO Tracker v2
 import sys, os, json, logging, csv, io
+import secrets
 sys.path.insert(0, os.path.dirname(__file__))
 
 from fastapi import FastAPI, Depends, HTTPException, Request
@@ -67,6 +68,9 @@ DEFAULT_TEAMS = [
 
 ]
 
+def generate_api_token() -> str:
+    return secrets.token_urlsafe(32)
+
 @app.on_event("startup")
 async def startup():
     await init_db()
@@ -76,6 +80,7 @@ async def startup():
             q = await db.execute(select(TeamConfig))
             existing = {t.name for t in q.scalars().all()}
             added = 0
+            tokens_added = 0
             # Seed defaults if none exist
             if not existing:
                 for t in DEFAULT_TEAMS:
@@ -88,9 +93,12 @@ async def startup():
                     db.add(TeamConfig(name=device.team, created_by="system"))
                     existing.add(device.team)
                     added += 1
-            if added:
+                if not device.api_token:
+                    device.api_token = generate_api_token()
+                    tokens_added += 1
+            if added or tokens_added:
                 await db.commit()
-                logger.info(f"[OK] Team sync: added {added} teams")
+                logger.info(f"[OK] Startup sync: added {added} teams, generated {tokens_added} device tokens")
     except Exception as e:
         logger.error(f"[FAIL] Team seed error: {e}")
     logger.info("[OK] RTO Tracker v2 started")
@@ -156,6 +164,12 @@ async def get_role(employee_id: str, db: AsyncSession) -> str:
 def get_caller_id(request: Request) -> str | None:
     return request.headers.get("X-Employee-Id") or None
 
+def get_device_token(request: Request) -> str | None:
+    auth = request.headers.get("Authorization", "")
+    if auth.lower().startswith("bearer "):
+        return auth.split(" ", 1)[1].strip()
+    return request.headers.get("X-Device-Token") or None
+
 async def get_managed_teams(employee_id: str, db: AsyncSession):
     """Returns list of teams this manager can see, or None meaning all teams.
     None  = admin or unset (sees all teams — backwards compatible).
@@ -178,6 +192,11 @@ async def require_role(request: Request, db: AsyncSession,
     eid = caller_id or get_caller_id(request)
     if not eid:
         raise HTTPException(403, "X-Employee-Id header required.")
+    q = await db.execute(select(Device).where(Device.employee_id == eid))
+    device = q.scalars().first()
+    token = get_device_token(request)
+    if not device or not token or not device.api_token or not secrets.compare_digest(token, device.api_token):
+        raise HTTPException(401, "Valid X-Device-Token header required.")
     role = await get_role(eid, db)
     if HIERARCHY.get(role, 0) < HIERARCHY.get(minimum, 1):
         raise HTTPException(403, f"Requires {minimum} role. Your role: {role}.")
@@ -191,7 +210,15 @@ async def require_registered_caller(request: Request, db: AsyncSession):
     device = q.scalars().first()
     if not device:
         raise HTTPException(404, "Not registered")
+    token = get_device_token(request)
+    if not token or not device.api_token or not secrets.compare_digest(token, device.api_token):
+        raise HTTPException(401, "Valid X-Device-Token header required.")
     return device
+
+async def get_caller_context(request: Request, db: AsyncSession):
+    device = await require_registered_caller(request, db)
+    role = await get_role(device.employee_id, db)
+    return device, role
 
 # -- 1. REGISTER -------------------------------------------
 @app.post("/api/register")
@@ -200,10 +227,15 @@ async def register(p: RegisterPayload, db: AsyncSession = Depends(get_db)):
     if existing:
         existing.employee_name=p.employee_name; existing.employee_id=p.employee_id
         existing.team=p.team; existing.platform=p.platform
+        if not existing.api_token:
+            existing.api_token = generate_api_token()
         await db.commit()
-        return {"status": "updated", "hostname": p.hostname}
+        return {"status": "updated", "hostname": p.hostname,
+                "employee_id": existing.employee_id, "api_token": existing.api_token}
+    token = generate_api_token()
     db.add(Device(hostname=p.hostname, employee_name=p.employee_name,
-                  employee_id=p.employee_id, team=p.team, platform=p.platform))
+                  employee_id=p.employee_id, team=p.team, platform=p.platform,
+                  api_token=token))
     await db.commit()
     # First registered user -> admin
     q = await db.execute(select(Role))
@@ -212,15 +244,20 @@ async def register(p: RegisterPayload, db: AsyncSession = Depends(get_db)):
         await db.commit()
         logger.info(f"Auto-assigned admin to first user: {p.employee_id}")
     logger.info(f"Registered: {p.hostname} -> {p.employee_name}")
-    return {"status": "registered", "hostname": p.hostname}
+    return {"status": "registered", "hostname": p.hostname,
+            "employee_id": p.employee_id, "api_token": token}
 
 @app.get("/api/device/{hostname}")
 async def get_device(hostname: str, db: AsyncSession = Depends(get_db)):
     d = await db.get(Device, hostname)
     if not d: return {"registered": False}
+    if not d.api_token:
+        d.api_token = generate_api_token()
+        await db.commit()
     role = await get_role(d.employee_id, db)
     return {"registered": True, "employee_name": d.employee_name,
-            "employee_id": d.employee_id, "team": d.team, "role": role}
+            "employee_id": d.employee_id, "team": d.team, "role": role,
+            "api_token": d.api_token}
 
 # -- 2. ROLES ----------------------------------------------
 @app.get("/api/roles")
@@ -253,6 +290,7 @@ async def set_role(p: RolePayload, request: Request,
 async def get_managed_teams_api(employee_id: str, request: Request,
                                 db: AsyncSession=Depends(get_db)):
     """Get managed teams for an employee. Admin can get any, manager can get own."""
+    await require_registered_caller(request, db)
     caller_id = get_caller_id(request)
     caller_role = await get_role(caller_id, db) if caller_id else "employee"
     if caller_role == "employee":
@@ -272,6 +310,7 @@ async def get_managed_teams_api(employee_id: str, request: Request,
 async def set_managed_teams_api(employee_id: str, request: Request,
                                 db: AsyncSession=Depends(get_db)):
     """Set managed teams. Admin can update any, manager can update own only."""
+    await require_registered_caller(request, db)
     caller_id = get_caller_id(request)
     caller_role = await get_role(caller_id, db) if caller_id else "employee"
     if caller_role == "employee":
@@ -301,6 +340,9 @@ async def remove_role(employee_id: str, request: Request,
 async def checkin(p: CheckInPayload, request: Request, db: AsyncSession = Depends(get_db)):
     device = await db.get(Device, p.hostname)
     if not device: return {"action": "register_first"}
+    token = get_device_token(request)
+    if not token or not device.api_token or not secrets.compare_digest(token, device.api_token):
+        raise HTTPException(401, "Valid X-Device-Token header required.")
     today     = p.date if p.date else today_str()
     # Skip weekends
     if is_weekend(today):
@@ -407,9 +449,12 @@ async def _upsert_checkin(device, today, public_ip, p, result, db):
 
 # -- 4. CONFIRM --------------------------------------------
 @app.post("/api/confirm")
-async def confirm(p: ConfirmPayload, db: AsyncSession = Depends(get_db)):
+async def confirm(p: ConfirmPayload, request: Request, db: AsyncSession = Depends(get_db)):
     device = await db.get(Device, p.hostname)
     if not device: raise HTTPException(404, "Not registered")
+    token = get_device_token(request)
+    if not token or not device.api_token or not secrets.compare_digest(token, device.api_token):
+        raise HTTPException(401, "Valid X-Device-Token header required.")
     if p.declared_status not in ("wfo","wfh"): raise HTTPException(400, "must be wfo|wfh")
     today    = today_str()
     open_seg = await get_open_segment(device.employee_id, today, db)
@@ -515,7 +560,8 @@ async def override(p: OverridePayload, request: Request,
 async def apply_leave(p: LeavePayload, request: Request,
                       db: AsyncSession = Depends(get_db)):
     # Self-apply always allowed; applying for someone else requires manager role
-    caller = get_caller_id(request) or p.applied_by or p.employee_id
+    caller_device = await require_registered_caller(request, db)
+    caller = caller_device.employee_id
     if caller != p.employee_id:
         await require_role(request, db, "manager", caller_id=caller)
     dq     = await db.execute(select(Device).where(Device.employee_id == p.employee_id))
@@ -558,7 +604,8 @@ async def apply_leave(p: LeavePayload, request: Request,
 @app.delete("/api/leave")
 async def delete_leave(p: DeleteLeavePayload, request: Request,
                        db: AsyncSession = Depends(get_db)):
-    caller = get_caller_id(request) or p.employee_id
+    caller_device = await require_registered_caller(request, db)
+    caller = caller_device.employee_id
     if caller != p.employee_id:
         await require_role(request, db, "manager", caller_id=caller)
     lq  = await db.execute(select(LeaveRequest).where(and_(
@@ -575,7 +622,18 @@ async def delete_leave(p: DeleteLeavePayload, request: Request,
     return {"status": "deleted"}
 
 @app.get("/api/leave/{employee_id}")
-async def get_leaves(employee_id: str, month: str=None, db: AsyncSession=Depends(get_db)):
+async def get_leaves(employee_id: str, month: str=None, request: Request=None,
+                     db: AsyncSession=Depends(get_db)):
+    caller_device, caller_role = await get_caller_context(request, db)
+    if caller_device.employee_id != employee_id:
+        if caller_role == "employee":
+            raise HTTPException(403, "Access denied")
+        managed = await get_managed_teams(caller_device.employee_id, db)
+        if managed is not None:
+            dq = await db.execute(select(Device).where(Device.employee_id == employee_id))
+            dev = dq.scalars().first()
+            if not dev or dev.team not in managed:
+                raise HTTPException(403, "Access denied")
     if not month: month=date.today().strftime("%Y-%m")
     q = await db.execute(select(LeaveRequest).where(and_(
         LeaveRequest.employee_id==employee_id, LeaveRequest.date.like(f"{month}%"),
@@ -643,9 +701,12 @@ async def get_holidays(year: int=None, db: AsyncSession=Depends(get_db)):
 
 # -- 8. MISSED DAY -----------------------------------------
 @app.post("/api/missed")
-async def record_missed(p: MissedDayPayload, db: AsyncSession=Depends(get_db)):
+async def record_missed(p: MissedDayPayload, request: Request, db: AsyncSession=Depends(get_db)):
     device = await db.get(Device, p.hostname)
     if not device: raise HTTPException(404, "Not registered")
+    token = get_device_token(request)
+    if not token or not device.api_token or not secrets.compare_digest(token, device.api_token):
+        raise HTTPException(401, "Valid X-Device-Token header required.")
     source   = "offline_queue_flushed" if p.has_cached_data else "missed_prompt_no_data"
     is_leave = p.status in LEAVE_TYPES or p.leave_type
     lt       = p.leave_type or p.status
@@ -692,13 +753,15 @@ async def record_missed(p: MissedDayPayload, db: AsyncSession=Depends(get_db)):
 @app.get("/api/today")
 async def get_today(team: str=None, request: Request=None,
                     db: AsyncSession=Depends(get_db)):
-    await require_registered_caller(request, db)
+    caller_device, caller_role = await get_caller_context(request, db)
     q = await db.execute(select(CheckIn).where(
         CheckIn.date==today_str()).order_by(desc(CheckIn.timestamp)))
     caller_id = get_caller_id(request) if request else None
     managed = await get_managed_teams(caller_id, db) if caller_id else None
     result = []
     for r in q.scalars().all():
+        if caller_role == "employee" and r.employee_id != caller_device.employee_id:
+            continue
         s = await get_day_summary(r.employee_id, r.date, db)
         dq = await db.execute(select(Device).where(Device.employee_id==r.employee_id))
         dev = dq.scalars().first()
@@ -736,7 +799,9 @@ async def get_today(team: str=None, request: Request=None,
 @app.get("/api/today/team")
 async def get_today_team(team: str, request: Request=None, db: AsyncSession=Depends(get_db)):
     """All members of a team with today's status - includes those not yet checked in."""
-    await require_registered_caller(request, db)
+    caller_device, caller_role = await get_caller_context(request, db)
+    if caller_role == "employee" and team != caller_device.team:
+        raise HTTPException(403, "Employees can only view their own team")
     # Get all devices in this team
     dq = await db.execute(select(Device).where(Device.team==team).order_by(Device.employee_name))
     devices = dq.scalars().all()
@@ -797,7 +862,7 @@ async def get_me(request: Request, db: AsyncSession=Depends(get_db)):
 @app.get("/api/stats")
 async def get_stats(team: str=None, request: Request=None,
                     db: AsyncSession=Depends(get_db)):
-    await require_registered_caller(request, db)
+    caller_device, caller_role = await get_caller_context(request, db)
     today = today_str()
     q = await db.execute(select(CheckIn).where(CheckIn.date==today))
     caller_id = get_caller_id(request) if request else None
@@ -812,6 +877,7 @@ async def get_stats(team: str=None, request: Request=None,
     for r in records:
         dq2 = await db.execute(select(Device).where(Device.employee_id==r.employee_id))
         dev2 = dq2.scalars().first()
+        if caller_role == "employee" and r.employee_id != caller_device.employee_id: continue
         if team and (not dev2 or dev2.team != team): continue
         if managed is not None and dev2 and dev2.team not in managed: continue
         total_filtered += 1
@@ -833,7 +899,7 @@ async def get_stats(team: str=None, request: Request=None,
 @app.get("/api/week")
 async def get_week(team: str=None, request: Request=None,
                    db: AsyncSession=Depends(get_db)):
-    await require_registered_caller(request, db)
+    caller_device, caller_role = await get_caller_context(request, db)
     results = []
     caller_id_w = get_caller_id(request) if request else None
     managed_w = await get_managed_teams(caller_id_w, db) if caller_id_w else None
@@ -848,6 +914,7 @@ async def get_week(team: str=None, request: Request=None,
         for r in recs:
             dq3 = await db.execute(select(Device).where(Device.employee_id==r.employee_id))
             dev3 = dq3.scalars().first()
+            if caller_role == "employee" and r.employee_id != caller_device.employee_id: continue
             if team and (not dev3 or dev3.team != team): continue
             if managed_w is not None and dev3 and dev3.team not in managed_w: continue
             s = await get_day_summary(r.employee_id, d, db)
@@ -865,11 +932,13 @@ async def get_week(team: str=None, request: Request=None,
 @app.get("/api/history/{employee_id}")
 async def get_history(employee_id: str, month: str=None,
                       request: Request=None, db: AsyncSession=Depends(get_db)):
-    await require_registered_caller(request, db)
+    caller_device, caller_role = await get_caller_context(request, db)
     if not month: month=date.today().strftime("%Y-%m")
     # Access check: manager can only view employees in their managed teams
     caller_id = get_caller_id(request) if request else None
     if caller_id and caller_id != employee_id:
+        if caller_role == "employee":
+            raise HTTPException(403, "Access denied")
         managed = await get_managed_teams(caller_id, db)
         if managed is not None:
             dq = await db.execute(select(Device).where(Device.employee_id==employee_id))
@@ -914,7 +983,8 @@ async def get_history(employee_id: str, month: str=None,
             "personal_leave_dates": leave_dates}
 
 @app.get("/api/anomalies")
-async def get_anomalies(db: AsyncSession=Depends(get_db)):
+async def get_anomalies(request: Request, db: AsyncSession=Depends(get_db)):
+    await require_role(request, db, "manager")
     q = await db.execute(select(AnomalyLog).where(
         AnomalyLog.resolved==False).order_by(desc(AnomalyLog.detected_at)))
     return {"anomalies": [{"id": r.id, "employee_id": r.employee_id,
@@ -925,12 +995,13 @@ async def get_anomalies(db: AsyncSession=Depends(get_db)):
 
 @app.get("/api/team")
 async def get_team(request: Request=None, db: AsyncSession=Depends(get_db)):
-    await require_registered_caller(request, db)
+    caller_device, caller_role = await get_caller_context(request, db)
     caller_id = get_caller_id(request) if request else None
     managed = await get_managed_teams(caller_id, db) if caller_id else None
     dq = await db.execute(select(Device).order_by(Device.employee_name))
     result = []
     for d in dq.scalars().all():
+        if caller_role == "employee" and d.employee_id != caller_device.employee_id: continue
         if managed is not None and d.team not in managed: continue
         role = await get_role(d.employee_id, db)
         result.append({"hostname": d.hostname, "employee_name": d.employee_name,
@@ -945,6 +1016,7 @@ async def get_leave_types():
 @app.get("/api/compliance")
 async def get_compliance(month: str=None, team: str=None, request: Request=None,
                          db: AsyncSession=Depends(get_db)):
+    await require_role(request, db, "manager")
     if not month: month=date.today().strftime("%Y-%m")
     yr, mo = int(month[:4]), int(month[5:7])
     today  = date.today()
@@ -1199,12 +1271,10 @@ async def export_csv(month: str=None, request: Request=None,
              | RTO% | Wk1 | Wk2 | Wk3 | Wk4 | Wk5 | Notes
     """
     if not month: month = date.today().strftime("%Y-%m")
-    if request:
-        caller_id = get_caller_id(request)
-        if caller_id:
-            role = await get_role(caller_id, db)
-            if role == "employee":
-                raise HTTPException(403, "Manager or admin role required")
+    caller_device = await require_registered_caller(request, db)
+    role = await get_role(caller_device.employee_id, db)
+    if role == "employee":
+        raise HTTPException(403, "Manager or admin role required")
 
     # Get all working days in month
     yr, mo = int(month[:4]), int(month[5:7])
@@ -1370,10 +1440,12 @@ async def get_insights(employee_id: str, request: Request = None,
     Personal WFO forecast for the next 14 working days + monthly progress.
     Accessible by the employee themselves, their manager, or admin.
     """
-    await require_registered_caller(request, db)
+    caller_device, caller_role = await get_caller_context(request, db)
     caller_id = get_caller_id(request) if request else None
     # Access check: can only view own or managed team members
     if caller_id and caller_id != employee_id:
+        if caller_role == "employee":
+            raise HTTPException(403, "Access denied")
         managed = await get_managed_teams(caller_id, db)
         if managed is not None:
             dq = await db.execute(select(Device).where(Device.employee_id == employee_id))
@@ -1529,11 +1601,13 @@ async def get_team_rhythm(team: str, request: Request = None,
 @app.get("/api/team-leave")
 async def get_team_leave(month: str=None, team: str=None,
                          request: Request=None, db: AsyncSession=Depends(get_db)):
-    await require_registered_caller(request, db)
+    caller_device, caller_role = await get_caller_context(request, db)
     if not month: month=date.today().strftime("%Y-%m")
     caller_id_tl = get_caller_id(request) if request else None
     managed_tl = await get_managed_teams(caller_id_tl, db) if caller_id_tl else None
     stmt = select(LeaveRequest).where(LeaveRequest.date.like(f"{month}%"))
+    if caller_role == "employee":
+        team = caller_device.team
     if team:
         subq = select(Device.employee_id).where(Device.team == team)
         stmt = stmt.where(LeaveRequest.employee_id.in_(subq))

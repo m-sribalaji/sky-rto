@@ -150,9 +150,19 @@ const LEAVE_TYPES = ['annual','casual','sick','public_holiday',
 
 let selected = new Set();
 let chosenType = null;
+let DEVICE_TOKEN = localStorage.getItem('rto_device_token') || '';
 
 // Auto-select all on load
-window.addEventListener('DOMContentLoaded', () => {
+window.addEventListener('DOMContentLoaded', async () => {
+  try {
+    const r = await fetch(`/api/device/${HOSTNAME}`);
+    const d = await r.json();
+    if (d.employee_id) localStorage.setItem('rto_my_employee_id', d.employee_id);
+    if (d.api_token) {
+      DEVICE_TOKEN = d.api_token;
+      localStorage.setItem('rto_device_token', d.api_token);
+    }
+  } catch(e) {}
   MISSING_DAYS.forEach(d => toggleDay(d.date, true));
 });
 
@@ -228,7 +238,7 @@ async function submitBulk(){
     try{
       const resp = await fetch('/api/missed', {
         method: 'POST',
-        headers: {'Content-Type':'application/json'},
+        headers: {'Content-Type':'application/json','X-Device-Token':DEVICE_TOKEN},
         body: JSON.stringify({
           hostname: HOSTNAME,
           date,

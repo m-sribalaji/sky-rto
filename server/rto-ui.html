@@ -493,7 +493,7 @@ input::placeholder,textarea::placeholder{color:var(--tx3);}textarea{resize:verti
 <script>
 const API = window.location.origin;
 const TODAY = (()=>{const d=new Date();return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;})();
-let MY_ID='', MY_ROLE='employee', MY_NAME='', MY_TEAM='';
+let MY_ID='', MY_TOKEN='', MY_ROLE='employee', MY_NAME='', MY_TEAM='';
 let MY_MANAGED_TEAMS=null; // null=all, array=restricted teams
 let DASH_TEAM_FILTER='';   // currently selected team filter on dashboard
 
@@ -528,16 +528,19 @@ const pageTitles={dashboard:'Dashboard',today:"Today's Status",mystatus:'My Stat
 // -- UTILS ----------------------------------------------
 async function get(p){
   try{
-    // Use MY_ID if set, otherwise fall back to localStorage (handles init race)
     const eid = MY_ID || localStorage.getItem('rto_my_employee_id') || '';
-    const r=await fetch(API+p,{headers:eid?{'X-Employee-Id':eid}:{}});
+    const token = MY_TOKEN || localStorage.getItem('rto_device_token') || '';
+    const headers = {};
+    if(eid) headers['X-Employee-Id']=eid;
+    if(token) headers['X-Device-Token']=token;
+    const r=await fetch(API+p,{headers});
     return r.ok?await r.json():null;
   }catch{return null;}
 }
 async function post(p,b){
   try{
     const r=await fetch(API+p,{method:'POST',
-      headers:{'Content-Type':'application/json','X-Employee-Id':MY_ID||''},
+      headers:{'Content-Type':'application/json','X-Employee-Id':MY_ID||'','X-Device-Token':MY_TOKEN||''},
       body:JSON.stringify(b)});
     return{ok:r.ok,data:await r.json()};
   }catch(e){return{ok:false,data:{error:e.message}};}
@@ -545,7 +548,7 @@ async function post(p,b){
 async function del(p,b={}){
   try{
     const r=await fetch(API+p,{method:'DELETE',
-      headers:{'Content-Type':'application/json','X-Employee-Id':MY_ID||''},
+      headers:{'Content-Type':'application/json','X-Employee-Id':MY_ID||'','X-Device-Token':MY_TOKEN||''},
       body:JSON.stringify(b)});
     return{ok:r.ok,data:await r.json()};
   }catch(e){return{ok:false,data:{}};}
@@ -709,7 +712,7 @@ function buildTopbarActions(){
 }
 
 function showUnregisteredState(msg='This browser is not linked to a registered employee.'){
-  MY_ID=''; MY_ROLE='employee'; MY_NAME=''; MY_TEAM=''; MY_MANAGED_TEAMS=null;
+  MY_ID=''; MY_TOKEN=''; MY_ROLE='employee'; MY_NAME=''; MY_TEAM=''; MY_MANAGED_TEAMS=null;
   document.getElementById('sb-ava').textContent='?';
   document.getElementById('sb-ava').style.background='';
   document.getElementById('sb-name').textContent='Not registered';
@@ -757,15 +760,18 @@ function nav(id){
 // -- SIDEBAR USER --------------------------------------
 async function loadSidebarUser(){
   const stored = localStorage.getItem('rto_my_employee_id');
-  if(!stored){
+  const storedToken = localStorage.getItem('rto_device_token');
+  if(!stored || !storedToken){
     showUnregisteredState();
     return false;
   }
 
   MY_ID = stored;
-  const meResp = await fetch(`${API}/api/me`,{headers:{'X-Employee-Id':stored}});
+  MY_TOKEN = storedToken;
+  const meResp = await fetch(`${API}/api/me`,{headers:{'X-Employee-Id':stored,'X-Device-Token':storedToken}});
   if(!meResp.ok){
     localStorage.removeItem('rto_my_employee_id');
+    localStorage.removeItem('rto_device_token');
     showUnregisteredState('Saved employee identity is no longer registered.');
     return false;
   }
@@ -777,7 +783,7 @@ async function loadSidebarUser(){
   // Load managed teams for manager/admin
   if(MY_ROLE==='manager'||MY_ROLE==='admin'){
     try{
-      const mt=await fetch(`${API}/api/managed-teams/${MY_ID}`,{headers:{'X-Employee-Id':MY_ID}});
+      const mt=await fetch(`${API}/api/managed-teams/${MY_ID}`,{headers:{'X-Employee-Id':MY_ID,'X-Device-Token':MY_TOKEN}});
       if(mt.ok){const mtd=await mt.json();MY_MANAGED_TEAMS=mtd.managed_teams||null;}
     }catch(e){}
   }
@@ -953,7 +959,7 @@ async function loadTeamTodayStatus(){
   // Employee: show only own registered team
   let myTeam = null;
   try {
-    const meR = await fetch('/api/me', {headers:{'X-Employee-Id':MY_ID}});
+    const meR = await fetch('/api/me', {headers:{'X-Employee-Id':MY_ID,'X-Device-Token':MY_TOKEN}});
     if(meR.ok){ const meData = await meR.json(); myTeam = meData?.team || null; }
   } catch(e) {}
 
@@ -1057,7 +1063,7 @@ async function loadTeamLeaveCalendar(){
   // Get my team via /api/me
   let myTeam = null;
   try {
-    const meR = await fetch('/api/me', {headers:{'X-Employee-Id':MY_ID}});
+    const meR = await fetch('/api/me', {headers:{'X-Employee-Id':MY_ID,'X-Device-Token':MY_TOKEN}});
     if(meR.ok){ const meData = await meR.json(); myTeam = meData?.team || null; }
   } catch(e) {}
 
@@ -1341,7 +1347,19 @@ async function exportCSV(){
   const month = document.getElementById('compliance-month')?.value
              || document.getElementById('my-hist-month')?.value
              || new Date().toISOString().slice(0,7);
-  window.location.href=`${API}/api/export?month=${month}`;
+  const r = await fetch(`${API}/api/export?month=${month}`, {
+    headers:{'X-Employee-Id':MY_ID,'X-Device-Token':MY_TOKEN}
+  });
+  if(!r.ok) return;
+  const blob = await r.blob();
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = `rto-attendance-${month}.csv`;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
 }
 
 // -- LEAVE MANAGEMENT ----------------------------------
@@ -1851,7 +1869,7 @@ async function saveTeamAccess(empId){
   const managed = checked.length ? checked : null;
   const r = await fetch(`${API}/api/managed-teams/${empId}`,{
     method:'PUT',
-    headers:{'Content-Type':'application/json','X-Employee-Id':MY_ID},
+    headers:{'Content-Type':'application/json','X-Employee-Id':MY_ID,'X-Device-Token':MY_TOKEN},
     body: JSON.stringify({managed_teams: managed})
   });
   if(r.ok){
@@ -1873,7 +1891,7 @@ async function saveTeamAccess(empId){
 
 async function clearTeamAccess(empId){
   const r=await fetch(`${API}/api/managed-teams/${empId}`,{
-    method:'PUT',headers:{'Content-Type':'application/json','X-Employee-Id':MY_ID},
+    method:'PUT',headers:{'Content-Type':'application/json','X-Employee-Id':MY_ID,'X-Device-Token':MY_TOKEN},
     body:JSON.stringify({managed_teams:null})
   });
   if(r.ok){notice('ok',`${empId} now has unrestricted access`);loadTeamAssign();}

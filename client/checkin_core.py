@@ -93,6 +93,8 @@ DEFAULT_CONFIG = {
     "last_detected_class":  None,
     "last_reg_attempt_ts":  None,
     "last_reg_attempt_date": None,
+    "employee_id":          None,
+    "device_token":         None,
     "poll_interval_seconds": 300,
 }
 
@@ -133,8 +135,31 @@ def _get_notify_cfg(cfg: dict) -> tuple:
     )
 
 def _get_auth_headers(cfg: dict) -> dict:
+    headers = {}
     employee_id = cfg.get("employee_id")
-    return {"X-Employee-Id": employee_id} if employee_id else {}
+    device_token = cfg.get("device_token")
+    if employee_id:
+        headers["X-Employee-Id"] = employee_id
+    if device_token:
+        headers["X-Device-Token"] = device_token
+    return headers
+
+def _sync_device_auth(server: str, hostname: str, cfg: dict) -> dict:
+    device = api_get(f"{server}/api/device/{hostname}")
+    if device and device.get("registered"):
+        changed = False
+        if device.get("employee_id") and cfg.get("employee_id") != device.get("employee_id"):
+            cfg["employee_id"] = device.get("employee_id")
+            changed = True
+        if device.get("api_token") and cfg.get("device_token") != device.get("api_token"):
+            cfg["device_token"] = device.get("api_token")
+            changed = True
+        if device.get("employee_name") and cfg.get("employee_name") != device.get("employee_name"):
+            cfg["employee_name"] = device.get("employee_name")
+            changed = True
+        if changed:
+            save_config(cfg)
+    return device
 
 # ── NETWORK SIGNAL COLLECTION ────────────────────────────────────────────────
 import ipaddress as _ipaddress
@@ -459,17 +484,16 @@ def api_post(url, payload, timeout=10, auth_headers: dict = None):
     except Exception as e:
         logger.error(f"[FAIL] POST {url}: {e}"); return None
 
-def api_get(url, timeout=10):
+def api_get(url, timeout=10, auth_headers: dict = None):
     try:
-        req = urllib.request.Request(
-            url,
-            headers={
-                "Accept": "application/json",
-                "Accept-Encoding": "identity",
-                "Connection": "close",
-            },
-            method="GET",
-        )
+        hdrs = {
+            "Accept": "application/json",
+            "Accept-Encoding": "identity",
+            "Connection": "close",
+        }
+        if auth_headers:
+            hdrs.update(auth_headers)
+        req = urllib.request.Request(url, headers=hdrs, method="GET")
         with urllib.request.urlopen(req, timeout=timeout) as r:
             return json.loads(r.read().decode())
     except Exception as e:
@@ -728,7 +752,7 @@ def check_missed_yesterday(server: str, hostname: str, cfg: dict, today: str):
     except Exception: pass
 
     if not server_reachable(server): return
-    device = api_get(f"{server}/api/device/{hostname}")
+    device = _sync_device_auth(server, hostname, cfg)
     if not device or not device.get("registered"): return
 
     emp_id = device.get("employee_id", "")
@@ -751,7 +775,8 @@ def check_missed_yesterday(server: str, hostname: str, cfg: dict, today: str):
     months_needed = list(dict.fromkeys(d[:7] for d in days_to_check))
     records_by_date = {}
     for month in months_needed:
-        history = api_get(f"{server}/api/history/{emp_id}?month={month}")
+        history = api_get(f"{server}/api/history/{emp_id}?month={month}",
+                          auth_headers=_get_auth_headers(cfg))
         if history:
             for r in history.get("records", []):
                 records_by_date[r["date"]] = r
@@ -844,6 +869,9 @@ def run_checkin(force: bool = False):
             f"-> class={local_class}"
         )
 
+        if server_reachable(server):
+            _sync_device_auth(server, hostname, cfg)
+
         changed = location_changed(cfg, local_class)
         if not force and not changed:
             if QUEUE_FILE.exists() and server_reachable(server):
@@ -928,7 +956,7 @@ def run_checkin(force: bool = False):
                 notify_queue_flushed(emp_name, flushed,
                                      webhook=wh, level=lvl, server_url=srv)
 
-        device = api_get(f"{server}/api/device/{hostname}")
+        device = _sync_device_auth(server, hostname, cfg)
         if not device or not device.get("registered"):
             logger.info("Not registered - opening registration page")
             last_reg_ts  = cfg.get("last_reg_attempt_ts") or 0
@@ -959,6 +987,7 @@ def run_checkin(force: bool = False):
                     cfg.pop("last_reg_attempt_date", None)
                     cfg["employee_name"] = emp_name
                     cfg["employee_id"] = check.get("employee_id")
+                    cfg["device_token"] = check.get("api_token")
                     save_config(cfg)
                     if NOTIFIER_AVAILABLE:
                         wh, lvl, srv = _get_notify_cfg(cfg)
@@ -1002,6 +1031,7 @@ def run_checkin(force: bool = False):
                 if dev_check and dev_check.get("employee_name"):
                     cfg["employee_name"] = dev_check["employee_name"]
                     cfg["employee_id"] = dev_check.get("employee_id")
+                    cfg["device_token"] = dev_check.get("api_token")
             save_config(cfg)
             if NOTIFIER_AVAILABLE:
                 wh, lvl, srv = _get_notify_cfg(cfg)
@@ -1087,6 +1117,7 @@ def run_reset():
 # ── RETRY QUEUE ───────────────────────────────────────────────────────────────
 def run_retry():
     cfg    = load_config()
+    hostname = get_hostname()
     server = cfg["server_url"].rstrip("/")
     if not QUEUE_FILE.exists():
         print("  No queued check-ins to retry."); return
@@ -1103,6 +1134,7 @@ def run_retry():
         print(f"\n    [WARN] Server unreachable at {server}")
         print(f"  Connect VPN and try again.\n"); return
 
+    _sync_device_auth(server, hostname, cfg)
     flushed, _ = flush_queue(server, cfg)
     print(f"\n    [OK] Synced {flushed} record(s) to server.")
     remaining = json.loads(QUEUE_FILE.read_text()) if QUEUE_FILE.exists() else []

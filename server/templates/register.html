@@ -77,13 +77,15 @@ async function register() {
   lucide.createIcons();
   try {
     const plt = navigator.platform.toLowerCase().includes('win') ? 'windows' : 'macos';
-    await fetch('/api/register', {
+    const resp = await fetch('/api/register', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ hostname: '{{ hostname }}', employee_name: nm,
                              employee_id: eid, team: tm, platform: plt })
     });
+    const data = await resp.json();
     localStorage.setItem('rto_my_employee_id', eid);
+    if (data.api_token) localStorage.setItem('rto_device_token', data.api_token);
     btn.innerHTML = '<i data-lucide="check-circle"></i> Registered successfully!';
     btn.className = 'btn success';
     lucide.createIcons();
