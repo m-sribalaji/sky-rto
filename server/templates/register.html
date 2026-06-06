@@ -84,8 +84,9 @@ async function register() {
                              employee_id: eid, team: tm, platform: plt })
     });
     const data = await resp.json();
-    localStorage.setItem('rto_my_employee_id', eid);
-    if (data.api_token) localStorage.setItem('rto_device_token', data.api_token);
+    localStorage.setItem('_sk_ei', eid);
+    localStorage.setItem('_sk_host', '{{ hostname }}');
+    if (data.api_token) localStorage.setItem('_sk_dt', data.api_token);
     btn.innerHTML = '<i data-lucide="check-circle"></i> Registered successfully!';
     btn.className = 'btn success';
     lucide.createIcons();

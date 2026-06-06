@@ -61,18 +61,12 @@
 {% block script %}
 <script>
 let chosen = null;
-let DEVICE_TOKEN = localStorage.getItem('rto_device_token') || '';
+let DEVICE_TOKEN = localStorage.getItem('_sk_dt') || '';
 
 (async () => {
-  try {
-    const r = await fetch('/api/device/{{ hostname }}');
-    const d = await r.json();
-    if (d.employee_id) localStorage.setItem('rto_my_employee_id', d.employee_id);
-    if (d.api_token) {
-      DEVICE_TOKEN = d.api_token;
-      localStorage.setItem('rto_device_token', d.api_token);
-    }
-  } catch(e) {}
+  // Token is stored from registration — do not re-fetch from device endpoint
+  // (device endpoint no longer returns token for security)
+  DEVICE_TOKEN = localStorage.getItem('_sk_dt') || '';
 })();
 
 function pick(v) {

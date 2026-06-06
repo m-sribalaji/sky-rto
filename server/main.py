@@ -45,8 +45,17 @@ except ImportError:
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("rto")
 
-app = FastAPI(title=APP_TITLE, version="2.0.0")
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"], expose_headers=["X-Employee-Id"])
+app = FastAPI(
+    title=APP_TITLE, version="2.0.0",
+    docs_url=None, redoc_url=None, openapi_url=None,
+)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://10.131.80.141:8989", "http://localhost:8989"],
+    allow_methods=["GET","POST","PUT","PATCH","DELETE"],
+    allow_headers=["Content-Type","X-Employee-Id","X-Device-Token","Authorization"],
+    expose_headers=["X-Employee-Id"],
+)
 _base_dir = os.path.dirname(os.path.abspath(__file__))
 _tmpl_dir = os.path.join(_base_dir, "templates")
 if not os.path.isdir(_tmpl_dir):
@@ -70,6 +79,33 @@ DEFAULT_TEAMS = [
 
 def generate_api_token() -> str:
     return secrets.token_urlsafe(32)
+
+from collections import defaultdict as _dd
+import time as _t
+_rl: dict = _dd(list)
+
+@app.middleware("http")
+async def security_middleware(request: Request, call_next):
+    # Block oversized requests
+    cl = request.headers.get("content-length")
+    if cl and int(cl) > 1_048_576:
+        from fastapi.responses import JSONResponse
+        return JSONResponse(status_code=413, content={"detail": "Request too large"})
+    # Rate limit per IP
+    ip  = request.client.host if request.client else "unknown"
+    now = _t.time()
+    _rl[ip] = [t for t in _rl[ip] if t > now - 60]
+    limit = 20 if request.method in ("POST","PUT","PATCH","DELETE") else 120
+    if len(_rl[ip]) >= limit:
+        from fastapi.responses import JSONResponse
+        return JSONResponse(status_code=429, content={"detail": "Too many requests."})
+    _rl[ip].append(now)
+    resp = await call_next(request)
+    resp.headers["X-Content-Type-Options"] = "nosniff"
+    resp.headers["X-Frame-Options"] = "DENY"
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
+
 
 @app.on_event("startup")
 async def startup():
@@ -189,18 +225,23 @@ async def get_managed_teams(employee_id: str, db: AsyncSession):
 async def require_role(request: Request, db: AsyncSession,
                        minimum: str, caller_id: str | None = None) -> str:
     HIERARCHY = {"employee": 0, "manager": 1, "admin": 2}
-    eid = caller_id or get_caller_id(request)
-    if not eid:
-        raise HTTPException(403, "X-Employee-Id header required.")
-    q = await db.execute(select(Device).where(Device.employee_id == eid))
+    # Always use header identity — never trust caller_id from request body alone.
+    # Body-supplied caller_id is only used as a hint; header token is the real auth.
+    header_eid = get_caller_id(request)
+    token      = get_device_token(request)
+    if not header_eid or not token:
+        raise HTTPException(401, "X-Employee-Id and X-Device-Token headers required.")
+    q = await db.execute(select(Device).where(Device.employee_id == header_eid))
     device = q.scalars().first()
-    token = get_device_token(request)
-    if not device or not token or not device.api_token or not secrets.compare_digest(token, device.api_token):
-        raise HTTPException(401, "Valid X-Device-Token header required.")
-    role = await get_role(eid, db)
+    if not device or not device.api_token or not secrets.compare_digest(token, device.api_token):
+        raise HTTPException(401, "Invalid token.")
+    # If caller_id provided (e.g. from body), it must match the authenticated header identity
+    if caller_id and caller_id != header_eid:
+        raise HTTPException(403, "Caller ID mismatch — cannot act on behalf of another user.")
+    role = await get_role(header_eid, db)
     if HIERARCHY.get(role, 0) < HIERARCHY.get(minimum, 1):
         raise HTTPException(403, f"Requires {minimum} role. Your role: {role}.")
-    return eid
+    return header_eid
 
 async def require_registered_caller(request: Request, db: AsyncSession):
     eid = get_caller_id(request)
@@ -222,7 +263,10 @@ async def get_caller_context(request: Request, db: AsyncSession):
 
 # -- 1. REGISTER -------------------------------------------
 @app.post("/api/register")
-async def register(p: RegisterPayload, db: AsyncSession = Depends(get_db)):
+async def register(p: RegisterPayload, request: Request, db: AsyncSession = Depends(get_db)):
+    client_ip = get_client_ip(request)
+    if not (client_ip.startswith("10.") or client_ip in ("127.0.0.1", "::1", "172.17.0.1")):
+        raise HTTPException(403, "Registration only allowed from Sky network.")
     existing = await db.get(Device, p.hostname)
     if existing:
         existing.employee_name=p.employee_name; existing.employee_id=p.employee_id
@@ -249,15 +293,32 @@ async def register(p: RegisterPayload, db: AsyncSession = Depends(get_db)):
 
 @app.get("/api/device/{hostname}")
 async def get_device(hostname: str, db: AsyncSession = Depends(get_db)):
+    """Public endpoint - NEVER returns api_token. Token only returned at register/token-refresh."""
     d = await db.get(Device, hostname)
     if not d: return {"registered": False}
+    role = await get_role(d.employee_id, db)
+    return {"registered": True, "employee_name": d.employee_name,
+            "employee_id": d.employee_id, "team": d.team, "role": role}
+
+@app.post("/api/token-refresh/{hostname}")
+async def token_refresh(hostname: str, request: Request, db: AsyncSession = Depends(get_db)):
+    """
+    Issues a token for existing registered devices that predate token auth.
+    Security: only callable from Sky VPN (10.x.x.x).
+    Safe to call repeatedly — returns same token each time.
+    """
+    client_ip = get_client_ip(request)
+    if not (client_ip.startswith("10.") or client_ip in ("127.0.0.1","::1","172.17.0.1")):
+        raise HTTPException(403, "Only accessible on Sky network.")
+    d = await db.get(Device, hostname)
+    if not d:
+        raise HTTPException(404, "Device not registered.")
     if not d.api_token:
         d.api_token = generate_api_token()
         await db.commit()
-    role = await get_role(d.employee_id, db)
-    return {"registered": True, "employee_name": d.employee_name,
-            "employee_id": d.employee_id, "team": d.team, "role": role,
-            "api_token": d.api_token}
+        logger.info(f"Token issued for existing device: {hostname}")
+    return {"api_token": d.api_token, "employee_id": d.employee_id,
+            "employee_name": d.employee_name}
 
 # -- 2. ROLES ----------------------------------------------
 @app.get("/api/roles")
@@ -1970,7 +2031,7 @@ async def get_version():
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "service": APP_TITLE, "port": PORT, "version": "2.0"}
+    return {"status": "ok"}
 
 # -- STATIC FILES - must be mounted AFTER all routes -------
 _static_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")

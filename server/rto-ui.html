@@ -528,8 +528,8 @@ const pageTitles={dashboard:'Dashboard',today:"Today's Status",mystatus:'My Stat
 // -- UTILS ----------------------------------------------
 async function get(p){
   try{
-    const eid = MY_ID || localStorage.getItem('rto_my_employee_id') || '';
-    const token = MY_TOKEN || localStorage.getItem('rto_device_token') || '';
+    const eid = MY_ID || localStorage.getItem('_sk_ei') || '';
+    const token = MY_TOKEN || localStorage.getItem('_sk_dt') || '';
     const headers = {};
     if(eid) headers['X-Employee-Id']=eid;
     if(token) headers['X-Device-Token']=token;
@@ -759,8 +759,8 @@ function nav(id){
 
 // -- SIDEBAR USER --------------------------------------
 async function loadSidebarUser(){
-  const stored = localStorage.getItem('rto_my_employee_id');
-  const storedToken = localStorage.getItem('rto_device_token');
+  const stored = localStorage.getItem('_sk_ei');
+  const storedToken = localStorage.getItem('_sk_dt');
   if(!stored || !storedToken){
     showUnregisteredState();
     return false;
@@ -768,10 +768,35 @@ async function loadSidebarUser(){
 
   MY_ID = stored;
   MY_TOKEN = storedToken;
+  // If we have employee ID but no token, try token-refresh before clearing state
+  // This handles existing users migrating to token auth
+  if (MY_ID && !MY_TOKEN) {
+    try {
+      const hostname = window.location.hostname === 'localhost' ? 'unknown' :
+        (await fetch('/api/me', {headers:{'X-Employee-Id':MY_ID}})
+          .then(r=>r.json()).then(d=>d.hostname||'').catch(()=>''));
+      const h = localStorage.getItem('_sk_host') || '';
+      if (h) {
+        const tr = await fetch(`/api/token-refresh/${h}`, {method:'POST'});
+        if (tr.ok) {
+          const td = await tr.json();
+          if (td.api_token) {
+            MY_TOKEN = td.api_token;
+            localStorage.setItem('_sk_dt', MY_TOKEN);
+          }
+        }
+      }
+    } catch(e) {}
+    // If still no token after refresh attempt, clear
+    if (!MY_TOKEN) {
+      MY_ID = '';
+      localStorage.removeItem('_sk_ei');
+    }
+  }
   const meResp = await fetch(`${API}/api/me`,{headers:{'X-Employee-Id':stored,'X-Device-Token':storedToken}});
   if(!meResp.ok){
-    localStorage.removeItem('rto_my_employee_id');
-    localStorage.removeItem('rto_device_token');
+    localStorage.removeItem('_sk_ei');
+    localStorage.removeItem('_sk_dt');
     showUnregisteredState('Saved employee identity is no longer registered.');
     return false;
   }

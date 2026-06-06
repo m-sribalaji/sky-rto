@@ -11,10 +11,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends tzdata \
 ENV TZ=Asia/Kolkata
 RUN ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone
 
-# Teams webhook for server-side notifications (leave, overrides)
-# Override at runtime: docker run -e TEAMS_WEBHOOK -e SERVER_URL
+# Secrets are injected at runtime via .env file (docker-compose env_file).
+# Never hardcode TEAMS_WEBHOOK or SERVER_URL here.
 ENV TEAMS_WEBHOOK=""
-ENV SERVER_URL="http://10.131.80.141:8989"
+ENV SERVER_URL=""
 
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
@@ -26,11 +26,10 @@ COPY config.py database.py detection.py main.py segments.py notifier.py analytic
 COPY rto-ui.html admin.html ./
 COPY templates/ ./templates/
 
-# sky-logo.png is optional - copy only if present
+# sky-logo.png is optional
 COPY sky-logo.pn[g] ./
 
 RUN mkdir -p /app/data /app/static
-# Move sky-logo to static dir if it exists
 RUN [ -f /app/sky-logo.png ] && mv /app/sky-logo.png /app/static/ || true
 
 EXPOSE 8989

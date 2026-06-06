@@ -8,15 +8,14 @@ services:
     container_name: sky-rto-tracker
     restart: unless-stopped
     ports:
-      - "8989:8989"
+      - "127.0.0.1:8989:8989"
     volumes:
-      # Persist SQLite DB outside container
       - ./data:/app/data
+    env_file:
+      - .env
     environment:
       - DATABASE_URL=sqlite+aiosqlite:////app/data/rto.db
       - TZ=Asia/Kolkata
-      - SERVER_URL=http://10.131.80.141:8989
-      - TEAMS_WEBHOOK=https://skyglobal.webhook.office.com/webhookb2/0d7bdc66-6a73-45fb-a24b-385d4e0cda96@68b865d5-cf18-4b2b-82a4-a4eddb9c5237/IncomingWebhook/a525a07c9ccd4bbc83366d86b04f0302/4ea4908b-0ad1-44e4-982b-b8aa39c45886/V28h2KNMh38ha3v9UR5RdOiiyen2KNykniOao3hJZFQq41
     healthcheck:
       test: ["CMD", "python3", "-c",
              "import urllib.request; urllib.request.urlopen('http://localhost:8989/health')"]

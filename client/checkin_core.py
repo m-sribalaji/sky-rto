@@ -145,18 +145,26 @@ def _get_auth_headers(cfg: dict) -> dict:
     return headers
 
 def _sync_device_auth(server: str, hostname: str, cfg: dict) -> dict:
+    """
+    Sync device info from server. If token is missing (existing user migrating
+    to token auth), call /api/token-refresh to get one issued.
+    """
     device = api_get(f"{server}/api/device/{hostname}")
     if device and device.get("registered"):
         changed = False
         if device.get("employee_id") and cfg.get("employee_id") != device.get("employee_id"):
             cfg["employee_id"] = device.get("employee_id")
             changed = True
-        if device.get("api_token") and cfg.get("device_token") != device.get("api_token"):
-            cfg["device_token"] = device.get("api_token")
-            changed = True
         if device.get("employee_name") and cfg.get("employee_name") != device.get("employee_name"):
             cfg["employee_name"] = device.get("employee_name")
             changed = True
+        # If we have no token, call token-refresh to get one
+        if not cfg.get("device_token"):
+            refresh = api_post(f"{server}/api/token-refresh/{hostname}", {})
+            if refresh and refresh.get("api_token"):
+                cfg["device_token"] = refresh["api_token"]
+                changed = True
+                logger.info("[OK] Device token obtained via token-refresh")
         if changed:
             save_config(cfg)
     return device
@@ -581,8 +589,15 @@ UPDATE_CHECK_FILE = CONFIG_DIR / ".last_update_check"
 UPDATE_INTERVAL   = 86400  # check once per day (seconds)
 
 def _parse_version(v: str) -> tuple:
-    """Parse "v1.2.3" or "1.2.3" into (1, 2, 3) for comparison."""
+    """
+    Parse version strings into comparable tuples.
+    Handles: "0.0.22", "v0.0.22", "build-24" (-> (0,0,24))
+    """
     try:
+        # Handle "build-N" tag format from GitHub Actions
+        if v.startswith("build-"):
+            n = int(v.split("-")[1])
+            return (0, 0, n)
         return tuple(int(x) for x in v.lstrip("v").split(".")[:3])
     except Exception:
         return (0, 0, 0)
