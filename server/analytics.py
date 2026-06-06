@@ -321,6 +321,54 @@ def compute_dow_rates(
 
     return dow_rates, active_weeks, dow_intervals, dow_confidence
 
+# ── Stable display baseline — slow EWMA, immune to single deviations ────────
+def compute_dow_rates_stable(
+    att: dict[str, str],
+    ph_dates: set[str],
+) -> dict[int, float]:
+    """
+    Compute a STABLE WFO probability for each weekday — display only, not prediction.
+
+    Key differences from compute_dow_rates:
+    - Always uses EWMA_ALPHA_STABLE (0.15) regardless of tenure or variance.
+    - Caps to the most recent 12 weeks of data.
+    - A single deviation (e.g. one unexpected WFH Monday) barely moves the bar.
+    - Used for the WFO Pattern chart so percentages don't swing week to week.
+    """
+    today_ref = date.today()
+    cutoff_12w = (today_ref - timedelta(weeks=12)).isoformat()
+    current_week_start = today_ref - timedelta(days=today_ref.weekday())
+
+    dow_obs_dates: dict[int, list[tuple[str, bool]]] = defaultdict(list)
+    for ds, st in att.items():
+        if ds < cutoff_12w:
+            continue
+        if st in ("leave", "public_holiday"):
+            continue
+        d = date.fromisoformat(ds)
+        dow_obs_dates[d.weekday()].append((ds, st == "wfo"))
+
+    for dow in dow_obs_dates:
+        dow_obs_dates[dow].sort(key=lambda x: x[0])  # oldest first
+
+    dow_rates: dict[int, float] = {}
+    for dow in range(5):
+        obs = dow_obs_dates.get(dow, [])
+        if not obs:
+            dow_rates[dow] = 0.40
+            continue
+        ewma_val = 0.40  # neutral prior
+        for ds_str, was_wfo in obs:
+            obs_date = date.fromisoformat(ds_str)
+            obs_week_start = obs_date - timedelta(days=obs_date.weekday())
+            weeks_ago = max(0, (current_week_start - obs_week_start).days // 7)
+            # Fixed slow alpha — never adapts quickly
+            w = EWMA_ALPHA_STABLE * ((1 - EWMA_ALPHA_STABLE) ** weeks_ago)
+            v = 1.0 if was_wfo else 0.0
+            ewma_val = (1 - w) * ewma_val + w * v
+        dow_rates[dow] = round(max(0.05, min(0.95, ewma_val)), 3)
+    return dow_rates
+
 # ── Personal Markov matrix with Laplace smoothing (Fix #3) ─────────────────
 def _build_personal_markov(att: dict[str, str], ph_dates: set[str],
                             today: date) -> Optional[dict]:
@@ -417,6 +465,8 @@ def compute_forecast(
     """Compute personal WFO forecast for next forecast_days working days."""
     att = build_attendance(checkins, leaves, ph_dates)
     dow_rates, active_weeks, dow_intervals, dow_confidence = compute_dow_rates(att, ph_dates)
+    # Stable display baseline — slow alpha, max 12 weeks, won't swing on a single day
+    dow_rates_stable = compute_dow_rates_stable(att, ph_dates)
 
     # Insufficiency check based on per-weekday observation counts
     # Use global active_weeks as primary gate (fastest check)
@@ -426,13 +476,17 @@ def compute_forecast(
     global_conf = _confidence_tier(total_actual_obs)
     if active_weeks < 2:
         return {
-            "employee_id":      employee_id,
-            "employee_name":    employee_name,
-            "confidence":       "insufficient",
-            "confidence_label": _confidence_label("insufficient"),
-            "active_weeks":     active_weeks,
-            "forecast":         [],
-            "monthly":          _monthly_progress(att, today, ph_dates, current_month_wfo),
+            "employee_id":       employee_id,
+            "employee_name":     employee_name,
+            "confidence":        "insufficient",
+            "confidence_label":  _confidence_label("insufficient"),
+            "active_weeks":      active_weeks,
+            "forecast":          [],
+            "dow_rates_stable":  {str(i): 0.40 for i in range(5)},
+            "compliance_weeks":  [],
+            "wfh_budget":        0,
+            "projected_month_total": 0,
+            "monthly":           _monthly_progress(att, today, ph_dates, current_month_wfo),
             "insufficient_data": True,
             "message": f"Need at least 2 weeks of check-in data. Currently have {active_weeks}.",
         }
@@ -522,6 +576,8 @@ def compute_forecast(
         running_prev = "wfo" if prob >= 0.5 else "wfh"
 
     monthly = _monthly_progress(att, today, ph_dates, current_month_wfo)
+    compliance_meta = _compliance_forecast_weeks(
+        att, today, ph_dates, dow_rates_stable, current_month_wfo)
     month_rem = [f for f in forecast
                  if f["date"][:7] == today.strftime("%Y-%m")
                  and not f.get("certain") and f["status"] == "predicted_wfo"]
@@ -529,17 +585,21 @@ def compute_forecast(
     monthly["predicted_total"]      = monthly["actual_wfo"] + len(month_rem)
 
     return {
-        "employee_id":      employee_id,
-        "employee_name":    employee_name,
-        "confidence":       global_conf,
-        "confidence_label": _confidence_label(global_conf),
-        "active_weeks":     active_weeks,
-        "dow_rates":        {str(k): round(v,3) for k,v in dow_rates.items()},
-        "dow_confidence":   {str(k): v for k,v in dow_confidence.items()},
-        "personal_markov":  personal_markov is not None,
-        "forecast":         forecast,
-        "monthly":          monthly,
-        "insufficient_data": False,
+        "employee_id":           employee_id,
+        "employee_name":         employee_name,
+        "confidence":            global_conf,
+        "confidence_label":      _confidence_label(global_conf),
+        "active_weeks":          active_weeks,
+        "dow_rates":             {str(k): round(v,3) for k,v in dow_rates.items()},
+        "dow_rates_stable":      {str(k): v for k, v in dow_rates_stable.items()},
+        "dow_confidence":        {str(k): v for k,v in dow_confidence.items()},
+        "personal_markov":       personal_markov is not None,
+        "forecast":              forecast,
+        "monthly":               monthly,
+        "compliance_weeks":      compliance_meta["compliance_weeks"],
+        "wfh_budget":            compliance_meta["wfh_budget"],
+        "projected_month_total": compliance_meta["projected_month_total"],
+        "insufficient_data":     False,
     }
 
 def _last_workday_status(att: dict, today: date, ph_dates: set) -> Optional[str]:
@@ -570,6 +630,121 @@ def _monthly_progress(att, today, ph_dates, current_month_wfo=0):
         "total_workdays": len(workdays),
         "achievable":     len(remaining) >= needed,
         "on_track":       actual_wfo >= round((len(elapsed) / max(len(workdays),1)) * 12),
+    }
+
+# ── Per-week compliance forecast ──────────────────────────────────────────────
+def _compliance_forecast_weeks(
+    att: dict[str, str],
+    today: date,
+    ph_dates: set[str],
+    dow_rates_stable: dict[int, float],
+    current_month_wfo: int,
+    monthly_target: int = 12,
+    weekly_target: int = 3,
+) -> dict:
+    """
+    Compute per-remaining-week compliance outlook for the current month.
+    Uses stable (slow-moving) dow rates so projections don't chase behavior.
+
+    Returns:
+        compliance_weeks  — list of week dicts for the UI
+        wfh_budget        — total WFH days you can take and still hit monthly target
+        total_needed      — WFO days still needed this month
+        projected_month_total — actual + projected WFO (may exceed target)
+    """
+    yr, mo = today.year, today.month
+    workdays  = _workdays_in_month(yr, mo, ph_dates)
+    elapsed   = [d for d in workdays if d < today.isoformat()]
+    remaining = [d for d in workdays if d >= today.isoformat()]
+
+    actual_wfo = max(
+        sum(1 for d in elapsed if att.get(d) == "wfo"),
+        current_month_wfo,
+    )
+    total_needed = max(0, monthly_target - actual_wfo)
+    wfh_budget   = max(0, len(remaining) - total_needed)
+
+    # Group remaining workdays by ISO week
+    weeks_map: dict[str, list[str]] = defaultdict(list)
+    for ds in remaining:
+        d = date.fromisoformat(ds)
+        wk = f"{d.isocalendar()[0]}-W{d.isocalendar()[1]:02d}"
+        weeks_map[wk].append(ds)
+
+    compliance_weeks = []
+    projected_total_additional = 0.0
+
+    for wk_key in sorted(weeks_map.keys()):
+        days_in_week = weeks_map[wk_key]
+        day_details  = []
+        week_proj    = 0.0
+        leave_count  = 0
+
+        for ds in days_in_week:
+            d_obj         = date.fromisoformat(ds)
+            dow           = d_obj.weekday()
+            is_leave      = att.get(ds) in ("leave", "public_holiday")
+            is_today      = ds == today.isoformat()
+            is_past_actual = ds < today.isoformat() and att.get(ds) in ("wfo", "wfh")
+            actual_status  = att.get(ds) if ds <= today.isoformat() else None
+
+            if is_leave:
+                rate = 0.0
+                leave_count += 1
+            elif is_past_actual:
+                rate = 1.0 if actual_status == "wfo" else 0.0
+                week_proj += rate
+            else:
+                rate = dow_rates_stable.get(dow, 0.40)
+                week_proj += rate
+
+            day_details.append({
+                "date":          ds,
+                "dow":           dow,
+                "dow_name":      d_obj.strftime("%A")[:3],
+                "rate":          round(rate, 3),
+                "is_leave":      is_leave,
+                "is_today":      is_today,
+                "is_actual":     is_past_actual,
+                "actual_status": actual_status,
+            })
+
+        working_days = len(days_in_week) - leave_count
+        week_proj_r  = round(week_proj, 1)
+
+        # Scale weekly target for partial weeks (e.g. 2 days → ceil(2*3/5)=2)
+        week_tgt = math.ceil(working_days * weekly_target / 5) if working_days < 5 else weekly_target
+        risk     = week_proj < week_tgt and working_days > 0
+
+        projected_total_additional += week_proj
+
+        try:
+            is_current = (
+                date.fromisoformat(days_in_week[0]).isocalendar()[1] == today.isocalendar()[1]
+                and date.fromisoformat(days_in_week[0]).isocalendar()[0] == today.isocalendar()[0]
+            )
+        except Exception:
+            is_current = False
+
+        compliance_weeks.append({
+            "week_key":        wk_key,
+            "week_start":      days_in_week[0],
+            "week_end":        days_in_week[-1],
+            "working_days":    working_days,
+            "leave_days":      leave_count,
+            "week_target":     week_tgt,
+            "projected_wfo":   week_proj_r,
+            "risk":            risk,
+            "is_current_week": is_current,
+            "days":            day_details,
+        })
+
+    return {
+        "compliance_weeks":      compliance_weeks,
+        "wfh_budget":            wfh_budget,
+        "total_needed":          total_needed,
+        "remaining_days":        len(remaining),
+        "projected_month_total": round(actual_wfo + projected_total_additional, 1),
     }
 
 # ─────────────────────────────────────────────────────────────────────────────

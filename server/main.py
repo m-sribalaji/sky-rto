@@ -1645,16 +1645,24 @@ async def get_insights(employee_id: str, request: Request = None,
     """
     caller_device, caller_role = await get_caller_context(request, db)
     caller_id = get_caller_id(request) if request else None
-    # Access check: can only view own or managed team members
+    # Access control:
+    #   admin    → anyone
+    #   manager  → anyone in their managed teams
+    #   employee → own record OR any member of their own team
     if caller_id and caller_id != employee_id:
         if caller_role == "employee":
-            raise HTTPException(403, "Access denied")
-        managed = await get_managed_teams(caller_id, db)
-        if managed is not None:
-            dq = await db.execute(select(Device).where(Device.employee_id == employee_id))
-            dev_chk = dq.scalars().first()
-            if not dev_chk or dev_chk.team not in managed:
-                raise HTTPException(403, "Access denied")
+            # Employees may view teammates' insights
+            dq_target = await db.execute(select(Device).where(Device.employee_id == employee_id))
+            target_dev = dq_target.scalars().first()
+            if not target_dev or not caller_device or caller_device.team != target_dev.team:
+                raise HTTPException(403, "Employees can only view insights for their own team members")
+        else:
+            managed = await get_managed_teams(caller_id, db)
+            if managed is not None:
+                dq = await db.execute(select(Device).where(Device.employee_id == employee_id))
+                dev_chk = dq.scalars().first()
+                if not dev_chk or dev_chk.team not in managed:
+                    raise HTTPException(403, "Access denied")
 
     dq = await db.execute(select(Device).where(Device.employee_id == employee_id))
     device = dq.scalars().first()
@@ -1734,6 +1742,51 @@ async def get_insights(employee_id: str, request: Request = None,
         current_month_total_workdays = len(_workdays_in_month(today.year, today.month, ph_dates)),
     )
     return result
+
+
+@app.get("/api/insights-members")
+async def get_insights_members(request: Request, db: AsyncSession = Depends(get_db)):
+    """
+    Returns the list of employees whose insights the caller can view.
+    - Employee: own team only
+    - Manager:  managed teams only (or all if no restriction)
+    - Admin:    everyone
+    Used to populate the person-picker in the Insights UI.
+    """
+    caller_device, caller_role = await get_caller_context(request, db)
+    caller_id = get_caller_id(request)
+
+    if caller_role == "employee":
+        # Scoped strictly to own team
+        team = caller_device.team if caller_device else None
+        if team:
+            dq = await db.execute(
+                select(Device).where(Device.team == team).order_by(Device.employee_name))
+        else:
+            dq = await db.execute(
+                select(Device).where(Device.employee_id == caller_id))
+        devices = dq.scalars().all()
+    elif caller_role == "manager":
+        managed = await get_managed_teams(caller_id, db)
+        if managed is not None:
+            dq = await db.execute(
+                select(Device).where(Device.team.in_(managed))
+                .order_by(Device.team, Device.employee_name))
+        else:
+            dq = await db.execute(
+                select(Device).order_by(Device.team, Device.employee_name))
+        devices = dq.scalars().all()
+    else:  # admin
+        dq = await db.execute(
+            select(Device).order_by(Device.team, Device.employee_name))
+        devices = dq.scalars().all()
+
+    return {
+        "members": [
+            {"employee_id": d.employee_id, "employee_name": d.employee_name, "team": d.team or ""}
+            for d in devices
+        ]
+    }
 
 
 @app.get("/api/rhythm/{team}")

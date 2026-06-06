@@ -474,6 +474,13 @@ input::placeholder,textarea::placeholder{color:var(--tx3);}textarea{resize:verti
 
     <!-- INSIGHTS -->
     <div class="page" id="page-insights">
+      <div id="insights-person-picker" style="display:none;margin-bottom:2px">
+        <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+          <span style="font-family:var(--mono);font-size:10px;color:var(--tx3);text-transform:uppercase;letter-spacing:0.08em">Viewing</span>
+          <select id="insights-emp-sel" onchange="onInsightsPersonChange()" style="padding:5px 10px;font-size:12px;background:var(--bg2);border:1px solid var(--b1);border-radius:7px;color:var(--tx);font-family:var(--sans)"></select>
+          <span id="insights-person-team" style="font-family:var(--mono);font-size:10px;color:var(--tx3)"></span>
+        </div>
+      </div>
       <div id="insights-content"><div class="loading"><div class="spinner"></div>Loading...</div></div>
     </div>
 
@@ -496,6 +503,7 @@ const TODAY = (()=>{const d=new Date();return `${d.getFullYear()}-${String(d.get
 let MY_ID='', MY_TOKEN='', MY_ROLE='employee', MY_NAME='', MY_TEAM='';
 let MY_MANAGED_TEAMS=null; // null=all, array=restricted teams
 let DASH_TEAM_FILTER='';   // currently selected team filter on dashboard
+let INSIGHTS_EMP_ID='';    // currently viewed employee on Insights page ('' = self)
 
 // Returns team query param based on role and selected filter
 function getTeamParam(selectedTeam){
@@ -712,7 +720,7 @@ function buildTopbarActions(){
 }
 
 function showUnregisteredState(msg='This browser is not linked to a registered employee.'){
-  MY_ID=''; MY_TOKEN=''; MY_ROLE='employee'; MY_NAME=''; MY_TEAM=''; MY_MANAGED_TEAMS=null;
+  MY_ID=''; MY_TOKEN=''; MY_ROLE='employee'; MY_NAME=''; MY_TEAM=''; MY_MANAGED_TEAMS=null; INSIGHTS_EMP_ID='';
   document.getElementById('sb-ava').textContent='?';
   document.getElementById('sb-ava').style.background='';
   document.getElementById('sb-name').textContent='Not registered';
@@ -2053,21 +2061,40 @@ if(document.readyState==='loading'){
 }
 // ── INSIGHTS ──────────────────────────────────────────────────────────────
 async function loadInsights(){
-  const el = document.getElementById('insights-content');
-  el.innerHTML = '<div class="loading"><div class="spinner"></div>Loading your insights...</div>';
+  // Initialise person to self on first load or if reset
+  if(!INSIGHTS_EMP_ID) INSIGHTS_EMP_ID = MY_ID;
 
-  const empId = MY_ID;
-  // Fetch both forecast and compliance data in parallel
+  // Build/refresh person picker (employees = own team, mgr/admin = managed scope)
+  await _initInsightsPicker();
+
+  const el = document.getElementById('insights-content');
+  el.innerHTML = '<div class="loading"><div class="spinner"></div>Loading insights...</div>';
+
+  const empId = INSIGHTS_EMP_ID;
+  const isSelf = empId === MY_ID;
+
+  // Compliance fetch scoped by role
+  const compMonth = TODAY.slice(0,7);
+  const compUrl = (MY_ROLE==='employee' && MY_TEAM)
+    ? `/api/compliance?month=${compMonth}&team=${encodeURIComponent(MY_TEAM)}`
+    : `/api/compliance?month=${compMonth}`;
+
   const [d, compData] = await Promise.all([
     get(`/api/insights/${empId}`),
-    get(`/api/compliance?month=${TODAY.slice(0,7)}`),
+    get(compUrl),
   ]);
   if(!d){ el.innerHTML = '<div class="notice warn">Could not load insights.</div>'; return; }
+
+  // Update team label in picker
+  const teamSpan = document.getElementById('insights-person-team');
+  if(teamSpan) teamSpan.textContent = d.employee_name ? (isSelf ? '' : `· ${d.employee_name.split(' ')[0]}'s insights`) : '';
+
+  const ownerLabel = isSelf ? 'My' : `${d.employee_name?.split(' ')[0]}'s`;
 
   if(d.insufficient_data){
     el.innerHTML = `
       <div class="card" style="max-width:560px">
-        <div class="card-title">Insights <span class="card-sub">Personal forecast</span></div>
+        <div class="card-title">${ownerLabel} Insights <span class="card-sub">Personal forecast</span></div>
         <div class="notice info" style="margin:0">
           <i data-lucide="info"></i>
           <span>${d.message}</span>
@@ -2083,12 +2110,12 @@ async function loadInsights(){
   const needed = m.needed;
   const remaining = m.remaining_days;
   const achievable = m.achievable;
-  const predicted = m.predicted_total || m.actual_wfo;
+  const projected = d.projected_month_total || m.actual_wfo;
 
-  // Progress card
+  // ── Progress card ────────────────────────────────────────────────────
   const progressCard = `
     <div class="card">
-      <div class="card-title">My ${m.month} Progress <span class="card-sub">${d.confidence_label}</span></div>
+      <div class="card-title">${ownerLabel} ${m.month} Progress <span class="card-sub">${d.confidence_label}</span></div>
       <div style="margin:6px 0 14px">
         <div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:6px">
           <span style="font-family:var(--serif);font-size:28px;color:${barColor}">${m.actual_wfo}</span>
@@ -2109,7 +2136,7 @@ async function loadInsights(){
         </div>
         ${d.confidence !== 'insufficient' ? `
         <div style="font-family:var(--mono);font-size:10px;color:var(--tx3)">
-          Based on your pattern: predicted month-end total ~${predicted} days
+          Based on ${ownerLabel.toLowerCase()} pattern: predicted month-end total ~${Math.round(projected)} days
         </div>` : ''}
       </div>` : `
       <div style="font-family:var(--mono);font-size:11px;color:var(--green)">
@@ -2117,15 +2144,16 @@ async function loadInsights(){
       </div>`}
     </div>`;
 
-  // Day-of-week pattern card
+  // ── WFO Pattern card — uses stable rates ─────────────────────────────
   const dowNames = ['Mon','Tue','Wed','Thu','Fri'];
-  const dowBars = Object.entries(d.dow_rates || {}).map(([dow, rate]) => {
-    const h = Math.round(rate * 48);
+  const stableRates = d.dow_rates_stable || d.dow_rates || {};
+  const dowBars = Object.entries(stableRates).map(([dow, rate]) => {
+    const h = Math.max(3, Math.round(rate * 48));
     const c = rate >= 0.65 ? 'var(--green)' : rate >= 0.35 ? 'var(--amber)' : 'var(--red)';
     return `<div style="display:flex;flex-direction:column;align-items:center;gap:4px;flex:1">
       <div style="font-family:var(--mono);font-size:9px;color:var(--tx3)">${Math.round(rate*100)}%</div>
       <div style="width:100%;height:48px;display:flex;align-items:flex-end">
-        <div style="width:100%;height:${h}px;background:${c};border-radius:3px 3px 0 0;min-height:3px"></div>
+        <div style="width:100%;height:${h}px;background:${c};border-radius:3px 3px 0 0"></div>
       </div>
       <div style="font-family:var(--mono);font-size:9px;color:var(--tx2)">${dowNames[dow]}</div>
     </div>`;
@@ -2133,53 +2161,17 @@ async function loadInsights(){
 
   const patternCard = `
     <div class="card">
-      <div class="card-title">Your WFO Pattern <span class="card-sub">Day-of-week probability</span></div>
+      <div class="card-title">${ownerLabel} WFO Pattern <span class="card-sub">Day-of-week baseline</span></div>
       <div style="display:flex;gap:8px;align-items:flex-end;height:80px">${dowBars}</div>
       <div style="font-family:var(--mono);font-size:10px;color:var(--tx3);margin-top:8px">
         Based on ${d.active_weeks} week${d.active_weeks!==1?'s':''} of data — ${d.confidence_label}
       </div>
-    </div>`;
-
-  // 14-day forecast card
-  const forecastRows = (d.forecast || []).map(f => {
-    const isWeekend = false; // server already excludes weekends
-    let statusHtml = '';
-    if(f.certain && f.status === 'leave'){
-      statusHtml = `<span class="chip c-leave" style="font-size:10px">${svgI('calendar-x',10)} ${f.leave_type?.replace(/_/g,' ')||'Leave'}</span>`;
-    } else if(f.certain && f.status === 'public_holiday'){
-      statusHtml = `<span class="chip c-leave" style="font-size:10px">${svgI('sparkles',10)} Holiday</span>`;
-    } else if(f.certain && f.status === 'wfo'){
-      statusHtml = `<span class="chip c-wfo" style="font-size:10px">${svgI('building',10)} WFO</span>`;
-    } else if(f.certain && f.status === 'wfh'){
-      statusHtml = `<span class="chip c-wfh" style="font-size:10px">${svgI('home',10)} WFH</span>`;
-    } else {
-      const prob = Math.round(f.probability * 100);
-      const c = prob >= 60 ? 'var(--green)' : prob >= 35 ? 'var(--amber)' : 'var(--blue)';
-      const label = prob >= 60 ? 'Likely WFO' : prob >= 35 ? 'Uncertain' : 'Likely WFH';
-      const band = f.prob_low !== undefined ? ` (${Math.round(f.prob_low*100)}-${Math.round(f.prob_high*100)}%)` : '';
-      statusHtml = `<span style="font-family:var(--mono);font-size:10px;color:${c}">${label} — ${prob}%${band}</span>`;
-    }
-    const isToday = f.date === TODAY;
-    return `<tr style="${isToday?'background:rgba(193,123,63,0.06)':''}">
-      <td style="font-family:var(--mono);font-size:10px;color:${isToday?'var(--acc)':'var(--tx3)'}">${f.date}</td>
-      <td style="font-family:var(--mono);font-size:10px;color:var(--tx2)">${f.dow_name}</td>
-      <td>${statusHtml}</td>
-    </tr>`;
-  }).join('');
-
-  const forecastCard = `
-    <div class="card">
-      <div class="card-title">14-Day Forecast <span class="card-sub">Next 2 working weeks</span></div>
-      <div class="tbl-wrap"><table>
-        <thead><tr><th>Date</th><th>Day</th><th>Prediction</th></tr></thead>
-        <tbody>${forecastRows}</tbody>
-      </table></div>
-      <div style="font-family:var(--mono);font-size:10px;color:var(--tx3);margin-top:8px">
-        Predictions use your historical pattern + day-to-day transitions. Leave and holidays are certain.
+      <div style="font-family:var(--mono);font-size:10px;color:var(--tx3);margin-top:4px;border-top:1px solid var(--b0);padding-top:6px">
+        Stable 12-week average. Single deviations do not change this view.
       </div>
     </div>`;
 
-  // Self-compliance card — employee sees their own RAG status
+  // ── Compliance status card ────────────────────────────────────────────
   const myComp = (compData?.team||[]).find(r=>r.employee_id===empId);
   let compCard = '';
   if(myComp){
@@ -2194,7 +2186,7 @@ async function loadInsights(){
     const realPassed=realWeeks.filter(w=>w.passed).length;
     compCard = `
       <div class="card">
-        <div class="card-title">My Compliance Status <span class="card-sub">${TODAY.slice(0,7)}</span></div>
+        <div class="card-title">${ownerLabel} Compliance Status <span class="card-sub">${TODAY.slice(0,7)}</span></div>
         <div style="display:flex;align-items:center;gap:14px;padding:10px 0">
           <div style="width:14px;height:14px;border-radius:50%;background:${ragCol};flex-shrink:0"></div>
           <div>
@@ -2224,11 +2216,180 @@ async function loadInsights(){
       </div>`;
   }
 
+  // ── Compliance Outlook card (replaces 14-day table) ───────────────────
+  const compWeeks = d.compliance_weeks || [];
+  const wfhBudget = d.wfh_budget ?? null;
+  let outlookCard = '';
+
+  if(compWeeks.length === 0 && m.needed === 0){
+    outlookCard = `
+      <div class="card">
+        <div class="card-title">Compliance Outlook <span class="card-sub">${m.month}</span></div>
+        <div style="font-family:var(--mono);font-size:11px;color:var(--green);padding:8px 0">
+          Monthly target already met — no further action needed.
+        </div>
+      </div>`;
+  } else if(compWeeks.length === 0){
+    outlookCard = `
+      <div class="card">
+        <div class="card-title">Compliance Outlook <span class="card-sub">${m.month}</span></div>
+        <div style="font-family:var(--mono);font-size:11px;color:var(--tx3);padding:8px 0">
+          No remaining working days this month.
+        </div>
+      </div>`;
+  } else {
+    // Budget summary line
+    const budgetColor = wfhBudget === 0 ? 'var(--red)' : wfhBudget <= 3 ? 'var(--amber)' : 'var(--green)';
+    const budgetHtml = wfhBudget !== null ? `
+      <div style="display:flex;align-items:center;justify-content:space-between;padding:10px 14px;
+                  background:var(--bg2);border:1px solid var(--b0);border-radius:8px;margin-bottom:14px">
+        <div>
+          <div style="font-family:var(--mono);font-size:11px;color:${budgetColor}">
+            ${wfhBudget === 0
+              ? 'No WFH days remaining — every working day must be WFO'
+              : `WFH budget: up to ${wfhBudget} day${wfhBudget!==1?'s':''} available this month`}
+          </div>
+          <div style="font-family:var(--mono);font-size:10px;color:var(--tx3);margin-top:2px">
+            Pattern suggests ~${Math.round(projected)} WFO days by month-end
+          </div>
+        </div>
+        <div style="font-family:var(--mono);font-size:10px;color:var(--tx3);text-align:right">
+          ${m.needed} needed<br>${m.remaining_days} days left
+        </div>
+      </div>` : '';
+
+    // Per-week rows
+    const weekRows = compWeeks.map(wk => {
+      const projColor = wk.risk ? 'var(--red)' : wk.projected_wfo >= wk.week_target ? 'var(--green)' : 'var(--amber)';
+      const badge = wk.risk
+        ? `<span style="font-family:var(--mono);font-size:9px;padding:2px 7px;border-radius:10px;background:var(--rbg);color:var(--red)">Plan WFO day</span>`
+        : `<span style="font-family:var(--mono);font-size:9px;padding:2px 7px;border-radius:10px;background:var(--gbg);color:var(--green)">On track</span>`;
+
+      // Day mini-bars
+      const dayBars = wk.days.map(day => {
+        let barBg, barH, label;
+        if(day.is_leave){
+          barBg = 'var(--tx3)'; barH = 4; label = day.dow_name;
+        } else if(day.is_actual){
+          barBg = day.actual_status==='wfo' ? 'var(--green)' : 'var(--blue)';
+          barH = day.actual_status==='wfo' ? 28 : 12;
+          label = day.dow_name;
+        } else if(day.is_today){
+          barBg = 'var(--acc)';
+          barH = Math.max(4, Math.round(day.rate * 28));
+          label = day.dow_name;
+        } else {
+          const r = day.rate;
+          barBg = r >= 0.65 ? 'var(--green)' : r >= 0.35 ? 'var(--amber)' : 'var(--blue)';
+          barH = Math.max(4, Math.round(r * 28));
+          label = day.dow_name;
+        }
+        const pct = day.is_actual ? '' : day.is_leave ? '' : `${Math.round(day.rate*100)}%`;
+        return `<div style="display:flex;flex-direction:column;align-items:center;gap:3px;flex:1">
+          <div style="font-family:var(--mono);font-size:8px;color:var(--tx3)">${pct}</div>
+          <div style="width:100%;height:28px;display:flex;align-items:flex-end">
+            <div style="width:100%;height:${barH}px;background:${barBg};border-radius:2px 2px 0 0;
+                        ${day.is_today?'outline:1px solid var(--acc);outline-offset:1px':''}"></div>
+          </div>
+          <div style="font-family:var(--mono);font-size:8px;color:${day.is_today?'var(--acc)':'var(--tx3)'}">${label}</div>
+        </div>`;
+      }).join('');
+
+      // Week date range label
+      const [ws_mo, ws_d] = wk.week_start.slice(5).split('-').map(Number);
+      const [we_mo, we_d] = wk.week_end.slice(5).split('-').map(Number);
+      const months = ['','Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+      const weekLabel = ws_mo === we_mo
+        ? `${ws_d}–${we_d} ${months[ws_mo]}`
+        : `${ws_d} ${months[ws_mo]}–${we_d} ${months[we_mo]}`;
+
+      return `
+        <div style="background:var(--bg2);border:1px solid ${wk.risk?'rgba(248,113,113,0.2)':'var(--b0)'};
+                    border-radius:8px;padding:12px 14px;${wk.is_current_week?'border-color:rgba(193,123,63,0.3)':''}">
+          <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px">
+            <div style="display:flex;align-items:center;gap:8px">
+              <span style="font-family:var(--mono);font-size:11px;color:${wk.is_current_week?'var(--acc)':'var(--tx2)'}">
+                Week of ${weekLabel}
+              </span>
+              ${wk.leave_days>0?`<span style="font-family:var(--mono);font-size:9px;color:var(--tx3)">${wk.leave_days}d leave</span>`:''}
+            </div>
+            ${badge}
+          </div>
+          <div style="display:flex;gap:6px;align-items:flex-end;height:56px;margin-bottom:6px">${dayBars}</div>
+          <div style="display:flex;align-items:center;gap:10px">
+            <span style="font-family:var(--mono);font-size:10px;color:${projColor}">
+              Projected: ~${wk.projected_wfo} WFO
+            </span>
+            <span style="font-family:var(--mono);font-size:10px;color:var(--tx3)">
+              · Target: ${wk.week_target} WFO
+            </span>
+          </div>
+        </div>`;
+    }).join('');
+
+    outlookCard = `
+      <div class="card">
+        <div class="card-title">Compliance Outlook
+          <span class="card-sub">${m.month} — remaining weeks</span>
+        </div>
+        ${budgetHtml}
+        <div style="display:flex;flex-direction:column;gap:10px">${weekRows}</div>
+        <div style="font-family:var(--mono);font-size:10px;color:var(--tx3);margin-top:10px;padding-top:8px;border-top:1px solid var(--b0)">
+          Projections use ${ownerLabel.toLowerCase()} stable pattern. Bars show historical WFO rate per day.
+          ${svgI('building-2',9)} <span style="color:var(--green)">Actual WFO</span>
+          &nbsp; ${svgI('home',9)} <span style="color:var(--blue)">Actual WFH</span>
+          &nbsp; Filled = pattern probability.
+        </div>
+      </div>`;
+  }
+
   el.innerHTML = `
     <div class="two-col" style="margin-bottom:20px">${progressCard}${patternCard}</div>
     <div style="margin-bottom:20px">${compCard}</div>
-    <div>${forecastCard}</div>`;
+    <div>${outlookCard}</div>`;
   reIcons();
+}
+
+async function _initInsightsPicker(){
+  const picker = document.getElementById('insights-person-picker');
+  const sel    = document.getElementById('insights-emp-sel');
+  if(!picker || !sel) return;
+
+  const data = await get('/api/insights-members');
+  const members = data?.members || [];
+
+  if(members.length <= 1){
+    picker.style.display = 'none';
+    if(members.length === 1) INSIGHTS_EMP_ID = members[0].employee_id;
+    return;
+  }
+
+  picker.style.display = 'block';
+
+  // Rebuild only if membership changed or empty
+  const currentIds = [...sel.options].map(o=>o.value).join(',');
+  const newIds = members.map(m=>m.employee_id).join(',');
+  if(currentIds === newIds) return; // preserve current selection
+
+  sel.innerHTML = members.map(m => {
+    const label = m.employee_id === MY_ID
+      ? `${m.employee_name} (me)`
+      : `${m.employee_name}`;
+    const teamSuffix = m.team ? ` · ${m.team}` : '';
+    return `<option value="${m.employee_id}"${m.employee_id===INSIGHTS_EMP_ID?' selected':''}>${label}${teamSuffix}</option>`;
+  }).join('');
+
+  // Ensure INSIGHTS_EMP_ID is valid in current list; fall back to self
+  if(!members.find(m=>m.employee_id===INSIGHTS_EMP_ID)){
+    INSIGHTS_EMP_ID = MY_ID;
+    sel.value = MY_ID;
+  }
+}
+
+function onInsightsPersonChange(){
+  const sel = document.getElementById('insights-emp-sel');
+  if(sel) INSIGHTS_EMP_ID = sel.value;
+  loadInsights();
 }
 
 // ── TEAM RHYTHM ────────────────────────────────────────────────────────────
