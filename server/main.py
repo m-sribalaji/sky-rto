@@ -521,11 +521,42 @@ async def checkin(p: CheckInPayload, request: Request, db: AsyncSession = Depend
         logger.info(f"Weekend check-in skipped: {today} ({device.employee_id})")
         return {"action": "weekend_skip", "date": today}
     public_ip = get_client_ip(request)
-    result    = classify(public_ip=public_ip, lan_ip=p.lan_ip,
+
+    # ── Signal integrity check ────────────────────────────────────────────
+    # Client supplies lan_ip, dns, vpn from its own network interfaces.
+    # Cross-validate: if client claims office LAN IP but is connecting from
+    # outside the Sky VPN range, the signals are fabricated — flag and override.
+    # A real office machine connects from 10.x.x.x (Sky VPN/LAN).
+    # A home machine connecting via VPN has public_ip = home ISP IP (non-10.x).
+    claimed_lan    = p.lan_ip or ""
+    lan_is_office  = claimed_lan.startswith("10.126.") or claimed_lan.startswith("10.128.")
+    conn_is_sky    = public_ip.startswith("10.") or public_ip in ("127.0.0.1", "::1")
+    fabricated_sig = lan_is_office and not conn_is_sky
+
+    if fabricated_sig:
+        # Client claims office LAN but is connecting from outside Sky network.
+        # This means the pending_queue.json was edited with fake office signals.
+        # Override all client signals — classify as WFH with flag.
+        logger.warning(
+            f"[SECURITY] Signal fabrication detected: {device.employee_id} "
+            f"claims lan={claimed_lan} but connecting from {public_ip}. "
+            f"Overriding to WFH and flagging."
+        )
+        from detection import DetectionResult
+        result = DetectionResult(
+            auto_status="wfh", confidence="high",
+            vpn_active=False, flagged=True,
+            flag_reason=f"Signal fabrication: claimed office LAN {claimed_lan} "
+                        f"but connected from {public_ip}. Recorded as WFH.",
+            detail=f"Fabricated office signals detected from {public_ip}.",
+        )
+    else:
+        result = classify(public_ip=public_ip, lan_ip=p.lan_ip,
                          vpn_tunnel_ip=p.vpn_tunnel_ip, ssid=None,
                          is_ethernet=p.is_ethernet,
                          dns_servers=p.dns_servers, dns_domains=p.dns_domains)
-    logger.info(f"CheckIn: {device.employee_id} lan={p.lan_ip} dns={p.dns_servers} -> {result.auto_status}({result.confidence})")
+
+    logger.info(f"CheckIn: {device.employee_id} lan={p.lan_ip} conn={public_ip} -> {result.auto_status}({result.confidence}){' [FLAGGED]' if result.flagged else ''}")
     if result.auto_status == "vpn_ambiguous":
         return {"action": "confirm_needed", "lan_ip": p.lan_ip, "public_ip": public_ip, "detail": result.detail}
     seg_result = await handle_checkin(
