@@ -410,6 +410,27 @@ async def token_refresh(hostname: str, request: Request, db: AsyncSession = Depe
     return {"api_token": d.api_token, "employee_id": d.employee_id,
             "employee_name": d.employee_name}
 
+@app.post("/api/reg-nonce/{hostname}")
+async def create_reg_nonce(hostname: str, request: Request,
+                           db: AsyncSession = Depends(get_db)):
+    """
+    Agent calls this to get a one-time nonce before opening the registration URL.
+    Only callable from Sky VPN. Nonce expires in 5 minutes.
+    The register page requires this nonce in the ?nonce= query param —
+    prevents anyone from opening the registration URL directly.
+    """
+    import time as _tn
+    client_ip = get_client_ip(request)
+    if not (client_ip.startswith("10.") or client_ip in ("127.0.0.1","::1","172.17.0.1")):
+        raise HTTPException(403, "Only accessible on Sky network.")
+    existing = await db.get(Device, hostname)
+    if existing:
+        raise HTTPException(409, "Device already registered.")
+    nonce = secrets.token_urlsafe(24)
+    _reg_nonces[nonce] = {"hostname": hostname, "expires": _tn.time() + 300}
+    logger.info(f"Registration nonce created for {hostname}")
+    return {"nonce": nonce}
+
 # -- 2. ROLES ----------------------------------------------
 @app.get("/api/roles")
 async def get_roles(request: Request, db: AsyncSession = Depends(get_db)):
