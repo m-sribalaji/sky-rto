@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-rto_agent_win.py - RTO Attendance Agent(Windows)
+rto_agent_win.py - RTO Attendance Agent (Windows)
 
 Compiled into a standalone .exe by PyInstaller — no Python needed on
 the target machine.
@@ -59,6 +59,9 @@ if not getattr(sys, 'frozen', False):
 from checkin_core import (
     run_checkin,
     check_and_apply_update,
+    _sync_device_auth,
+    get_hostname,
+    server_reachable,
     run_reset,
     run_retry,
     load_config,
@@ -550,6 +553,16 @@ Examples:
         check_and_apply_update()
     except Exception as _ue:
         logger.debug(f"Update check skipped: {_ue}")
+
+    # Ensure device token is synced — runs independently of check-in skip logic
+    try:
+        cfg      = load_config()
+        hostname = get_hostname()
+        server   = cfg.get("server_url", "").rstrip("/")
+        if server and server_reachable(server):
+            _sync_device_auth(server, hostname, cfg)
+    except Exception as _te:
+        logger.debug(f"Token sync skipped: {_te}")
 
     # ── Single-instance guard (Windows Mutex) ────────────────────────────────
     # Prevents two agent processes running simultaneously.
