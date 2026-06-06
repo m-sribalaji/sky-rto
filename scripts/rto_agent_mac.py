@@ -462,13 +462,37 @@ Examples:
         logger.debug(f"Update check skipped: {_ue}")
 
     # Ensure device token is synced — runs independently of check-in skip logic.
-    # This means token-refresh works even on weekends / same-location days.
+    # Also creates a handoff token so opening the dashboard URL auto-logs in the browser.
     try:
         cfg      = load_config()
         hostname = get_hostname()
         server   = cfg.get("server_url", "").rstrip("/")
         if server and server_reachable(server):
             _sync_device_auth(server, hostname, cfg)
+            # Create auth handoff so dashboard URL auto-populates browser localStorage
+            cfg = load_config()  # reload after sync to get fresh token
+            token = cfg.get("device_token", "")
+            if token:
+                import urllib.request as _ur, json as _json
+                try:
+                    req = _ur.Request(
+                        f"{server}/api/auth-handoff",
+                        data=b"{}",
+                        headers={
+                            "Content-Type": "application/json",
+                            "X-Device-Token": token,
+                        },
+                        method="POST",
+                    )
+                    with _ur.urlopen(req, timeout=5) as r:
+                        hd = _json.loads(r.read())
+                    handoff = hd.get("handoff", "")
+                    if handoff:
+                        cfg["_dashboard_url"] = f"{server}/?auth={handoff}"
+                        save_config(cfg)
+                        logger.info("[OK] Dashboard auth handoff created")
+                except Exception as _he:
+                    logger.debug(f"Handoff creation skipped: {_he}")
     except Exception as _te:
         logger.debug(f"Token sync skipped: {_te}")
 

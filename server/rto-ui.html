@@ -759,40 +759,81 @@ function nav(id){
 
 // -- SIDEBAR USER --------------------------------------
 async function loadSidebarUser(){
+  // Check for auth handoff in URL — agent deposits this after syncing token.
+  // Consuming it auto-populates localStorage so browser is instantly logged in.
+  const urlParams = new URLSearchParams(window.location.search);
+  const handoff = urlParams.get('auth');
+  if(handoff){
+    try{
+      const hr = await fetch(`/api/auth-handoff/${handoff}`);
+      if(hr.ok){
+        const hd = await hr.json();
+        if(hd.api_token && hd.employee_id){
+          localStorage.setItem('_sk_dt', hd.api_token);
+          localStorage.setItem('_sk_ei', hd.employee_id);
+          localStorage.setItem('_sk_host', hd.hostname || '');
+          // Remove ?auth= from URL cleanly without reload
+          const clean = window.location.pathname;
+          window.history.replaceState({}, '', clean);
+        }
+      }
+    } catch(e){}
+  }
+
+  // Migrate old localStorage key names to new ones (one-time)
+  const oldEid   = localStorage.getItem('rto_my_employee_id');
+  const oldToken = localStorage.getItem('rto_device_token');
+  const oldHost  = localStorage.getItem('rto_hostname');
+  if(oldEid && !localStorage.getItem('_sk_ei')){
+    localStorage.setItem('_sk_ei', oldEid);
+    localStorage.removeItem('rto_my_employee_id');
+  }
+  if(oldToken && !localStorage.getItem('_sk_dt')){
+    localStorage.setItem('_sk_dt', oldToken);
+    localStorage.removeItem('rto_device_token');
+  }
+  if(oldHost && !localStorage.getItem('_sk_host')){
+    localStorage.setItem('_sk_host', oldHost);
+    localStorage.removeItem('rto_hostname');
+  }
   const stored = localStorage.getItem('_sk_ei');
-  const storedToken = localStorage.getItem('_sk_dt');
-  if(!stored || !storedToken){
-    showUnregisteredState();
-    return false;
+  let storedToken = localStorage.getItem('_sk_dt');
+
+  // No employee ID at all — show unregistered
+  if(!stored){ showUnregisteredState(); return false; }
+
+  // Have employee ID but no token — try token-refresh silently
+  // This handles existing users and users who cleared localStorage
+  if(stored && !storedToken){
+    try {
+      // Try stored hostname first, then look it up by employee ID
+      let h = localStorage.getItem('_sk_host') || '';
+      if(!h){
+        // Find hostname by querying device info for this employee
+        const devR = await fetch(`/api/device-by-employee/${stored}`).catch(()=>null);
+        if(devR && devR.ok){
+          const devD = await devR.json();
+          h = devD.hostname || '';
+          if(h) localStorage.setItem('_sk_host', h);
+        }
+      }
+      if(h){
+        const tr = await fetch(`/api/token-refresh/${h}`, {method:'POST'});
+        if(tr.ok){
+          const td = await tr.json();
+          if(td.api_token){
+            storedToken = td.api_token;
+            localStorage.setItem('_sk_dt', storedToken);
+          }
+        }
+      }
+    } catch(e){}
+    // Still no token after refresh attempt
+    if(!storedToken){ showUnregisteredState(); return false; }
   }
 
   MY_ID = stored;
   MY_TOKEN = storedToken;
-  // If we have employee ID but no token, try token-refresh before clearing state
-  // This handles existing users migrating to token auth
-  if (MY_ID && !MY_TOKEN) {
-    try {
-      const hostname = window.location.hostname === 'localhost' ? 'unknown' :
-        (await fetch('/api/me', {headers:{'X-Employee-Id':MY_ID}})
-          .then(r=>r.json()).then(d=>d.hostname||'').catch(()=>''));
-      const h = localStorage.getItem('_sk_host') || '';
-      if (h) {
-        const tr = await fetch(`/api/token-refresh/${h}`, {method:'POST'});
-        if (tr.ok) {
-          const td = await tr.json();
-          if (td.api_token) {
-            MY_TOKEN = td.api_token;
-            localStorage.setItem('_sk_dt', MY_TOKEN);
-          }
-        }
-      }
-    } catch(e) {}
-    // If still no token after refresh attempt, clear
-    if (!MY_TOKEN) {
-      MY_ID = '';
-      localStorage.removeItem('_sk_ei');
-    }
-  }
   const meResp = await fetch(`${API}/api/me`,{headers:{'X-Employee-Id':stored,'X-Device-Token':storedToken}});
   if(!meResp.ok){
     localStorage.removeItem('_sk_ei');

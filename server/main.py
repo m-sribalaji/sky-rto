@@ -300,6 +300,66 @@ async def get_device(hostname: str, db: AsyncSession = Depends(get_db)):
     return {"registered": True, "employee_name": d.employee_name,
             "employee_id": d.employee_id, "team": d.team, "role": role}
 
+@app.get("/api/device-by-employee/{employee_id}")
+async def get_device_by_employee(employee_id: str, db: AsyncSession = Depends(get_db)):
+    """Returns hostname for an employee ID — used by UI for token-refresh lookup.
+    Never returns api_token."""
+    q = await db.execute(select(Device).where(Device.employee_id == employee_id))
+    d = q.scalars().first()
+    if not d: return {"found": False}
+    return {"found": True, "hostname": d.hostname, "employee_name": d.employee_name}
+
+# One-time auth handoff tokens — agent deposits these, browser consumes them once
+_handoff_tokens: dict = {}  # token -> {employee_id, hostname, api_token, expires}
+
+@app.post("/api/auth-handoff")
+async def create_auth_handoff(request: Request, db: AsyncSession = Depends(get_db)):
+    """
+    Agent calls this after getting its device token.
+    Returns a one-time handoff token the agent embeds in the dashboard URL.
+    Browser reads it once, populates localStorage, token is then deleted.
+    Only callable from Sky VPN.
+    """
+    import time as _time
+    client_ip = get_client_ip(request)
+    if not (client_ip.startswith("10.") or client_ip in ("127.0.0.1","::1","172.17.0.1")):
+        raise HTTPException(403, "Only accessible on Sky network.")
+    token = get_device_token(request)
+    if not token:
+        raise HTTPException(401, "X-Device-Token required.")
+    # Verify token
+    q = await db.execute(select(Device).where(Device.api_token == token))
+    device = q.scalars().first()
+    if not device:
+        raise HTTPException(401, "Invalid token.")
+    # Generate one-time handoff token
+    handoff = secrets.token_urlsafe(16)
+    _handoff_tokens[handoff] = {
+        "employee_id": device.employee_id,
+        "hostname":    device.hostname,
+        "api_token":   device.api_token,
+        "expires":     _time.time() + 60,  # expires in 60 seconds
+    }
+    return {"handoff": handoff}
+
+@app.get("/api/auth-handoff/{token}")
+async def consume_auth_handoff(token: str):
+    """
+    Browser calls this once with the handoff token from the URL.
+    Returns credentials and immediately deletes the token.
+    """
+    import time as _time
+    data = _handoff_tokens.pop(token, None)
+    if not data:
+        raise HTTPException(404, "Invalid or expired handoff token.")
+    if _time.time() > data["expires"]:
+        raise HTTPException(410, "Handoff token expired.")
+    return {
+        "employee_id": data["employee_id"],
+        "hostname":    data["hostname"],
+        "api_token":   data["api_token"],
+    }
+
 @app.post("/api/token-refresh/{hostname}")
 async def token_refresh(hostname: str, request: Request, db: AsyncSession = Depends(get_db)):
     """
