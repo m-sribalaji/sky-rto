@@ -246,8 +246,21 @@ td.readonly{color:var(--tx3);cursor:not-allowed;}
 
 <script>
 // -- STATE -------------------------------------------------
-const MY_ID = localStorage.getItem('rto_my_employee_id') || '';
-const MY_TOKEN = localStorage.getItem('rto_device_token') || '';
+// Migrate old key names to new ones (one-time)
+(function(){
+  const oldEid = localStorage.getItem('rto_my_employee_id');
+  const oldTok = localStorage.getItem('rto_device_token');
+  if(oldEid && !localStorage.getItem('_sk_ei')){
+    localStorage.setItem('_sk_ei', oldEid);
+    localStorage.removeItem('rto_my_employee_id');
+  }
+  if(oldTok && !localStorage.getItem('_sk_dt')){
+    localStorage.setItem('_sk_dt', oldTok);
+    localStorage.removeItem('rto_device_token');
+  }
+})();
+const MY_ID    = localStorage.getItem('_sk_ei') || '';
+const MY_TOKEN = localStorage.getItem('_sk_dt') || '';
 let currentTable = null;
 let currentPage  = 0;
 let currentSearch = '';

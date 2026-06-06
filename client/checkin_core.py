@@ -525,6 +525,24 @@ def open_browser(url: str):
         try: webbrowser.open(url)
         except Exception: pass
 
+def _get_reg_url(server: str, hostname: str) -> str:
+    """
+    Get a nonce-protected registration URL.
+    Calls /api/reg-nonce/{hostname} to get a one-time nonce,
+    returns /register/{hostname}?nonce={nonce}.
+    Prevents direct URL access to the registration page.
+    Falls back to plain URL if nonce endpoint unavailable (old server).
+    """
+    try:
+        resp = api_post(f"{server}/api/reg-nonce/{hostname}", {})
+        if resp and resp.get("nonce"):
+            nonce_url = f"{server}/register/{hostname}?nonce={resp['nonce']}"
+            logger.info("[OK] Registration nonce obtained")
+            return nonce_url
+    except Exception as e:
+        logger.debug(f"Could not get reg nonce: {e}")
+    return f"{server}/register/{hostname}"
+
 def _desktop_notify(title: str, message: str):
     try:
         if IS_MAC:
@@ -979,7 +997,7 @@ def run_checkin(force: bool = False):
             hour_elapsed = (now_ts - float(last_reg_ts)) > 3600
 
             if hour_elapsed:
-                reg_url = f"{server}/register/{hostname}"
+                reg_url = _get_reg_url(server, hostname)
                 if NOTIFIER_AVAILABLE:
                     wh, lvl, _ = _get_notify_cfg(cfg)
                     notify_registration_needed(hostname, reg_url, webhook=wh, level=lvl)
@@ -1082,7 +1100,7 @@ def run_checkin(force: bool = False):
             open_browser(f"{server}/confirm/{hostname}")
 
         elif action == "register_first":
-            open_browser(f"{server}/register/{hostname}")
+            open_browser(_get_reg_url(server, hostname))
 
         elif action == "override_locked":
             locked_status = response.get("status", "unknown")

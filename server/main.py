@@ -84,6 +84,11 @@ from collections import defaultdict as _dd
 import time as _t
 _rl: dict = _dd(list)
 
+# Paths that should never be rate-limited (static files, health)
+_RL_EXEMPT = {"/health", "/api/version", "/", "/dashboard", "/admin"}
+# Path prefixes exempt from rate limiting
+_RL_EXEMPT_PREFIX = ("/static/",)
+
 @app.middleware("http")
 async def security_middleware(request: Request, call_next):
     # Block oversized requests
@@ -91,15 +96,39 @@ async def security_middleware(request: Request, call_next):
     if cl and int(cl) > 1_048_576:
         from fastapi.responses import JSONResponse
         return JSONResponse(status_code=413, content={"detail": "Request too large"})
-    # Rate limit per IP
-    ip  = request.client.host if request.client else "unknown"
-    now = _t.time()
-    _rl[ip] = [t for t in _rl[ip] if t > now - 60]
-    limit = 20 if request.method in ("POST","PUT","PATCH","DELETE") else 120
-    if len(_rl[ip]) >= limit:
-        from fastapi.responses import JSONResponse
-        return JSONResponse(status_code=429, content={"detail": "Too many requests."})
-    _rl[ip].append(now)
+
+    path = request.url.path
+
+    # Skip rate limiting for health/static/version endpoints
+    if path not in _RL_EXEMPT and not any(path.startswith(p) for p in _RL_EXEMPT_PREFIX):
+        ip  = request.client.host if request.client else "unknown"
+        now = _t.time()
+        # Rolling 60-second window
+        _rl[ip] = [t for t in _rl[ip] if t > now - 60]
+
+        # Limits based on real usage analysis for 200 employees:
+        # - Browser dashboard fires ~8 parallel requests per refresh
+        # - Refreshes every 60s = ~8 req/min steady state
+        # - Manual navigation / page loads add ~20 more
+        # - Agent: ~2 req/min (poll every 5min + health check)
+        # - Admin/manager: heavier usage, bulk compliance loads
+        # Limits are per-IP (per person), not global
+        if request.method in ("POST", "PUT", "PATCH", "DELETE"):
+            # Writes: agent polls ~2/min, browser actions ~5/min
+            # Set to 60/min — well above normal, blocks actual abuse (600+/min)
+            limit = 60
+        else:
+            # Reads: dashboard ~30/min active use, set to 300/min
+            # This allows burst of 8 parallel + normal navigation
+            limit = 300
+
+        if len(_rl[ip]) >= limit:
+            from fastapi.responses import JSONResponse
+            logger.warning(f"Rate limit hit: {ip} {request.method} {path} ({len(_rl[ip])}/min)")
+            return JSONResponse(status_code=429,
+                                content={"detail": "Too many requests. Please slow down."})
+        _rl[ip].append(now)
+
     resp = await call_next(request)
     resp.headers["X-Content-Type-Options"] = "nosniff"
     resp.headers["X-Frame-Options"] = "DENY"
@@ -311,6 +340,7 @@ async def get_device_by_employee(employee_id: str, db: AsyncSession = Depends(ge
 
 # One-time auth handoff tokens — agent deposits these, browser consumes them once
 _handoff_tokens: dict = {}  # token -> {employee_id, hostname, api_token, expires}
+_reg_nonces: dict     = {}  # nonce -> {hostname, expires} — one-time registration tokens
 
 @app.post("/api/auth-handoff")
 async def create_auth_handoff(request: Request, db: AsyncSession = Depends(get_db)):
@@ -1663,16 +1693,10 @@ async def get_team_rhythm(team: str, request: Request = None,
     Accessible by all team members, managers, and admins.
     Employees can only query their own team.
     """
-    await require_registered_caller(request, db)
-    caller_id = get_caller_id(request) if request else None
-    if caller_id:
-        dq = await db.execute(select(Device).where(Device.employee_id == caller_id))
-        caller_dev = dq.scalars().first()
-        caller_role = await get_role(caller_id, db) if caller_id else "employee"
-        if caller_role == "employee":
-            # Employee can only see their own team
-            if caller_dev and caller_dev.team != team:
-                raise HTTPException(403, "Employees can only view their own team rhythm")
+    caller_device, caller_role = await get_caller_context(request, db)
+    if caller_role == "employee":
+        if caller_device and caller_device.team != team:
+            raise HTTPException(403, "Employees can only view their own team rhythm")
 
     # Get all team members
     dq = await db.execute(select(Device).where(Device.team == team).order_by(Device.employee_name))
@@ -1776,7 +1800,26 @@ async def delete_team(team_id: int, request: Request,
 
 # -- 11. HTML PAGES ----------------------------------------
 @app.get("/register/{hostname}", response_class=HTMLResponse)
-async def register_page(hostname: str, request: Request):
+async def register_page(hostname: str, request: Request,
+                        db: AsyncSession = Depends(get_db)):
+    import time as _tr
+    _deny = lambda msg: HTMLResponse(f"<html><body style='background:#111;color:#f87171;font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0'><div style='text-align:center'><h2>Access Denied</h2><p>{msg}</p></div></body></html>", status_code=403)
+    # VPN only
+    client_ip = get_client_ip(request)
+    if not (client_ip.startswith("10.") or client_ip in ("127.0.0.1","::1","172.17.0.1")):
+        return _deny("Registration is only available on the Sky network.")
+    # Already registered
+    existing = await db.get(Device, hostname)
+    if existing:
+        return HTMLResponse(f"<html><body style='background:#111;color:#4ade80;font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0'><div style='text-align:center'><h2>Already Registered</h2><p>This device is registered as <strong>{existing.employee_name}</strong>.</p></div></body></html>", status_code=200)
+    # Require valid nonce — prevents direct URL access without agent
+    nonce = request.query_params.get("nonce", "")
+    if not nonce:
+        return _deny("Registration must be initiated from the RTO agent on your device.")
+    nonce_data = _reg_nonces.get(nonce)
+    if not nonce_data or nonce_data["hostname"] != hostname or _tr.time() > nonce_data["expires"]:
+        _reg_nonces.pop(nonce, None)
+        return _deny("Registration link has expired or is invalid. Run the agent again to get a new link.")
     tmpl = templates.get_template("register.html")
     html = tmpl.render(request=request, hostname=hostname)
     return HTMLResponse(html)
@@ -1785,6 +1828,9 @@ async def register_page(hostname: str, request: Request):
 @app.get("/confirm/{hostname}", response_class=HTMLResponse)
 async def vpn_confirm_page(hostname: str, request: Request,
                             db: AsyncSession = Depends(get_db)):
+    client_ip = get_client_ip(request)
+    if not (client_ip.startswith("10.") or client_ip in ("127.0.0.1","::1","172.17.0.1")):
+        return HTMLResponse("<html><body style='background:#111;color:#f87171;font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0'><div style='text-align:center'><h2>Access Restricted</h2><p>Only accessible on the Sky network.</p></div></body></html>", status_code=403)
     device  = await db.get(Device, hostname)
     name    = device.employee_name if device else hostname
     today   = today_str()
@@ -1807,6 +1853,9 @@ async def missed_day_page(hostname: str, request: Request,
     or a single date via ?dates=2026-05-19 (backwards compat).
     Also accepts legacy /missed/{hostname}/{date} format via redirect.
     """
+    client_ip = get_client_ip(request)
+    if not (client_ip.startswith("10.") or client_ip in ("127.0.0.1","::1","172.17.0.1")):
+        return HTMLResponse("<html><body style='background:#111;color:#f87171;font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0'><div style='text-align:center'><h2>Access Restricted</h2><p>Only accessible on the Sky network.</p></div></body></html>", status_code=403)
     device = await db.get(Device, hostname)
     if not device: raise HTTPException(404, "Not registered")
 
@@ -1861,6 +1910,9 @@ async def missed_day_page(hostname: str, request: Request,
 async def missed_day_page_legacy(hostname: str, missed_date: str,
                                   request: Request):
     """Legacy single-date URL - redirects to bulk page."""
+    client_ip = get_client_ip(request)
+    if not (client_ip.startswith("10.") or client_ip in ("127.0.0.1","::1","172.17.0.1")):
+        return HTMLResponse("<html><body style='background:#111;color:#f87171;font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0'><div style='text-align:center'><h2>Access Restricted</h2><p>Only accessible on the Sky network.</p></div></body></html>", status_code=403)
     from fastapi.responses import RedirectResponse
     cached = request.query_params.get("cached", "false")
     lan    = request.query_params.get("lan", "")
