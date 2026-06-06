@@ -554,18 +554,20 @@ Examples:
     except Exception as _ue:
         logger.debug(f"Update check skipped: {_ue}")
 
-    # Ensure device token is synced — runs independently of check-in skip logic
-    # Also creates a handoff token so opening the dashboard URL auto-logs in the browser.
+    # Sync device token and open dashboard with auth handoff.
+    # - Token sync runs on every startup, independent of check-in logic
+    # - Browser is opened automatically ONLY when token was just freshly obtained
     try:
+        import urllib.request as _ur, json as _json, webbrowser as _wb
         cfg      = load_config()
         hostname = get_hostname()
         server   = cfg.get("server_url", "").rstrip("/")
         if server and server_reachable(server):
+            had_token = bool(cfg.get("device_token"))
             _sync_device_auth(server, hostname, cfg)
-            cfg = load_config()
+            cfg   = load_config()
             token = cfg.get("device_token", "")
             if token:
-                import urllib.request as _ur, json as _json
                 try:
                     req = _ur.Request(
                         f"{server}/api/auth-handoff",
@@ -580,9 +582,13 @@ Examples:
                         hd = _json.loads(r.read())
                     handoff = hd.get("handoff", "")
                     if handoff:
-                        cfg["_dashboard_url"] = f"{server}/?auth={handoff}"
+                        dashboard_url = f"{server}/?auth={handoff}"
+                        cfg["_dashboard_url"] = dashboard_url
                         save_config(cfg)
                         logger.info("[OK] Dashboard auth handoff created")
+                        if not had_token:
+                            _wb.open(dashboard_url)
+                            logger.info("[OK] Dashboard opened for first-time auth setup")
                 except Exception as _he:
                     logger.debug(f"Handoff creation skipped: {_he}")
     except Exception as _te:
