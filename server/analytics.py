@@ -329,11 +329,13 @@ def compute_dow_rates_stable(
     """
     Compute a STABLE WFO probability for each weekday — display only, not prediction.
 
-    Key differences from compute_dow_rates:
-    - Always uses EWMA_ALPHA_STABLE (0.15) regardless of tenure or variance.
-    - Caps to the most recent 12 weeks of data.
-    - A single deviation (e.g. one unexpected WFH Monday) barely moves the bar.
-    - Used for the WFO Pattern chart so percentages don't swing week to week.
+    Key difference from compute_dow_rates:
+    - Caps to the most recent 12 weeks of data (ancient patterns don't bleed in).
+    - Uses the same adaptive alpha logic as compute_dow_rates, so new employees
+      still get accurate rates (not stuck near the 0.40 neutral prior).
+    - The 12-week window is the actual stability mechanism — not a slow fixed alpha.
+    - Single off-day deviations still cause some movement, but historical anchor
+      from 12 weeks of data dampens wild swings.
     """
     today_ref = date.today()
     cutoff_12w = (today_ref - timedelta(weeks=12)).isoformat()
@@ -351,19 +353,31 @@ def compute_dow_rates_stable(
     for dow in dow_obs_dates:
         dow_obs_dates[dow].sort(key=lambda x: x[0])  # oldest first
 
+    # Count active weeks in the 12-week window (for adaptive alpha)
+    active_week_keys: set[str] = set()
+    for ds, st in att.items():
+        if ds < cutoff_12w or st in ("leave", "public_holiday"):
+            continue
+        d = date.fromisoformat(ds)
+        active_week_keys.add(f"{d.isocalendar()[0]}-W{d.isocalendar()[1]:02d}")
+    n_weeks_stable = len(active_week_keys)
+
     dow_rates: dict[int, float] = {}
     for dow in range(5):
         obs = dow_obs_dates.get(dow, [])
         if not obs:
             dow_rates[dow] = 0.40
             continue
+        # Use same adaptive alpha as compute_dow_rates so bars reflect real patterns.
+        # Convert to (int, bool) format expected by _adaptive_alpha.
+        obs_for_alpha = [(i, v) for i, (_, v) in enumerate(obs)]
+        alpha = _adaptive_alpha(obs_for_alpha, n_weeks_stable)
         ewma_val = 0.40  # neutral prior
         for ds_str, was_wfo in obs:
             obs_date = date.fromisoformat(ds_str)
             obs_week_start = obs_date - timedelta(days=obs_date.weekday())
             weeks_ago = max(0, (current_week_start - obs_week_start).days // 7)
-            # Fixed slow alpha — never adapts quickly
-            w = EWMA_ALPHA_STABLE * ((1 - EWMA_ALPHA_STABLE) ** weeks_ago)
+            w = alpha * ((1 - alpha) ** weeks_ago)
             v = 1.0 if was_wfo else 0.0
             ewma_val = (1 - w) * ewma_val + w * v
         dow_rates[dow] = round(max(0.05, min(0.95, ewma_val)), 3)

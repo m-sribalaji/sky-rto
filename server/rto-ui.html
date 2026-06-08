@@ -902,7 +902,10 @@ async function loadDashboard(){
     if(filterBar) filterBar.style.display='none';
     if(searchWrap) searchWrap.style.display='none';
   }
-  const tp = DASH_TEAM_FILTER ? `?team=${encodeURIComponent(DASH_TEAM_FILTER)}` : '';
+  // Employees always scope to their own team; managers use DASH_TEAM_FILTER (or no filter = all managed)
+  const tp = MY_ROLE === 'employee' && MY_TEAM
+    ? `?team=${encodeURIComponent(MY_TEAM)}`
+    : DASH_TEAM_FILTER ? `?team=${encodeURIComponent(DASH_TEAM_FILTER)}` : '';
   const[stats,today,week]=await Promise.all([
     get('/api/stats'+tp),
     get('/api/today'+tp),
