@@ -963,11 +963,11 @@ async def get_today(team: str=None, request: Request=None,
     managed = await get_managed_teams(caller_id, db) if caller_id else None
     result = []
     for r in q.scalars().all():
-        if caller_role == "employee" and r.employee_id != caller_device.employee_id:
-            continue
-        s = await get_day_summary(r.employee_id, r.date, db)
         dq = await db.execute(select(Device).where(Device.employee_id==r.employee_id))
         dev = dq.scalars().first()
+        if caller_role == "employee" and (not dev or dev.team != caller_device.team):
+            continue
+        s = await get_day_summary(r.employee_id, r.date, db)
         if team and (not dev or dev.team != team): continue
         if managed is not None and dev and dev.team not in managed: continue
         # Check public holiday once per loop (cached after first call)
@@ -1080,7 +1080,7 @@ async def get_stats(team: str=None, request: Request=None,
     for r in records:
         dq2 = await db.execute(select(Device).where(Device.employee_id==r.employee_id))
         dev2 = dq2.scalars().first()
-        if caller_role == "employee" and r.employee_id != caller_device.employee_id: continue
+        if caller_role == "employee" and (not dev2 or dev2.team != caller_device.team): continue
         if team and (not dev2 or dev2.team != team): continue
         if managed is not None and dev2 and dev2.team not in managed: continue
         total_filtered += 1
@@ -1117,7 +1117,7 @@ async def get_week(team: str=None, request: Request=None,
         for r in recs:
             dq3 = await db.execute(select(Device).where(Device.employee_id==r.employee_id))
             dev3 = dq3.scalars().first()
-            if caller_role == "employee" and r.employee_id != caller_device.employee_id: continue
+            if caller_role == "employee" and (not dev3 or dev3.team != caller_device.team): continue
             if team and (not dev3 or dev3.team != team): continue
             if managed_w is not None and dev3 and dev3.team not in managed_w: continue
             s = await get_day_summary(r.employee_id, d, db)
