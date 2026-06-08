@@ -610,11 +610,19 @@ function renderSplitLabel(label){
   }).join('');
   return `<span class="split-pill">${html}</span>`;
 }
+// Strip timestamps from a raw split_label string when the setting/role says not to show them.
+// Used for title attributes and any path that doesn't go through renderSplitLabel().
+function splitLabelForDisplay(label){
+  if(!label) return '';
+  if(APP_SETTINGS.show_split_timestamps && (MY_ROLE==='manager'||MY_ROLE==='admin')) return label;
+  // Remove " HH:MM" tokens — e.g. "WFH 07:21 → WFO 08:57" → "WFH → WFO"
+  return label.replace(/\s+\d{2}:\d{2}/g, '');
+}
 function fmt(d){if(!d)return'-';return new Date(d).toLocaleTimeString('en-IN',{hour:'2-digit',minute:'2-digit',hour12:false,timeZone:'Asia/Kolkata'});}
 function colorFor(id){const C=['#7c3aed','#2563eb','#059669','#d97706','#dc2626','#0891b2','#db2777'];let h=0;for(const c of(id||''))h=(h*31+c.charCodeAt(0))%C.length;return C[h];}
 function iniOf(n){return(n||'?').split(' ').map(w=>w[0]).join('').slice(0,2).toUpperCase();}
 function chipS(s,sl){
-  if(s==='split'){const splitCls=sl&&sl.includes('WFO')?'c-split c-split-wfo':'c-split';return`<span class="chip ${splitCls}" title="${sl||''}">${svgI('split',11)} Split</span>`;}
+  if(s==='split'){const splitCls=sl&&sl.includes('WFO')?'c-split c-split-wfo':'c-split';return`<span class="chip ${splitCls}" title="${splitLabelForDisplay(sl)||''}">${svgI('split',11)} Split</span>`;}
   if(s==='wfo')return`<span class="chip c-wfo">${svgI('building')} WFO</span>`;
   if(s==='wfh')return`<span class="chip c-wfh">${svgI('home')} WFH</span>`;
   if(s==='vpn_ambiguous')return`<span class="chip c-vpn">${svgI('shield-check')} VPN</span>`;
@@ -1391,7 +1399,7 @@ function renderCalendar(gridId,records,month,phDates=[]){
     const isPast=(yr<ty)||(yr===ty&&mo<tm)||(yr===ty&&mo===tm&&day<td);
     const cls=['cal-cell',s||(isPast?'empty':'future'),isToday?'today':''].filter(Boolean).join(' ');
     const noteStr=statusMap[ds+'_note']?` - ${statusMap[ds+'_note']}`:'';
-    const splitStr=statusMap[ds+'_split']?statusMap[ds+'_split']:'';
+    const splitStr=statusMap[ds+'_split'] ? splitLabelForDisplay(statusMap[ds+'_split']) : '';
     const tooltipLabel=s==='split'&&splitStr?` - ${splitStr}`:s?`: ${s.toUpperCase()}`:'';
     cells.push(`<div class="${cls}" title="${ds}${tooltipLabel}${noteStr}">${day}</div>`);
   }
