@@ -698,8 +698,10 @@ def _compliance_forecast_weeks(
             d_obj         = date.fromisoformat(ds)
             dow           = d_obj.weekday()
             is_leave      = att.get(ds) in ("leave", "public_holiday")
-            is_today      = ds == today.isoformat()
-            is_past_actual = ds < today.isoformat() and att.get(ds) in ("wfo", "wfh")
+            # Today counts as actual if a check-in was already recorded (wfo/wfh).
+            # Only use the in-progress "today" state when no check-in exists yet.
+            is_past_actual = ds <= today.isoformat() and att.get(ds) in ("wfo", "wfh")
+            is_today      = ds == today.isoformat() and att.get(ds) not in ("wfo", "wfh")
             actual_status  = att.get(ds) if ds <= today.isoformat() else None
 
             if is_leave:
