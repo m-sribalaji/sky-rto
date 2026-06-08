@@ -23,6 +23,26 @@ from segments import (dominant_status_from_segments, handle_checkin, get_day_sum
                       get_leave_meta, LEAVE_TYPES)
 from config import APP_TITLE, PORT
 
+# ── App-wide settings (persisted to /app/data/app_settings.json) ─────────────
+import pathlib as _pathlib, json as _sjson
+
+_SETTINGS_PATH = _pathlib.Path("/app/data/app_settings.json")
+_APP_SETTINGS_DEFAULTS: dict = {
+    "show_split_timestamps": True,   # show HH:MM in split-day labels for managers/admins
+}
+
+def _read_app_settings() -> dict:
+    try:
+        if _SETTINGS_PATH.exists():
+            return {**_APP_SETTINGS_DEFAULTS, **_sjson.loads(_SETTINGS_PATH.read_text())}
+    except Exception:
+        pass
+    return dict(_APP_SETTINGS_DEFAULTS)
+
+def _write_app_settings(data: dict) -> None:
+    _SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    _SETTINGS_PATH.write_text(_sjson.dumps(data, indent=2))
+
 # -- SERVER-SIDE NOTIFIER ----------------------------------
 # Set TEAMS_WEBHOOK env var on the server to enable push notifications
 # for leave, overrides, and other server-side events.
@@ -2245,6 +2265,24 @@ async def get_version():
         "win_url": f"https://github.com/m-sribalaji/sky-rto/releases/download/build-{build_num}/rto-win.exe",
     }
 
+
+@app.get("/api/settings")
+async def get_settings(request: Request, db: AsyncSession = Depends(get_db)):
+    """Return app-wide display settings — readable by any registered user."""
+    await require_registered_caller(request, db)
+    return _read_app_settings()
+
+@app.put("/api/settings")
+async def put_settings(request: Request, db: AsyncSession = Depends(get_db)):
+    """Persist app-wide display settings — admin only."""
+    await require_role(request, db, "admin")
+    body = await request.json()
+    current = _read_app_settings()
+    for key, default_val in _APP_SETTINGS_DEFAULTS.items():
+        if key in body:
+            current[key] = bool(body[key]) if isinstance(default_val, bool) else body[key]
+    _write_app_settings(current)
+    return current
 
 @app.get("/health")
 async def health():

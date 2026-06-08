@@ -61,6 +61,15 @@ tr:last-child td{border-bottom:none;}tbody tr{transition:background 0.1s;}tbody 
 .chip svg{width:10px;height:10px;stroke-width:2.2;}
 .c-wfo{background:var(--gbg);color:var(--green);}.c-wfh{background:var(--bbg);color:var(--blue);}.c-vpn{background:var(--abg);color:var(--amber);}.c-leave{background:var(--pbg);color:var(--purple);}.c-split{background:linear-gradient(105deg,rgba(96,165,250,0.12) 0%,rgba(74,222,128,0.14) 55%,rgba(74,222,128,0.09) 100%);color:var(--green);border:1px solid rgba(74,222,128,0.28);box-shadow:0 0 8px rgba(96,165,250,0.08);width:fit-content;}
 .c-split-wfo{background:linear-gradient(105deg,rgba(96,165,250,0.14) 0%,rgba(74,222,128,0.18) 55%,rgba(74,222,128,0.11) 100%);color:var(--green);border:1px solid rgba(74,222,128,0.35);box-shadow:0 0 10px rgba(96,165,250,0.1);}
+.setting-row{display:flex;align-items:center;justify-content:space-between;gap:16px;padding:12px 0;border-bottom:1px solid var(--b0);}
+.setting-row:last-child{border-bottom:none;padding-bottom:0;}
+.setting-row:first-child{padding-top:0;}
+.setting-label{font-size:12px;font-weight:500;margin-bottom:3px;}
+.setting-desc{font-family:var(--mono);font-size:10px;color:var(--tx3);line-height:1.5;}
+.toggle-pill{width:36px;height:20px;border-radius:10px;background:var(--bg3);border:1.5px solid var(--b1);cursor:pointer;position:relative;transition:background 0.2s,border-color 0.2s;flex-shrink:0;padding:0;}
+.toggle-pill::after{content:'';width:14px;height:14px;border-radius:50%;background:var(--tx3);position:absolute;top:2px;left:1px;transition:transform 0.2s,background 0.2s;box-shadow:0 1px 3px rgba(0,0,0,0.4);}
+.toggle-pill.on{background:rgba(193,123,63,0.25);border-color:var(--acc);}
+.toggle-pill.on::after{transform:translateX(15px);background:var(--acc);}
 .c-hi{background:var(--gbg);color:var(--green);}.c-md{background:var(--abg);color:var(--amber);}.c-lo{background:var(--rbg);color:var(--red);}
 .btn{display:inline-flex;align-items:center;justify-content:center;gap:6px;padding:7px 14px;border-radius:7px;font-size:12px;font-weight:500;cursor:pointer;border:none;transition:all 0.15s;font-family:var(--sans);}
 .btn svg{width:13px;height:13px;stroke-width:2;}
@@ -469,6 +478,20 @@ input::placeholder,textarea::placeholder{color:var(--tx3);}textarea{resize:verti
         </div>
         <div class="card"><div class="card-title">Server info</div><div id="server-info"><div class="loading"><div class="spinner"></div></div></div></div>
       </div>
+      <div class="card">
+        <div class="card-title">Display preferences
+          <span class="card-sub">Applies to all users</span>
+        </div>
+        <div class="setting-row">
+          <div>
+            <div class="setting-label">Split day timestamps</div>
+            <div class="setting-desc">Show transition times in split-day labels for managers and admins — e.g. WFH 09:23 → WFO 13:44. When off, all roles see labels only: WFH → WFO.</div>
+          </div>
+          <button class="toggle-pill" id="setting-show_split_timestamps"
+                  onclick="toggleAppSetting('show_split_timestamps')"
+                  title="Toggle split day timestamps"></button>
+        </div>
+      </div>
     </div>
 
 
@@ -504,6 +527,16 @@ let MY_ID='', MY_TOKEN='', MY_ROLE='employee', MY_NAME='', MY_TEAM='';
 let MY_MANAGED_TEAMS=null; // null=all, array=restricted teams
 let DASH_TEAM_FILTER='';   // currently selected team filter on dashboard
 let INSIGHTS_EMP_ID='';    // currently viewed employee on Insights page ('' = self)
+let APP_SETTINGS={ show_split_timestamps: true }; // server-persisted display prefs
+
+async function put(p,b){
+  try{
+    const r=await fetch(API+p,{method:'PUT',
+      headers:{'Content-Type':'application/json','X-Employee-Id':MY_ID||'','X-Device-Token':MY_TOKEN||''},
+      body:JSON.stringify(b)});
+    return{ok:r.ok,data:await r.json()};
+  }catch(e){return{ok:false,data:{}};}
+}
 
 // Returns team query param based on role and selected filter
 function getTeamParam(selectedTeam){
@@ -564,8 +597,8 @@ async function del(p,b={}){
 function renderSplitLabel(label){
   if(!label) return '';
   const parts = label.split(' → ');
-  // Employees: show status labels only, no transition timestamps
-  const showTime = (MY_ROLE==='manager'||MY_ROLE==='admin');
+  // Timestamps shown only when the admin setting is enabled AND viewer is manager/admin
+  const showTime = APP_SETTINGS.show_split_timestamps && (MY_ROLE==='manager'||MY_ROLE==='admin');
   const html = parts.map((part, i) => {
     const tokens = part.trim().split(' ');
     const status = tokens[0].toLowerCase();
@@ -1696,8 +1729,28 @@ async function loadConfig(){
   const dateEl=document.getElementById('ph-date');if(dateEl&&!dateEl.value)dateEl.value=TODAY;
   loadHolidays();
   const h=await get('/health');
-  document.getElementById('server-info').innerHTML=h?`<div style="display:flex;flex-direction:column;gap:8px"><div style="display:flex;justify-content:space-between;padding:10px 12px;background:var(--gbg);border-radius:7px"><span style="font-size:12px;color:var(--tx2)">Status</span><span style="font-family:var(--mono);font-size:11px;color:var(--green)";display:inline-flex;align-items:center;gap:5px"><span style="width:7px;height:7px;border-radius:50%;background:var(--green);display:inline-block"></span> Online</span></div><div style="display:flex;justify-content:space-between;padding:10px 12px;background:var(--bg2);border-radius:7px;border:1px solid var(--b0)"><span style="font-size:12px;color:var(--tx2)">Version</span><span style="font-family:var(--mono);font-size:11px;color:var(--accl)">${h.version||'2.0'}</span></div><div style="display:flex;justify-content:space-between;padding:10px 12px;background:var(--bg2);border-radius:7px;border:1px solid var(--b0)"><span style="font-size:12px;color:var(--tx2)">Port</span><span style="font-family:var(--mono);font-size:11px;color:var(--accl)">${h.port||8989}</span></div><div style="display:flex;justify-content:space-between;padding:10px 12px;background:var(--bg2);border-radius:7px;border:1px solid var(--b0)"><span style="font-size:12px;color:var(--tx2)">Timezone</span><span style="font-family:var(--mono);font-size:11px;color:var(--accl)">Asia/Kolkata (IST)</span></div></div>`:notice('err','Server unreachable');
+  document.getElementById('server-info').innerHTML=h?`<div style="display:flex;flex-direction:column;gap:8px"><div style="display:flex;justify-content:space-between;padding:10px 12px;background:var(--gbg);border-radius:7px"><span style="font-size:12px;color:var(--tx2)">Status</span><span style="font-family:var(--mono);font-size:11px;color:var(--green)";display:inline-flex;align-items:center;gap:5px><span style="width:7px;height:7px;border-radius:50%;background:var(--green);display:inline-block"></span> Online</span></div><div style="display:flex;justify-content:space-between;padding:10px 12px;background:var(--bg2);border-radius:7px;border:1px solid var(--b0)"><span style="font-size:12px;color:var(--tx2)">Version</span><span style="font-family:var(--mono);font-size:11px;color:var(--accl)">${h.version||'2.0'}</span></div><div style="display:flex;justify-content:space-between;padding:10px 12px;background:var(--bg2);border-radius:7px;border:1px solid var(--b0)"><span style="font-size:12px;color:var(--tx2)">Port</span><span style="font-family:var(--mono);font-size:11px;color:var(--accl)">${h.port||8989}</span></div><div style="display:flex;justify-content:space-between;padding:10px 12px;background:var(--bg2);border-radius:7px;border:1px solid var(--b0)"><span style="font-size:12px;color:var(--tx2)">Timezone</span><span style="font-family:var(--mono);font-size:11px;color:var(--accl)">Asia/Kolkata (IST)</span></div></div>`:notice('err','Server unreachable');
+  // Sync display-preference toggles to current server settings
+  const s = await get('/api/settings');
+  if(s){ APP_SETTINGS = { ...APP_SETTINGS, ...s }; }
+  _syncSettingToggles();
   reIcons();
+}
+function _syncSettingToggles(){
+  for(const key of Object.keys(APP_SETTINGS)){
+    const btn = document.getElementById(`setting-${key}`);
+    if(btn) btn.className = `toggle-pill${APP_SETTINGS[key] ? ' on' : ''}`;
+  }
+}
+async function toggleAppSetting(key){
+  const prev = APP_SETTINGS[key];
+  APP_SETTINGS[key] = !prev;
+  _syncSettingToggles();
+  const res = await put('/api/settings', APP_SETTINGS);
+  if(!res.ok){
+    APP_SETTINGS[key] = prev;
+    _syncSettingToggles();
+  }
 }
 async function loadHolidays(){
   const year=document.getElementById('ph-year')?.value||new Date().getFullYear();
@@ -1797,6 +1850,11 @@ async function initApp(){
     console.error('Sidebar load failed:', e);
     showUnregisteredState('Unable to verify this browser identity.');
   }
+  // Fetch server-side display settings (affects all roles)
+  try {
+    const s = await get('/api/settings');
+    if(s) APP_SETTINGS = { ...APP_SETTINGS, ...s };
+  } catch(e) {}
   try {
     if(ready) loadDashboard();
   } catch(e) {
