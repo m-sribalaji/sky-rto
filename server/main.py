@@ -47,7 +47,7 @@ def _write_app_settings(data: dict) -> None:
 # Set TEAMS_WEBHOOK env var on the server to enable push notifications
 # for leave, overrides, and other server-side events.
 _SERVER_WEBHOOK = os.environ.get("TEAMS_WEBHOOK") or None
-_SERVER_URL     = os.environ.get("SERVER_URL", "http://10.131.80.141:8989")
+_SERVER_URL     = os.environ.get("SERVER_URL", "http://10.132.176.3:9999")
 try:
     from notifier import (
         notify_leave_applied, notify_override_applied,
@@ -71,7 +71,7 @@ app = FastAPI(
 )
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://10.131.80.141:8989", "http://localhost:8989"],
+    allow_origins=["http://10.132.176.3:9999", "http://localhost:9999"],
     allow_methods=["GET","POST","PUT","PATCH","DELETE"],
     allow_headers=["Content-Type","X-Employee-Id","X-Device-Token","Authorization"],
     expose_headers=["X-Employee-Id"],

@@ -57,7 +57,7 @@ ISP_HOME_CIDRS      = [
 # -- APP ---------------------------------------------------
 APP_TITLE    = "RTO Tracker"
 APP_ORG      = "Sky"
-PORT         = 8989
+PORT         = 9999
 import os
 DATABASE_URL = os.environ.get(
     "DATABASE_URL", "sqlite+aiosqlite:////app/data/rto.db"

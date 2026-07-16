@@ -8,7 +8,7 @@ services:
     container_name: sky-rto-tracker
     restart: unless-stopped
     ports:
-      - "8989:8989"
+      - "9999:9999"
     volumes:
       - ./data:/app/data
     env_file:
@@ -18,7 +18,13 @@ services:
       - TZ=Asia/Kolkata
     healthcheck:
       test: ["CMD", "python3", "-c",
-             "import urllib.request; urllib.request.urlopen('http://localhost:8989/health')"]
+             "import urllib.request; urllib.request.urlopen('http://localhost:9999/health')"]
       interval: 30s
       timeout: 10s
       retries: 3
+    networks:
+      - sky-orion
+
+networks:
+  sky-orion:
+    external: true

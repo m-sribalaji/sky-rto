@@ -32,9 +32,9 @@ COPY sky-logo.pn[g] ./
 RUN mkdir -p /app/data /app/static
 RUN [ -f /app/sky-logo.png ] && mv /app/sky-logo.png /app/static/ || true
 
-EXPOSE 8989
+EXPOSE 9999
 
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-  CMD python3 -c "import urllib.request; urllib.request.urlopen('http://localhost:8989/health')"
+  CMD python3 -c "import urllib.request; urllib.request.urlopen('http://localhost:9999/health')"
 
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8989"]
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "9999"]

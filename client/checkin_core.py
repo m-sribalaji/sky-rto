@@ -107,7 +107,7 @@ def load_config() -> dict:
             data = json.loads(raw.decode('utf-8'))
             merged = {**DEFAULT_CONFIG, **data}
             # Always ensure baked URL is used if config has the placeholder
-            if not merged.get("server_url") or merged["server_url"] == "http://YOUR_SERVER_IP:8989":
+            if not merged.get("server_url") or merged["server_url"] == "http://YOUR_SERVER_IP:9999":
                 merged["server_url"] = _BAKED_SERVER_URL
             return merged
         except Exception:
