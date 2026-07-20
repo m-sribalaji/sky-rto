@@ -9,6 +9,10 @@ from fastapi.templating import Jinja2Templates
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
+from slowapi.middleware import SlowAPIMiddleware
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, and_, desc, func
 from pydantic import BaseModel
@@ -69,6 +73,30 @@ app = FastAPI(
     title=APP_TITLE, version="2.0.0",
     docs_url=None, redoc_url=None, openapi_url=None,
 )
+
+# ── Rate limiting ──────────────────────────────────────────────────────────
+# Protects credential-issuance and self-declared-attendance endpoints from
+# enumeration/abuse. Keyed by source IP (get_remote_address), which is
+# appropriate here since the whole trust model already leans on IP origin
+# (Sky VPN range) for these same endpoints.
+# ── Rate limiting ──────────────────────────────────────────────────────────
+# Protects credential-issuance and self-declared-attendance endpoints from
+# enumeration/abuse. Keyed by the SAME client-IP resolution the rest of the
+# app already uses (get_client_ip, defined below — respects X-Forwarded-For)
+# rather than slowapi's default get_remote_address, which only reads
+# request.client.host and would disagree with the app's own IP-range checks
+# if this ever sits behind a reverse proxy.
+def _limiter_key(request: Request) -> str:
+    xff = request.headers.get("X-Forwarded-For")
+    if xff:
+        return xff.split(",")[0].strip()
+    return request.client.host if request.client else "unknown"
+
+limiter = Limiter(key_func=_limiter_key, key_style="endpoint")
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+app.add_middleware(SlowAPIMiddleware)
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://10.132.176.3:9999", "http://localhost:9999"],
@@ -361,6 +389,7 @@ async def get_device_by_employee(employee_id: str, db: AsyncSession = Depends(ge
 # One-time auth handoff tokens — agent deposits these, browser consumes them once
 _handoff_tokens: dict = {}  # token -> {employee_id, hostname, api_token, expires}
 _reg_nonces: dict     = {}  # nonce -> {hostname, expires} — one-time registration tokens
+_token_refresh_log: dict = {}  # source_ip -> [(hostname, timestamp)] — enumeration detection
 
 @app.post("/api/auth-handoff")
 async def create_auth_handoff(request: Request, db: AsyncSession = Depends(get_db)):
@@ -411,22 +440,76 @@ async def consume_auth_handoff(token: str):
     }
 
 @app.post("/api/token-refresh/{hostname}")
+@limiter.limit("5/minute")
 async def token_refresh(hostname: str, request: Request, db: AsyncSession = Depends(get_db)):
     """
     Issues a token for existing registered devices that predate token auth.
-    Security: only callable from Sky VPN (10.x.x.x).
-    Safe to call repeatedly — returns same token each time.
+    Security:
+      - Only callable from Sky VPN (10.x.x.x) — network-level trust boundary,
+        same as before.
+      - Rate-limited to 5/minute per source IP (slowapi) — blocks brute-force
+        hostname enumeration from a single caller.
+      - Only issues a NEW token when one doesn't already exist (legacy
+        bootstrap case). If a token already exists for this hostname, the
+        caller must already present it via X-Device-Token — closes the gap
+        where anyone on VPN could pull any already-registered device's
+        token just by knowing/guessing its hostname.
+      - Distinct-hostname requests per source IP are tracked in a rolling
+        5-minute window; more than 5 distinct hostnames from one IP is
+        logged as a token_enumeration anomaly for admin visibility.
     """
+    import time as _time
     client_ip = get_client_ip(request)
     if not (client_ip.startswith("10.") or client_ip in ("127.0.0.1","::1","172.17.0.1")):
         raise HTTPException(403, "Only accessible on Sky network.")
+
+    # Enumeration detection: track distinct hostnames requested per source IP
+    now = _time.time()
+    window_start = now - 300  # 5-minute window
+    log = _token_refresh_log.setdefault(client_ip, [])
+    log[:] = [(h, t) for (h, t) in log if t > window_start]
+    log.append((hostname, now))
+    distinct_hosts = {h for h, _ in log}
+    if len(distinct_hosts) > 5:
+        logger.warning(
+            f"[SECURITY] Possible token enumeration from {client_ip}: "
+            f"{len(distinct_hosts)} distinct hostnames requested in 5 min "
+            f"(latest: {hostname})"
+        )
+        db.add(AnomalyLog(
+            employee_id="unknown", employee_name=f"IP {client_ip}",
+            anomaly_type="token_enumeration",
+            description=f"{len(distinct_hosts)} distinct hostnames requested "
+                        f"from {client_ip} within 5 minutes via token-refresh.",
+            severity="high",
+        ))
+        await db.commit()
+
     d = await db.get(Device, hostname)
     if not d:
         raise HTTPException(404, "Device not registered.")
+
     if not d.api_token:
+        # Legacy bootstrap: device has never had a token. Issue one — this
+        # is the intended one-time use case for this endpoint.
         d.api_token = generate_api_token()
         await db.commit()
-        logger.info(f"Token issued for existing device: {hostname}")
+        logger.info(f"Token issued for existing device (bootstrap): {hostname} from {client_ip}")
+        return {"api_token": d.api_token, "employee_id": d.employee_id,
+                "employee_name": d.employee_name}
+
+    # Device already has a token — caller must prove they already hold it.
+    presented = get_device_token(request)
+    if not presented or not secrets.compare_digest(presented, d.api_token):
+        logger.warning(
+            f"[SECURITY] token-refresh denied for {hostname}: caller at "
+            f"{client_ip} did not present the existing valid token."
+        )
+        raise HTTPException(
+            403,
+            "Device already has a token. The existing token must be "
+            "presented to refresh — contact an admin if it was lost."
+        )
     return {"api_token": d.api_token, "employee_id": d.employee_id,
             "employee_name": d.employee_name}
 
@@ -924,6 +1007,7 @@ async def get_holidays(year: int=None, db: AsyncSession=Depends(get_db)):
 
 # -- 8. MISSED DAY -----------------------------------------
 @app.post("/api/missed")
+@limiter.limit("30/hour")
 async def record_missed(p: MissedDayPayload, request: Request, db: AsyncSession=Depends(get_db)):
     device = await db.get(Device, p.hostname)
     if not device: raise HTTPException(404, "Not registered")
@@ -954,12 +1038,46 @@ async def record_missed(p: MissedDayPayload, request: Request, db: AsyncSession=
     else:
         open_seg = await get_open_segment(device.employee_id, p.date, db)
         if open_seg: await close_segment(open_seg, db)
+        conf = "high" if p.has_cached_data else "user_declared"
         seg = await open_new_segment(
             device.employee_id, device.employee_name, p.hostname, p.date,
-            p.status, p.status, "high" if p.has_cached_data else "user_declared", source,
+            p.status, p.status, conf, source,
             None, p.lan_ip, bool(p.vpn_tunnel_ip), p.vpn_tunnel_ip,
             p.dns_servers or [], p.dns_domains or [], p.is_ethernet, None, False, None, db)
         await close_segment(seg, db)
+
+        # ── Unverified self-declared WFO: flag for manager visibility ──────
+        # A retroactive WFO claim with no network evidence (no cached signals,
+        # confidence=user_declared) can't be cross-checked the way live
+        # check-ins are. Rather than silently accepting it at face value
+        # forever, flag it as an anomaly (visible in the Anomalies panel)
+        # and track a monthly count so a pattern of unverified WFO claims
+        # is visible, not just each individual one.
+        if p.status == "wfo" and conf == "user_declared":
+            month_prefix = p.date[:7]  # YYYY-MM
+            cnt_q = await db.execute(select(func.count()).select_from(AnomalyLog).where(and_(
+                AnomalyLog.employee_id == device.employee_id,
+                AnomalyLog.anomaly_type == "unverified_wfo_declared",
+                AnomalyLog.description.like(f"%{month_prefix}%"),
+            )))
+            month_count = (cnt_q.scalar() or 0) + 1
+            severity = "high" if month_count > 3 else "medium"
+            db.add(AnomalyLog(
+                employee_id=device.employee_id, employee_name=device.employee_name,
+                anomaly_type="unverified_wfo_declared",
+                description=(
+                    f"{device.employee_name} ({device.employee_id}) self-declared "
+                    f"WFO for {p.date} via missed-day form with no network signals "
+                    f"to verify. This is their #{month_count} unverified WFO claim "
+                    f"in {month_prefix}."
+                ),
+                severity=severity,
+            ))
+            logger.warning(
+                f"[SECURITY] Unverified WFO self-declaration: {device.employee_id} "
+                f"for {p.date} (#{month_count} this month, no supporting signals)"
+            )
+
     q    = await db.execute(select(CheckIn).where(and_(
         CheckIn.employee_id==device.employee_id, CheckIn.date==p.date)))
     crec = q.scalars().first()

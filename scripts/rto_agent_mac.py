@@ -18,6 +18,7 @@ CLI flags (same as the old checkin.py, now on the binary itself):
   rto-mac --retry         retry any queued offline check-ins
   rto-mac --install       (re)install the launchd agent
   rto-mac --uninstall     remove the launchd agent
+  rto-mac --purge         uninstall AND delete ~/.rto_tracker entirely
 
 First run (no --flag): auto-installs launchd, then enters agent loop.
 """
@@ -26,6 +27,7 @@ import sys
 import os
 import json
 import logging
+import shutil
 import threading
 import time
 import subprocess
@@ -74,10 +76,12 @@ PLIST_LABEL   = "com.sky.rto"
 PLIST_PATH    = HOME / "Library" / "LaunchAgents" / f"{PLIST_LABEL}.plist"
 
 AGENT_LOG.parent.mkdir(parents=True, exist_ok=True)
-logging.basicConfig(
-    filename=str(AGENT_LOG), level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
+from logging.handlers import RotatingFileHandler
+_agent_log_handler = RotatingFileHandler(
+    str(AGENT_LOG), maxBytes=5 * 1024 * 1024, backupCount=3, encoding="utf-8"
 )
+_agent_log_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+logging.basicConfig(level=logging.INFO, handlers=[_agent_log_handler])
 logger = logging.getLogger("rto_agent_mac")
 
 # ── POLL INTERVAL ─────────────────────────────────────────────────────────────
@@ -179,6 +183,31 @@ def is_launchd_installed() -> bool:
     return PLIST_PATH.exists()
 
 
+def purge_config_dir(verbose: bool = True):
+    """
+    Remove ~/.rto_tracker entirely — config.json (device token), checkin.log
+    (+ rotated backups), pending_queue.json, .last_update_check,
+    .last_missed_check, launchd_err.log, launchd.log.
+
+    Safe to do: the device_token is not the source of truth — it's re-issued
+    by the server on next registration via the nonce/handoff flow (same
+    mechanism used on first install). No server-side state is lost.
+    NOTE: any check-ins queued offline and not yet flushed to the server are
+    lost — this is why purge is opt-in via --purge, separate from --uninstall.
+    """
+    if not CONFIG_DIR.exists():
+        if verbose:
+            print("  [INFO] Config directory not found - nothing to purge")
+        return
+    try:
+        shutil.rmtree(CONFIG_DIR)
+        if verbose:
+            print(f"  [OK] Removed {CONFIG_DIR} (config, logs, device token, queue)")
+    except Exception as e:
+        if verbose:
+            print(f"  [WARN] Could not fully remove {CONFIG_DIR}: {e}")
+
+
 # ── SMART DEDUP ───────────────────────────────────────────────────────────────
 def should_run_checkin(trigger: str = "unknown") -> bool:
     """
@@ -242,6 +271,16 @@ def start_periodic_poller():
                 trigger_checkin(trigger="periodic")
             except Exception as e:
                 logger.error(f"Periodic poll error: {e}")
+            # Re-check for updates on every poll cycle. check_and_apply_update()
+            # has its own internal once-per-day rate limit, so this is a cheap
+            # no-op most cycles — but it's what makes the daily check actually
+            # fire for long-running agents that never restart (e.g. via
+            # LaunchAgent staying up for days). Without this, updates were only
+            # ever checked once, at process startup.
+            try:
+                check_and_apply_update()
+            except Exception as e:
+                logger.debug(f"Periodic update check skipped: {e}")
             time.sleep(POLL_INTERVAL)
 
     t = threading.Thread(target=_poll, daemon=True, name="periodic-poller")
@@ -410,6 +449,7 @@ Examples:
   rto-mac --retry         Retry any queued offline check-ins
   rto-mac --install       (Re)install the launchd auto-start agent
   rto-mac --uninstall     Remove the launchd auto-start agent
+  rto-mac --purge         Uninstall AND delete ~/.rto_tracker (config, logs, device token)
         """,
     )
     parser.add_argument("--force",     action="store_true",
@@ -421,10 +461,17 @@ Examples:
     parser.add_argument("--install",   action="store_true",
                         help="(Re)install the launchd LaunchAgent")
     parser.add_argument("--uninstall", action="store_true",
-                        help="Remove the launchd LaunchAgent")
+                        help="Remove the launchd LaunchAgent (keeps ~/.rto_tracker)")
+    parser.add_argument("--purge",     action="store_true",
+                        help="Uninstall AND delete ~/.rto_tracker entirely (config, logs, device token, queue)")
     args = parser.parse_args()
 
     # ── One-shot commands (exit after) ───────────────────────────────────────
+    if args.purge:
+        uninstall_launchd(verbose=True)
+        purge_config_dir(verbose=True)
+        sys.exit(0)
+
     if args.uninstall:
         uninstall_launchd(verbose=True)
         sys.exit(0)

@@ -44,10 +44,12 @@ MISSED_DAY_FILE = CONFIG_DIR / ".last_missed_check"
 
 CONFIG_DIR.mkdir(parents=True, exist_ok=True)
 
-logging.basicConfig(
-    filename=str(LOG_FILE), level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-)
+from logging.handlers import RotatingFileHandler
+_log_handler = RotatingFileHandler(
+    str(LOG_FILE), maxBytes=5 * 1024 * 1024, backupCount=3, encoding="utf-8"
+)  # caps at ~20MB total (current + 3 rotated backups), rotates automatically
+_log_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+logging.basicConfig(level=logging.INFO, handlers=[_log_handler])
 logger = logging.getLogger("rto_client")
 
 IS_MAC = platform.system() == "Darwin"
@@ -120,6 +122,15 @@ def load_config() -> dict:
 def save_config(cfg: dict):
     with open(CONFIG_FILE, "w", encoding="utf-8") as f:
         json.dump(cfg, f, indent=2)
+    # Restrict to owner read/write only — config.json holds the device_token,
+    # which is a bearer credential. Default umask leaves it world-readable on
+    # shared/multi-user machines. os.chmod is a no-op on Windows (NTFS ACLs
+    # differ) but harmless there — Windows per-user profile dirs already
+    # aren't readable by other standard users by default.
+    try:
+        os.chmod(CONFIG_FILE, 0o600)
+    except Exception:
+        pass  # best-effort — don't let permission hardening break check-in
 
 def get_hostname() -> str:
     return socket.gethostname().upper()
@@ -422,6 +433,17 @@ def location_changed(cfg: dict, current_class: str) -> bool:
     return False
 
 # ── OFFLINE QUEUE ────────────────────────────────────────────────────────────
+def _write_secure_file(path: Path, content: str):
+    """Write text and lock down permissions to owner-only (0600).
+    Used for any local file that could aid signal fabrication or credential
+    theft if readable by other local users (pending_queue.json holds queued
+    check-in payloads; config.json holds the device token)."""
+    path.write_text(content, encoding="utf-8")
+    try:
+        os.chmod(path, 0o600)
+    except Exception:
+        pass
+
 def queue_checkin(payload: dict):
     from datetime import datetime as _dt
     date_str = payload.get("date", "")
@@ -437,7 +459,7 @@ def queue_checkin(payload: dict):
     queue = [q for q in queue if q.get("date") != payload.get("date")]
     payload["queued_at"] = datetime.utcnow().isoformat() + "Z"
     queue.append(payload)
-    QUEUE_FILE.write_text(json.dumps(queue, indent=2))
+    _write_secure_file(QUEUE_FILE, json.dumps(queue, indent=2))
     logger.info(f"Queued check-in for {payload.get('date')} (server unreachable)")
 
 def flush_queue(server: str, cfg: dict = None) -> tuple:
@@ -468,7 +490,7 @@ def flush_queue(server: str, cfg: dict = None) -> tuple:
             failed.append(payload)
             logger.warning(f"[WARN] Failed to flush: {payload.get('date')}")
 
-    if failed: QUEUE_FILE.write_text(json.dumps(failed, indent=2))
+    if failed: _write_secure_file(QUEUE_FILE, json.dumps(failed, indent=2))
     else: QUEUE_FILE.unlink(missing_ok=True)
     if synced: logger.info(f"Flushed {len(synced)} queued check-in(s)")
     return len(synced), synced_results
@@ -840,7 +862,7 @@ def check_missed_yesterday(server: str, hostname: str, cfg: dict, today: str):
                     try:
                         qd = json.loads(QUEUE_FILE.read_text())
                         qd = [q for q in qd if q.get("date") != day]
-                        if qd: QUEUE_FILE.write_text(json.dumps(qd, indent=2))
+                        if qd: _write_secure_file(QUEUE_FILE, json.dumps(qd, indent=2))
                         else: QUEUE_FILE.unlink(missing_ok=True)
                     except Exception: pass
                     continue
