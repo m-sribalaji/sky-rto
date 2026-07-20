@@ -158,7 +158,17 @@ def _get_auth_headers(cfg: dict) -> dict:
 def _sync_device_auth(server: str, hostname: str, cfg: dict) -> dict:
     """
     Sync device info from server. If token is missing (existing user migrating
-    to token auth), call /api/token-refresh to get one issued.
+    to token auth, or local config was lost/purged), call /api/token-refresh.
+
+    /api/token-refresh only auto-issues a token when the device has never had
+    one (server-side bootstrap case). If the server already has a token for
+    this hostname (e.g. this machine had one before but config.json was lost,
+    purged, or the disk was wiped), it correctly refuses with 403 rather than
+    handing out the existing token to whoever asks — that's the intended
+    security behaviour. In that case, fall back to full re-registration via
+    the browser nonce flow, same as a never-registered device. This is
+    throttled by last_reg_attempt_ts (1 hour) so it doesn't retry every poll
+    cycle and doesn't spam the rate-limited endpoint.
     """
     device = api_get(f"{server}/api/device/{hostname}")
     if device and device.get("registered"):
@@ -169,13 +179,41 @@ def _sync_device_auth(server: str, hostname: str, cfg: dict) -> dict:
         if device.get("employee_name") and cfg.get("employee_name") != device.get("employee_name"):
             cfg["employee_name"] = device.get("employee_name")
             changed = True
-        # If we have no token, call token-refresh to get one
+        # If we have no local token, try token-refresh (bootstrap case)
         if not cfg.get("device_token"):
-            refresh = api_post(f"{server}/api/token-refresh/{hostname}", {})
+            refresh, status = api_post(
+                f"{server}/api/token-refresh/{hostname}", {}, return_status=True)
             if refresh and refresh.get("api_token"):
                 cfg["device_token"] = refresh["api_token"]
                 changed = True
                 logger.info("[OK] Device token obtained via token-refresh")
+            elif status == 403:
+                # Server already has a token for this hostname but we don't
+                # hold it locally — config was lost. Fall back to full
+                # re-registration, throttled to avoid hammering the endpoint.
+                last_reg_ts  = cfg.get("last_reg_attempt_ts") or 0
+                hour_elapsed = (time.time() - float(last_reg_ts)) > 3600
+                if hour_elapsed:
+                    logger.warning(
+                        "[WARN] Token-refresh denied (device already has a "
+                        "server-side token but local config was lost) - "
+                        "opening re-registration page"
+                    )
+                    reg_url = _get_reg_url(server, hostname)
+                    if NOTIFIER_AVAILABLE:
+                        wh, lvl, _ = _get_notify_cfg(cfg)
+                        notify_registration_needed(hostname, reg_url, webhook=wh, level=lvl)
+                    else:
+                        _desktop_notify("RTO Tracker",
+                            "Device token was lost. Please re-register in the browser window.")
+                    open_browser(reg_url)
+                    cfg["last_reg_attempt_ts"] = time.time()
+                    changed = True
+                else:
+                    logger.info(
+                        "Token-refresh denied recently - re-registration "
+                        "browser opened within the last hour, waiting"
+                    )
         if changed:
             save_config(cfg)
     return device
@@ -496,7 +534,12 @@ def flush_queue(server: str, cfg: dict = None) -> tuple:
     return len(synced), synced_results
 
 # ── API ──────────────────────────────────────────────────────────────────────
-def api_post(url, payload, timeout=10, auth_headers: dict = None):
+def api_post(url, payload, timeout=10, auth_headers: dict = None, return_status: bool = False):
+    """
+    POST JSON. Returns parsed response dict on success.
+    If return_status=True, returns (response_or_None, http_status_or_None) instead —
+    lets callers distinguish "denied" (403) from "unreachable" (timeout/network error).
+    """
     try:
         data = json.dumps(payload).encode()
         hdrs = {
@@ -510,9 +553,14 @@ def api_post(url, payload, timeout=10, auth_headers: dict = None):
         req  = urllib.request.Request(url, data=data,
                    headers=hdrs, method="POST")
         with urllib.request.urlopen(req, timeout=timeout) as r:
-            return json.loads(r.read().decode())
+            body = json.loads(r.read().decode())
+            return (body, r.status) if return_status else body
+    except urllib.error.HTTPError as e:
+        logger.error(f"[FAIL] POST {url}: HTTP Error {e.code}: {e.reason}")
+        return (None, e.code) if return_status else None
     except Exception as e:
-        logger.error(f"[FAIL] POST {url}: {e}"); return None
+        logger.error(f"[FAIL] POST {url}: {e}")
+        return (None, None) if return_status else None
 
 def api_get(url, timeout=10, auth_headers: dict = None):
     try:
