@@ -96,6 +96,7 @@ DEFAULT_CONFIG = {
     "last_reg_attempt_ts":  None,
     "last_reg_attempt_date": None,
     "last_token_recovery_ts": None,
+    "_pending_reg_nonce":    None,
     "employee_id":          None,
     "device_token":         None,
     "poll_interval_seconds": 300,
@@ -206,7 +207,7 @@ def _sync_device_auth(server: str, hostname: str, cfg: dict) -> dict:
                         "server-side token but local config was lost) - "
                         "opening re-registration page"
                     )
-                    reg_url = _get_reg_url(server, hostname)
+                    reg_url, nonce = _get_reg_url(server, hostname)
                     if NOTIFIER_AVAILABLE:
                         wh, lvl, _ = _get_notify_cfg(cfg)
                         notify_registration_needed(hostname, reg_url, webhook=wh, level=lvl)
@@ -216,6 +217,19 @@ def _sync_device_auth(server: str, hostname: str, cfg: dict) -> dict:
                     open_browser(reg_url)
                     cfg["last_token_recovery_ts"] = time.time()
                     changed = True
+                    # Poll for the recovered token — the page auto-claims it
+                    # server-side as soon as it loads (no form to fill in for
+                    # recovery), so this should resolve within a few seconds.
+                    if nonce:
+                        for _ in range(12):  # up to ~60s
+                            time.sleep(5)
+                            status_resp = api_get(f"{server}/api/reg-nonce-status/{nonce}")
+                            if status_resp and status_resp.get("ready") and status_resp.get("api_token"):
+                                cfg["device_token"] = status_resp["api_token"]
+                                logger.info("[OK] Token recovered via re-registration page")
+                                break
+                        else:
+                            logger.info("Token recovery not confirmed within 60s - will retry next cycle")
                 else:
                     logger.info(
                         "Token-refresh denied recently - re-registration "
@@ -602,23 +616,29 @@ def open_browser(url: str):
         try: webbrowser.open(url)
         except Exception: pass
 
-def _get_reg_url(server: str, hostname: str) -> str:
+def _get_reg_url(server: str, hostname: str) -> tuple:
     """
-    Get a nonce-protected registration URL.
-    Calls /api/reg-nonce/{hostname} to get a one-time nonce,
-    returns /register/{hostname}?nonce={nonce}.
-    Prevents direct URL access to the registration page.
-    Falls back to plain URL if nonce endpoint unavailable (old server).
+    Get a nonce-protected registration/recovery URL.
+    Calls /api/reg-nonce/{hostname} to get a one-time nonce (now issued for
+    BOTH new registration and lost-token recovery — server distinguishes
+    internally), returns (url, nonce).
+    The nonce is also used afterward to poll /api/reg-nonce-status/{nonce}
+    for the resulting token, since neither /api/device nor the old
+    "Already Registered" page ever exposed it.
+    Falls back to (url_without_nonce, None) if the endpoint is unreachable
+    (old server) — polling will then have no nonce to check and the caller
+    should treat that as "can't auto-recover, manual registration only".
     """
     try:
         resp = api_post(f"{server}/api/reg-nonce/{hostname}", {})
         if resp and resp.get("nonce"):
-            nonce_url = f"{server}/register/{hostname}?nonce={resp['nonce']}"
+            nonce = resp["nonce"]
+            nonce_url = f"{server}/register/{hostname}?nonce={nonce}"
             logger.info("[OK] Registration nonce obtained")
-            return nonce_url
+            return nonce_url, nonce
     except Exception as e:
         logger.debug(f"Could not get reg nonce: {e}")
-    return f"{server}/register/{hostname}"
+    return f"{server}/register/{hostname}", None
 
 def _desktop_notify(title: str, message: str):
     try:
@@ -1073,8 +1093,9 @@ def run_checkin(force: bool = False):
             now_ts       = time.time()
             hour_elapsed = (now_ts - float(last_reg_ts)) > 3600
 
+            reg_nonce = None
             if hour_elapsed:
-                reg_url = _get_reg_url(server, hostname)
+                reg_url, reg_nonce = _get_reg_url(server, hostname)
                 if NOTIFIER_AVAILABLE:
                     wh, lvl, _ = _get_notify_cfg(cfg)
                     notify_registration_needed(hostname, reg_url, webhook=wh, level=lvl)
@@ -1082,9 +1103,11 @@ def run_checkin(force: bool = False):
                     _desktop_notify("RTO Tracker", "Please register your device.")
                 open_browser(reg_url)
                 cfg["last_reg_attempt_ts"] = now_ts
+                cfg["_pending_reg_nonce"]  = reg_nonce  # survive across poll cycles
                 save_config(cfg)
             else:
                 logger.info("Registration browser opened recently - waiting")
+                reg_nonce = cfg.get("_pending_reg_nonce")
 
             logger.info("Waiting up to 3 minutes for registration...")
             for attempt in range(36):
@@ -1096,9 +1119,24 @@ def run_checkin(force: bool = False):
                     cfg.pop("last_reg_attempt_ts", None)
                     cfg.pop("last_reg_attempt_date", None)
                     cfg.pop("last_token_recovery_ts", None)
+                    cfg.pop("_pending_reg_nonce", None)
                     cfg["employee_name"] = emp_name
                     cfg["employee_id"] = check.get("employee_id")
-                    cfg["device_token"] = check.get("api_token")
+                    # /api/device deliberately never returns api_token (it's a
+                    # public read-only endpoint) — retrieve it via the nonce
+                    # that gated this registration instead. The browser form
+                    # submit stashes the token against this same nonce
+                    # server-side (see /api/register).
+                    if reg_nonce:
+                        tok_resp = api_get(f"{server}/api/reg-nonce-status/{reg_nonce}")
+                        if tok_resp and tok_resp.get("ready") and tok_resp.get("api_token"):
+                            cfg["device_token"] = tok_resp["api_token"]
+                        else:
+                            logger.warning(
+                                "[WARN] Registration detected but token not "
+                                "yet claimed against nonce - will pick up "
+                                "via token-refresh bootstrap next cycle"
+                            )
                     save_config(cfg)
                     if NOTIFIER_AVAILABLE:
                         wh, lvl, srv = _get_notify_cfg(cfg)
@@ -1178,7 +1216,8 @@ def run_checkin(force: bool = False):
             open_browser(f"{server}/confirm/{hostname}")
 
         elif action == "register_first":
-            open_browser(_get_reg_url(server, hostname))
+            url, _ = _get_reg_url(server, hostname)
+            open_browser(url)
 
         elif action == "override_locked":
             locked_status = response.get("status", "unknown")
@@ -1220,6 +1259,7 @@ def run_reset():
     cfg.pop("last_reg_attempt_ts", None)
     cfg.pop("last_reg_attempt_date", None)
     cfg.pop("last_token_recovery_ts", None)
+    cfg.pop("_pending_reg_nonce", None)
     save_config(cfg)
     cleared.append("config cache")
     logger.info(f"Reset complete - cleared: {', '.join(cleared)}")

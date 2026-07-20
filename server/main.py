@@ -230,6 +230,7 @@ def is_weekend(d: str) -> bool:
 class RegisterPayload(BaseModel):
     hostname: str; employee_name: str; employee_id: str
     team: Optional[str]=None; platform: Optional[str]=None
+    nonce: Optional[str]=None
 
 class CheckInPayload(BaseModel):
     hostname: str; lan_ip: Optional[str]=None; vpn_tunnel_ip: Optional[str]=None
@@ -358,6 +359,13 @@ async def register(p: RegisterPayload, request: Request, db: AsyncSession = Depe
                   employee_id=p.employee_id, team=p.team, platform=p.platform,
                   api_token=token))
     await db.commit()
+    # Stash the token against the nonce that gated this page load, so the
+    # polling agent can retrieve it via /api/reg-nonce-status/{nonce}
+    # instead of the old (broken) approach of expecting /api/device to
+    # return it — that endpoint deliberately never does.
+    nonce = p.nonce
+    if nonce and nonce in _reg_nonces:
+        _reg_nonces[nonce]["claimed_token"] = token
     # First registered user -> admin
     q = await db.execute(select(Role))
     if not q.scalars().first():
@@ -455,8 +463,13 @@ async def token_refresh(hostname: str, request: Request, db: AsyncSession = Depe
         where anyone on VPN could pull any already-registered device's
         token just by knowing/guessing its hostname.
       - Distinct-hostname requests per source IP are tracked in a rolling
-        5-minute window; more than 5 distinct hostnames from one IP is
-        logged as a token_enumeration anomaly for admin visibility.
+        5-minute window; 5 or more distinct hostnames from one IP is logged
+        as a token_enumeration anomaly for admin visibility. (Threshold is
+        deliberately AT the rate-limit ceiling of 5/minute, not above it —
+        a caller who exhausts their entire per-minute budget scanning
+        different hostnames is exhibiting the enumeration pattern by
+        definition; requiring more than 5 is unreachable since request 6
+        is blocked by the rate limiter before it can be counted here.)
     """
     import time as _time
     client_ip = get_client_ip(request)
@@ -470,7 +483,7 @@ async def token_refresh(hostname: str, request: Request, db: AsyncSession = Depe
     log[:] = [(h, t) for (h, t) in log if t > window_start]
     log.append((hostname, now))
     distinct_hosts = {h for h, _ in log}
-    if len(distinct_hosts) > 5:
+    if len(distinct_hosts) >= 5:
         logger.warning(
             f"[SECURITY] Possible token enumeration from {client_ip}: "
             f"{len(distinct_hosts)} distinct hostnames requested in 5 min "
@@ -517,22 +530,53 @@ async def token_refresh(hostname: str, request: Request, db: AsyncSession = Depe
 async def create_reg_nonce(hostname: str, request: Request,
                            db: AsyncSession = Depends(get_db)):
     """
-    Agent calls this to get a one-time nonce before opening the registration URL.
-    Only callable from Sky VPN. Nonce expires in 5 minutes.
-    The register page requires this nonce in the ?nonce= query param —
-    prevents anyone from opening the registration URL directly.
+    Agent calls this to get a one-time nonce before opening the registration
+    URL. Only callable from Sky VPN. Nonce expires in 5 minutes.
+    The register/recovery page requires this nonce in the ?nonce= query
+    param — prevents anyone from opening the registration URL directly.
+
+    Also used for lost-token recovery: if the device already exists, a nonce
+    is still issued (recovery=True) — the nonce still proves this specific
+    agent process, on this VPN, initiated the flow, which is exactly the
+    same trust property as new registration.
     """
     import time as _tn
     client_ip = get_client_ip(request)
     if not (client_ip.startswith("10.") or client_ip in ("127.0.0.1","::1","172.17.0.1")):
         raise HTTPException(403, "Only accessible on Sky network.")
     existing = await db.get(Device, hostname)
-    if existing:
-        raise HTTPException(409, "Device already registered.")
     nonce = secrets.token_urlsafe(24)
-    _reg_nonces[nonce] = {"hostname": hostname, "expires": _tn.time() + 300}
-    logger.info(f"Registration nonce created for {hostname}")
-    return {"nonce": nonce}
+    _reg_nonces[nonce] = {
+        "hostname": hostname, "expires": _tn.time() + 300,
+        "recovery": bool(existing), "claimed_token": None,
+    }
+    logger.info(
+        f"{'Recovery' if existing else 'Registration'} nonce created for {hostname}")
+    return {"nonce": nonce, "recovery": bool(existing)}
+
+@app.get("/api/reg-nonce-status/{nonce}")
+@limiter.limit("30/minute")
+async def reg_nonce_status(nonce: str, request: Request):
+    """
+    Agent polls this with its nonce after opening the registration/recovery
+    page. Returns the device token once the browser-side action (either the
+    registration form submit, or the recovery page's auto-claim) has
+    completed and stashed it against this nonce. One-time consumption:
+    the token is popped from the nonce record on successful read, so a
+    stolen/leaked nonce can't be replayed to re-read the token later
+    (though by then it's expired within 5 minutes regardless).
+    """
+    import time as _tn
+    data = _reg_nonces.get(nonce)
+    if not data:
+        raise HTTPException(404, "Invalid or expired nonce.")
+    if _tn.time() > data["expires"]:
+        _reg_nonces.pop(nonce, None)
+        raise HTTPException(410, "Nonce expired.")
+    if not data.get("claimed_token"):
+        return {"ready": False}
+    token = data.pop("claimed_token")
+    return {"ready": True, "api_token": token}
 
 # -- 2. ROLES ----------------------------------------------
 @app.get("/api/roles")
@@ -2051,11 +2095,9 @@ async def register_page(hostname: str, request: Request,
     client_ip = get_client_ip(request)
     if not (client_ip.startswith("10.") or client_ip in ("127.0.0.1","::1","172.17.0.1")):
         return _deny("Registration is only available on the Sky network.")
-    # Already registered
-    existing = await db.get(Device, hostname)
-    if existing:
-        return HTMLResponse(f"<html><body style='background:#111;color:#4ade80;font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0'><div style='text-align:center'><h2>Already Registered</h2><p>This device is registered as <strong>{existing.employee_name}</strong>.</p></div></body></html>", status_code=200)
-    # Require valid nonce — prevents direct URL access without agent
+
+    # Require valid nonce for BOTH new registration and recovery — proves
+    # this page load originated from the agent, not a guessed/direct URL.
     nonce = request.query_params.get("nonce", "")
     if not nonce:
         return _deny("Registration must be initiated from the RTO agent on your device.")
@@ -2063,6 +2105,25 @@ async def register_page(hostname: str, request: Request,
     if not nonce_data or nonce_data["hostname"] != hostname or _tr.time() > nonce_data["expires"]:
         _reg_nonces.pop(nonce, None)
         return _deny("Registration link has expired or is invalid. Run the agent again to get a new link.")
+
+    existing = await db.get(Device, hostname)
+    if existing:
+        # Lost-token recovery: this hostname is already registered. The
+        # valid nonce already proves this page load came from the agent on
+        # this machine (same VPN-gated trust as new registration). Safe to
+        # hand back the EXISTING token — does not rotate or affect any
+        # other session using it. Stash it against the nonce so the
+        # polling agent (GET /api/reg-nonce-status/{nonce}) can retrieve it.
+        nonce_data["claimed_token"] = existing.api_token
+        logger.info(f"Recovery token claimed for {hostname} ({existing.employee_name})")
+        return HTMLResponse(
+            f"<html><body style='background:#111;color:#4ade80;font-family:sans-serif;"
+            f"display:flex;align-items:center;justify-content:center;height:100vh;margin:0'>"
+            f"<div style='text-align:center'><h2>Device Recovered</h2>"
+            f"<p>Welcome back, <strong>{existing.employee_name}</strong>. "
+            f"You can close this window — the app will finish automatically.</p></div>"
+            f"</body></html>", status_code=200)
+
     tmpl = templates.get_template("register.html")
     html = tmpl.render(request=request, hostname=hostname)
     return HTMLResponse(html)

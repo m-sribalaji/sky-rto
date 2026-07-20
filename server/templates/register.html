@@ -77,11 +77,12 @@ async function register() {
   lucide.createIcons();
   try {
     const plt = navigator.platform.toLowerCase().includes('win') ? 'windows' : 'macos';
+    const nonce = new URLSearchParams(window.location.search).get('nonce') || '';
     const resp = await fetch('/api/register', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ hostname: '{{ hostname }}', employee_name: nm,
-                             employee_id: eid, team: tm, platform: plt })
+                             employee_id: eid, team: tm, platform: plt, nonce: nonce })
     });
     const data = await resp.json();
     localStorage.setItem('_sk_ei', eid);
