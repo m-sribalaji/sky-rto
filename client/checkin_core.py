@@ -95,6 +95,7 @@ DEFAULT_CONFIG = {
     "last_detected_class":  None,
     "last_reg_attempt_ts":  None,
     "last_reg_attempt_date": None,
+    "last_token_recovery_ts": None,
     "employee_id":          None,
     "device_token":         None,
     "poll_interval_seconds": 300,
@@ -191,8 +192,14 @@ def _sync_device_auth(server: str, hostname: str, cfg: dict) -> dict:
                 # Server already has a token for this hostname but we don't
                 # hold it locally — config was lost. Fall back to full
                 # re-registration, throttled to avoid hammering the endpoint.
-                last_reg_ts  = cfg.get("last_reg_attempt_ts") or 0
-                hour_elapsed = (time.time() - float(last_reg_ts)) > 3600
+                # Uses its OWN timestamp field (last_token_recovery_ts), not
+                # last_reg_attempt_ts — that field belongs to the separate
+                # "never registered at all" flow in run_checkin(). Sharing it
+                # caused this path to silently skip opening the browser if
+                # the other flow had recently set it, even though no browser
+                # had actually been opened for THIS reason.
+                last_recovery_ts = cfg.get("last_token_recovery_ts") or 0
+                hour_elapsed = (time.time() - float(last_recovery_ts)) > 3600
                 if hour_elapsed:
                     logger.warning(
                         "[WARN] Token-refresh denied (device already has a "
@@ -207,7 +214,7 @@ def _sync_device_auth(server: str, hostname: str, cfg: dict) -> dict:
                         _desktop_notify("RTO Tracker",
                             "Device token was lost. Please re-register in the browser window.")
                     open_browser(reg_url)
-                    cfg["last_reg_attempt_ts"] = time.time()
+                    cfg["last_token_recovery_ts"] = time.time()
                     changed = True
                 else:
                     logger.info(
@@ -1088,6 +1095,7 @@ def run_checkin(force: bool = False):
                     logger.info(f"Registration completed: {emp_name}")
                     cfg.pop("last_reg_attempt_ts", None)
                     cfg.pop("last_reg_attempt_date", None)
+                    cfg.pop("last_token_recovery_ts", None)
                     cfg["employee_name"] = emp_name
                     cfg["employee_id"] = check.get("employee_id")
                     cfg["device_token"] = check.get("api_token")
@@ -1211,6 +1219,7 @@ def run_reset():
     cfg["last_detected_class"] = None
     cfg.pop("last_reg_attempt_ts", None)
     cfg.pop("last_reg_attempt_date", None)
+    cfg.pop("last_token_recovery_ts", None)
     save_config(cfg)
     cleared.append("config cache")
     logger.info(f"Reset complete - cleared: {', '.join(cleared)}")
