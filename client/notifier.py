@@ -198,8 +198,10 @@ def _send_teams(webhook_url: str, payload: dict) -> bool:
                 ssl_ctx = _ssl._create_unverified_context()
         with urllib.request.urlopen(req, timeout=10, context=ssl_ctx) as resp:
             status = resp.status
-            if status == 200:
-                logger.info("[OK] Teams notification sent")
+            # 200 = classic O365 Connector success.
+            # 202 = Power Automate Workflow webhook success (request accepted, run triggered async).
+            if status in (200, 202):
+                logger.info(f"[OK] Teams notification sent (HTTP {status})")
                 return True
             body_txt = ""
             try:
@@ -208,6 +210,20 @@ def _send_teams(webhook_url: str, payload: dict) -> bool:
                 body_txt = f"response body unavailable: {e}"
             logger.warning(f"[WARN] Teams webhook returned HTTP {status}: {body_txt}")
             return False
+    except urllib.error.HTTPError as e:
+        # 202 responses with empty bodies can sometimes surface here depending on
+        # the urllib version's handling of non-2xx-with-empty-body edge cases —
+        # handle explicitly rather than falling through to the generic except.
+        if e.code in (200, 202):
+            logger.info(f"[OK] Teams notification sent (HTTP {e.code})")
+            return True
+        body_txt = ""
+        try:
+            body_txt = e.read().decode("utf-8", errors="ignore")
+        except Exception:
+            pass
+        logger.warning(f"[WARN] Teams webhook returned HTTP {e.code}: {body_txt}")
+        return False
     except urllib.error.URLError as e:
         logger.warning(f"[WARN] Teams webhook unreachable: {e}")
         return False
