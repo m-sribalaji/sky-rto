@@ -65,6 +65,9 @@ jobs:
             --hidden-import=notifier \
             --hidden-import=platform \
             --hidden-import=ipaddress \
+            --hidden-import=hmac \
+            --hidden-import=hashlib \
+            --hidden-import=secrets \
             --hidden-import=urllib.request \
             --hidden-import=urllib.error \
             --hidden-import=fcntl \
@@ -142,6 +145,9 @@ jobs:
             --hidden-import=notifier \
             --hidden-import=platform \
             --hidden-import=ipaddress \
+            --hidden-import=hmac \
+            --hidden-import=hashlib \
+            --hidden-import=secrets \
             --hidden-import=urllib.request \
             --hidden-import=urllib.error \
             --hidden-import=json \
