@@ -9,6 +9,7 @@ on them directly.
 import sys, os, json, socket, platform, subprocess
 import logging, time
 from pathlib import Path
+from datetime import datetime, timedelta
 
 # ── HARDCODED DEFAULTS (baked into binary at build time) ────────────────────
 # These placeholders are replaced by inject_version.py during GitHub Actions.
@@ -92,8 +93,15 @@ DEFAULT_CONFIG = {
     "_pending_reg_nonce":    None,
     "employee_id":          None,
     "device_token":         None,
+    "token_expires_at":     None,  # ISO timestamp — when the server will stop honouring device_token
     "poll_interval_seconds": 300,
 }
+
+# Rotate before the server-side expiry actually hits, so a well-behaved
+# agent that's online regularly never gets caught by the hard cutoff — the
+# hard cutoff (see TOKEN_TTL_DAYS on the server) is the backstop for tokens
+# that got separated from a well-behaved agent, not the normal path.
+TOKEN_RENEW_WINDOW_DAYS = 14
 
 def load_config() -> dict:
     if CONFIG_FILE.exists():
@@ -185,6 +193,7 @@ def _sync_device_auth(server: str, hostname: str, cfg: dict) -> dict:
                 f"{server}/api/token-refresh/{hostname}", {}, return_status=True)
             if refresh and refresh.get("api_token"):
                 cfg["device_token"] = refresh["api_token"]
+                cfg["token_expires_at"] = refresh.get("token_expires_at")
                 changed = True
                 logger.info("[OK] Device token obtained via token-refresh")
             elif status == 403:
@@ -224,6 +233,7 @@ def _sync_device_auth(server: str, hostname: str, cfg: dict) -> dict:
                             status_resp = api_get(f"{server}/api/reg-nonce-status/{nonce}")
                             if status_resp and status_resp.get("ready") and status_resp.get("api_token"):
                                 cfg["device_token"] = status_resp["api_token"]
+                                cfg["token_expires_at"] = status_resp.get("token_expires_at")
                                 logger.info("[OK] Token recovered via re-registration page")
                                 break
                         else:
@@ -233,6 +243,33 @@ def _sync_device_auth(server: str, hostname: str, cfg: dict) -> dict:
                         "Token-refresh denied recently - re-registration "
                         "browser opened within the last hour, waiting"
                     )
+        else:
+            # We already have a token — check if it's due for a proactive
+            # rotation before the server's hard expiry hits. A missing or
+            # unparseable expires_at means an older token issued before
+            # this feature existed; the server backfills those to a real
+            # expiry on next use, so just let this pass quietly and pick up
+            # a real value on the next sync rather than guessing.
+            due_for_rotation = False
+            expires_raw = cfg.get("token_expires_at")
+            if expires_raw:
+                try:
+                    exp = datetime.strptime(expires_raw.replace("Z",""), "%Y-%m-%dT%H:%M:%S.%f") \
+                          if "." in expires_raw else datetime.strptime(expires_raw.replace("Z",""), "%Y-%m-%dT%H:%M:%S")
+                    due_for_rotation = (exp - datetime.utcnow()) < timedelta(days=TOKEN_RENEW_WINDOW_DAYS)
+                except Exception:
+                    pass
+            if due_for_rotation:
+                refresh, status = api_post(
+                    f"{server}/api/token-refresh/{hostname}", {},
+                    auth_headers=_get_auth_headers(cfg), return_status=True)
+                if refresh and refresh.get("api_token"):
+                    cfg["device_token"]     = refresh["api_token"]
+                    cfg["token_expires_at"] = refresh.get("token_expires_at")
+                    changed = True
+                    logger.info(f"[OK] Device token rotated (was within {TOKEN_RENEW_WINDOW_DAYS}d of expiry)")
+                else:
+                    logger.warning(f"[WARN] Proactive token rotation failed (status={status}) - will retry next sync")
         if changed:
             save_config(cfg)
     return device

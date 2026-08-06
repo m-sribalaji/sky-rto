@@ -17,6 +17,7 @@ from sqlalchemy import select, and_
 from database import get_db, Device, CheckIn, LeaveRequest
 from deps import get_client_ip, today_str
 from routers.auth import _reg_nonces
+from schemas import _validate_missed_day_date
 
 router = APIRouter()
 
@@ -109,7 +110,23 @@ async def missed_day_page(hostname: str, request: Request,
     if not dates_param:
         return HTMLResponse("<p style='color:#888;font-family:monospace;padding:20px'>No dates specified.</p>")
 
-    dates = [d.strip() for d in dates_param.split(",") if d.strip()]
+    # Same rules as the /api/missed endpoint that actually saves this data:
+    # real calendar date, not in the future, not absurdly far in the past.
+    # No point showing someone a form for "2026-08-32" or a made-up future
+    # date only to have the submit fail — reject it here, before they even
+    # see it.
+    dates = []
+    for d in dates_param.split(","):
+        d = d.strip()
+        if not d:
+            continue
+        try:
+            dates.append(_validate_missed_day_date(d))
+        except ValueError:
+            continue
+
+    if not dates:
+        return HTMLResponse("<p style='color:#888;font-family:monospace;padding:20px'>No valid dates specified.</p>")
 
     # Filter out dates that already have a record — prevents re-use
     # by refreshing or manually editing the URL.

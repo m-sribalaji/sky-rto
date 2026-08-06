@@ -74,7 +74,7 @@ def check_missed_yesterday(server: str, hostname: str, cfg: dict, today: str):
                 cached_payload.get("is_ethernet", False),
             )
             if server_reachable(server):
-                resp = api_post(f"{server}/api/checkin", cached_payload, auth_headers=_get_auth_headers(cfg))
+                resp = api_post(f"{server}/api/checkin", cached_payload, auth_headers=_get_auth_headers(cfg), sign_key=cfg.get("device_token"))
                 if resp and resp.get("action") in ("ok", "already_checked_in"):
                     logger.info(f"Soft miss auto-resolved: {day}")
                     try:

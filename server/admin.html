@@ -4,6 +4,11 @@
 <meta charset="UTF-8"/>
 <meta name="viewport" content="width=device-width,initial-scale=1"/>
 <title>RTO Admin - DB View</title>
+<script>
+// Set before the stylesheet loads so there's no flash of the wrong theme
+// on first paint — see theme.js for the rest of the light/dark/system switcher.
+(function(){var t=localStorage.getItem('_sk_theme');if(t==='light'||t==='dark')document.documentElement.setAttribute('data-theme',t);})();
+</script>
 <!-- CSS and JS used to live inline here; they now live in server/static/admin.css and admin.js -->
 <link rel="icon" type="image/png" href="/static/sky-logo.png"/>
 <link href="https://fonts.googleapis.com/css2?family=Geist+Mono:wght@300;400;500&family=Geist:wght@300;400;500;600&family=Instrument+Serif:ital@0;1&display=swap" rel="stylesheet"/>
@@ -34,6 +39,7 @@
       Admin only
     </div>
     <span class="topbar-emp" id="topbar-emp"></span>
+    <div data-theme-toggle="inline" style="margin-left:10px"></div>
   </div>
 
   <div class="layout">
@@ -69,5 +75,6 @@
 <div class="toast" id="toast"></div>
 
 <script src="/static/admin.js"></script>
+<script src="/static/theme.js"></script>
 </body>
 </html>

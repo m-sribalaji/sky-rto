@@ -4,6 +4,11 @@
 <meta charset="UTF-8"/>
 <meta name="viewport" content="width=device-width,initial-scale=1.0"/>
 <title>RTO Tracker</title>
+<script>
+// Set before the stylesheet loads so there's no flash of the wrong theme
+// on first paint — see theme.js for the rest of the light/dark/system switcher.
+(function(){var t=localStorage.getItem('_sk_theme');if(t==='light'||t==='dark')document.documentElement.setAttribute('data-theme',t);})();
+</script>
 <!-- CSS and JS used to live inline here; they now live in server/static/rto-ui.css and rto-ui.js -->
 <link rel="icon" type="image/png" href="/static/sky-logo.png"/>
 <link href="https://fonts.googleapis.com/css2?family=Geist+Mono:wght@300;400;500&family=Geist:wght@300;400;500;600&family=Instrument+Serif:ital@0;1&display=swap" rel="stylesheet"/>
@@ -19,7 +24,9 @@
     <div class="ava" id="sb-ava">?</div>
     <div style="flex:1;min-width:0"><div class="u-name" id="sb-name">Loading</div><div class="u-id" id="sb-id">-</div><div class="u-role" id="sb-role-badge"></div></div>
     <div class="s-dot" id="s-dot"></div>
-  </div></div>
+  </div>
+  <div style="display:flex;justify-content:center;margin-top:10px"><div data-theme-toggle="inline"></div></div>
+  </div>
 </aside>
 <main class="main">
   <div class="topbar">
@@ -240,6 +247,7 @@
     <div class="page" id="page-anomalies">
       <div class="notice warn"><i data-lucide="triangle-alert"></i><span>Records with low confidence or LAN subnet mismatches.</span></div>
       <div class="card"><div class="card-title">Flagged today <span class="card-sub" id="flag-count">-</span></div><div id="flagged-list"><div class="loading"><div class="spinner"></div></div></div></div>
+      <div class="card" style="margin-top:16px"><div class="card-title">Security anomalies <span class="card-sub" id="anomaly-count">-</span></div><div id="anomaly-list"><div class="loading"><div class="spinner"></div></div></div></div>
     </div>
 
     <!-- OVERRIDE -->
@@ -394,5 +402,6 @@
 </div>
 
 <script src="/static/rto-ui.js"></script>
+<script src="/static/theme.js"></script>
 </body>
 </html>

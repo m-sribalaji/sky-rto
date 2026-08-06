@@ -19,6 +19,7 @@ from sqlalchemy import select
 from database import get_db, Device, Role, AnomalyLog
 from deps import (
     get_client_ip, get_device_token, get_role, generate_api_token, limiter,
+    is_sky_network, issue_token_expiry,
 )
 from schemas import RegisterPayload
 
@@ -34,7 +35,7 @@ _token_refresh_log: dict = {}  # source_ip -> [(hostname, timestamp)] — enumer
 @router.post("/api/register")
 async def register(p: RegisterPayload, request: Request, db: AsyncSession = Depends(get_db)):
     client_ip = get_client_ip(request)
-    if not (client_ip.startswith("10.") or client_ip in ("127.0.0.1", "::1", "172.17.0.1")):
+    if not is_sky_network(client_ip):
         raise HTTPException(403, "Registration only allowed from Sky network.")
     existing = await db.get(Device, p.hostname)
     if existing:
@@ -42,13 +43,16 @@ async def register(p: RegisterPayload, request: Request, db: AsyncSession = Depe
         existing.team=p.team; existing.platform=p.platform
         if not existing.api_token:
             existing.api_token = generate_api_token()
+            existing.token_issued_at, existing.token_expires_at = issue_token_expiry()
         await db.commit()
         return {"status": "updated", "hostname": p.hostname,
-                "employee_id": existing.employee_id, "api_token": existing.api_token}
+                "employee_id": existing.employee_id, "api_token": existing.api_token,
+                "token_expires_at": existing.token_expires_at.isoformat()+"Z" if existing.token_expires_at else None}
     token = generate_api_token()
+    issued_at, expires_at = issue_token_expiry()
     db.add(Device(hostname=p.hostname, employee_name=p.employee_name,
                   employee_id=p.employee_id, team=p.team, platform=p.platform,
-                  api_token=token))
+                  api_token=token, token_issued_at=issued_at, token_expires_at=expires_at))
     await db.commit()
     # Stash the token against the nonce that gated this page load, so the
     # polling agent can retrieve it via /api/reg-nonce-status/{nonce}
@@ -65,7 +69,8 @@ async def register(p: RegisterPayload, request: Request, db: AsyncSession = Depe
         logger.info(f"Auto-assigned admin to first user: {p.employee_id}")
     logger.info(f"Registered: {p.hostname} -> {p.employee_name}")
     return {"status": "registered", "hostname": p.hostname,
-            "employee_id": p.employee_id, "api_token": token}
+            "employee_id": p.employee_id, "api_token": token,
+            "token_expires_at": expires_at.isoformat()+"Z"}
 
 @router.get("/api/device/{hostname}")
 async def get_device(hostname: str, db: AsyncSession = Depends(get_db)):
@@ -77,9 +82,14 @@ async def get_device(hostname: str, db: AsyncSession = Depends(get_db)):
             "employee_id": d.employee_id, "team": d.team, "role": role}
 
 @router.get("/api/device-by-employee/{employee_id}")
-async def get_device_by_employee(employee_id: str, db: AsyncSession = Depends(get_db)):
+async def get_device_by_employee(employee_id: str, request: Request, db: AsyncSession = Depends(get_db)):
     """Returns hostname for an employee ID — used by UI for token-refresh lookup.
-    Never returns api_token."""
+    Never returns api_token. Every other pre-auth lookup in this file is
+    restricted to the Sky network; this one was accidentally left wide open
+    to anyone on the internet who wants to enumerate employee IDs — closing
+    that gap here rather than leaving this one endpoint as the odd one out."""
+    if not is_sky_network(get_client_ip(request)):
+        raise HTTPException(403, "Only accessible on Sky network.")
     q = await db.execute(select(Device).where(Device.employee_id == employee_id))
     d = q.scalars().first()
     if not d: return {"found": False}
@@ -95,7 +105,7 @@ async def create_auth_handoff(request: Request, db: AsyncSession = Depends(get_d
     """
     import time as _time
     client_ip = get_client_ip(request)
-    if not (client_ip.startswith("10.") or client_ip in ("127.0.0.1","::1","172.17.0.1")):
+    if not is_sky_network(client_ip):
         raise HTTPException(403, "Only accessible on Sky network.")
     token = get_device_token(request)
     if not token:
@@ -137,15 +147,24 @@ async def consume_auth_handoff(token: str):
 @limiter.limit("5/minute")
 async def token_refresh(hostname: str, request: Request, db: AsyncSession = Depends(get_db)):
     """
-    Issues a token for existing registered devices that predate token auth.
+    Two jobs, same endpoint: bootstrap a token for a device that predates
+    token auth, or ROTATE an existing one — issue a brand-new token value
+    and retire the old one, not just hand back what was already there. That
+    second part is new: previously this endpoint just re-returned the same
+    token forever, which meant "refresh" didn't actually limit anything —
+    a leaked token stayed valid until someone noticed and manually cleared
+    it. Now every call that proves possession of the current token walks
+    away with a different one, and the old value stops working immediately
+    (comparisons are always against whatever's currently on the Device row).
+
     Security:
       - Only callable from Sky VPN (10.x.x.x) — network-level trust boundary,
         same as before.
       - Rate-limited to 5/minute per source IP (slowapi) — blocks brute-force
         hostname enumeration from a single caller.
-      - Only issues a NEW token when one doesn't already exist (legacy
-        bootstrap case). If a token already exists for this hostname, the
-        caller must already present it via X-Device-Token — closes the gap
+      - Only issues a token without proof when one doesn't exist yet (legacy
+        bootstrap case). Rotating an existing token always requires
+        presenting the current one first via X-Device-Token — closes the gap
         where anyone on VPN could pull any already-registered device's
         token just by knowing/guessing its hostname.
       - Distinct-hostname requests per source IP are tracked in a rolling
@@ -159,7 +178,7 @@ async def token_refresh(hostname: str, request: Request, db: AsyncSession = Depe
     """
     import time as _time
     client_ip = get_client_ip(request)
-    if not (client_ip.startswith("10.") or client_ip in ("127.0.0.1","::1","172.17.0.1")):
+    if not is_sky_network(client_ip):
         raise HTTPException(403, "Only accessible on Sky network.")
 
     # Enumeration detection: track distinct hostnames requested per source IP
@@ -192,12 +211,20 @@ async def token_refresh(hostname: str, request: Request, db: AsyncSession = Depe
         # Legacy bootstrap: device has never had a token. Issue one — this
         # is the intended one-time use case for this endpoint.
         d.api_token = generate_api_token()
+        d.token_issued_at, d.token_expires_at = issue_token_expiry()
         await db.commit()
         logger.info(f"Token issued for existing device (bootstrap): {hostname} from {client_ip}")
         return {"api_token": d.api_token, "employee_id": d.employee_id,
-                "employee_name": d.employee_name}
+                "employee_name": d.employee_name,
+                "token_expires_at": d.token_expires_at.isoformat()+"Z"}
 
     # Device already has a token — caller must prove they already hold it.
+    # Note: deliberately NOT going through verify_device_auth here — an
+    # already-expired token is exactly the case this endpoint needs to
+    # accept, so someone whose token lapsed can still rotate into a fresh
+    # one without a full re-registration. It's still comparing against the
+    # real stored secret, just without the expiry gate applied everywhere
+    # else.
     presented = get_device_token(request)
     if not presented or not secrets.compare_digest(presented, d.api_token):
         logger.warning(
@@ -209,8 +236,13 @@ async def token_refresh(hostname: str, request: Request, db: AsyncSession = Depe
             "Device already has a token. The existing token must be "
             "presented to refresh — contact an admin if it was lost."
         )
+    d.api_token = generate_api_token()
+    d.token_issued_at, d.token_expires_at = issue_token_expiry()
+    await db.commit()
+    logger.info(f"Token rotated for {hostname} from {client_ip}")
     return {"api_token": d.api_token, "employee_id": d.employee_id,
-            "employee_name": d.employee_name}
+            "employee_name": d.employee_name,
+            "token_expires_at": d.token_expires_at.isoformat()+"Z"}
 
 @router.post("/api/reg-nonce/{hostname}")
 async def create_reg_nonce(hostname: str, request: Request,
@@ -228,7 +260,7 @@ async def create_reg_nonce(hostname: str, request: Request,
     """
     import time as _tn
     client_ip = get_client_ip(request)
-    if not (client_ip.startswith("10.") or client_ip in ("127.0.0.1","::1","172.17.0.1")):
+    if not is_sky_network(client_ip):
         raise HTTPException(403, "Only accessible on Sky network.")
     existing = await db.get(Device, hostname)
     nonce = secrets.token_urlsafe(24)

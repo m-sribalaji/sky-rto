@@ -255,15 +255,52 @@ async def get_history(employee_id: str, month: str=None,
             "personal_leave_dates": leave_dates}
 
 @router.get("/api/anomalies")
-async def get_anomalies(request: Request, db: AsyncSession=Depends(get_db)):
-    await require_role(request, db, "manager")
+async def get_anomalies(team: str=None, request: Request=None, db: AsyncSession=Depends(get_db)):
+    caller_id = await require_role(request, db, "manager")
     q = await db.execute(select(AnomalyLog).where(
         AnomalyLog.resolved==False).order_by(desc(AnomalyLog.detected_at)))
+    rows = q.scalars().all()
+
+    # A manager restricted to specific teams shouldn't see anomalies for
+    # people outside those teams — this endpoint never actually checked
+    # that (it just required "manager or above" and returned everything
+    # org-wide). Some anomalies aren't attributable to any employee at all
+    # (e.g. token_enumeration is logged against a source IP, not a person)
+    # — those stay visible to every manager/admin since there's no team to
+    # scope them to.
+    managed = await get_managed_teams(caller_id, db)
+    if managed is not None or team:
+        emp_ids = {r.employee_id for r in rows if r.employee_id and r.employee_id != "unknown"}
+        dq = await db.execute(select(Device).where(Device.employee_id.in_(emp_ids)))
+        team_by_emp = {d.employee_id: d.team for d in dq.scalars().all()}
+        def _keep(r):
+            emp_team = team_by_emp.get(r.employee_id)
+            if emp_team is None:
+                return True  # not attributable to a device/team — always visible to managers+
+            if team and emp_team != team:
+                return False
+            if managed is not None and emp_team not in managed:
+                return False
+            return True
+        rows = [r for r in rows if _keep(r)]
+
     return {"anomalies": [{"id": r.id, "employee_id": r.employee_id,
                            "employee_name": r.employee_name, "type": r.anomaly_type,
                            "description": r.description, "severity": r.severity,
                            "detected_at": r.detected_at.isoformat()+"Z"}
-                          for r in q.scalars().all()]}
+                          for r in rows]}
+
+@router.patch("/api/anomalies/{anomaly_id}/resolve")
+async def resolve_anomaly(anomaly_id: int, request: Request, db: AsyncSession=Depends(get_db)):
+    """Mark an anomaly as reviewed so it drops off the active list.
+    Manager or above — same access level as viewing them."""
+    await require_role(request, db, "manager")
+    row = await db.get(AnomalyLog, anomaly_id)
+    if not row:
+        raise HTTPException(404, "Anomaly not found")
+    row.resolved = True
+    await db.commit()
+    return {"status": "resolved", "id": anomaly_id}
 
 @router.get("/api/team")
 async def get_team(request: Request=None, db: AsyncSession=Depends(get_db)):

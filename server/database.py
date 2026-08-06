@@ -21,6 +21,13 @@ class Device(Base):
     platform      = Column(String, nullable=True)
     registered_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
     api_token     = Column(String, nullable=True, index=True)  # per-device secret token
+    # Tokens used to live forever once issued. Now they carry an expiry so a
+    # leaked/misused one only stays valid for a bounded window instead of
+    # indefinitely. Nullable so existing devices from before this column
+    # existed aren't instantly locked out on deploy — deps.py backfills
+    # these the first time an old device successfully authenticates.
+    token_issued_at  = Column(DateTime, nullable=True)
+    token_expires_at = Column(DateTime, nullable=True)
 
 class Role(Base):
     """employee_id -> admin | manager | employee (default if not in table)"""

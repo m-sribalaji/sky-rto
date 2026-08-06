@@ -5,7 +5,6 @@ is the most security-sensitive router in the app (signal fabrication
 checks, WFO-on-leave detection) so it's kept tight and on its own.
 """
 import json
-import secrets
 import logging
 from datetime import datetime, timezone
 from fastapi import APIRouter, Request, HTTPException, Depends
@@ -13,13 +12,14 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, and_
 
 from database import get_db, Device, CheckIn, AnomalyLog, DaySegment, LeaveRequest, PublicHoliday
-from detection import classify
+from detection import verify_client_signals
 from segments import (
     dominant_status_from_segments, handle_checkin, get_open_segment,
     close_segment, open_new_segment, LEAVE_TYPES,
 )
 from deps import (
     get_client_ip, get_device_token, today_str, is_weekend, require_role,
+    verify_device_auth, verify_request_signature,
     NOTIFIER_AVAILABLE, notify_override_applied, LEVEL_ALL,
     _SERVER_WEBHOOK, _SERVER_URL,
 )
@@ -34,8 +34,17 @@ async def checkin(p: CheckInPayload, request: Request, db: AsyncSession = Depend
     device = await db.get(Device, p.hostname)
     if not device: return {"action": "register_first"}
     token = get_device_token(request)
-    if not token or not device.api_token or not secrets.compare_digest(token, device.api_token):
-        raise HTTPException(401, "Valid X-Device-Token header required.")
+    await verify_device_auth(device, token, db)
+    # This is the endpoint that produces "verified, high-confidence"
+    # attendance records, so it's the one place a signature is required on
+    # top of the bearer token — see deps.verify_request_signature for what
+    # that does and doesn't protect against. request.body() is safe to
+    # await here even though `p` was already parsed from it: Starlette
+    # caches the raw bytes on first read, so this returns the exact same
+    # bytes the client signed, not a re-serialized (and therefore
+    # signature-mismatching) copy.
+    raw_body = await request.body()
+    verify_request_signature(request, raw_body, device)
     today     = p.date if p.date else today_str()
     # Skip weekends
     if is_weekend(today):
@@ -43,39 +52,20 @@ async def checkin(p: CheckInPayload, request: Request, db: AsyncSession = Depend
         return {"action": "weekend_skip", "date": today}
     public_ip = get_client_ip(request)
 
-    # ── Signal integrity check ────────────────────────────────────────────
-    # Client supplies lan_ip, dns, vpn from its own network interfaces.
-    # Cross-validate: if client claims office LAN IP but is connecting from
-    # outside the Sky VPN range, the signals are fabricated — flag and override.
-    # A real office machine connects from 10.x.x.x (Sky VPN/LAN).
-    # A home machine connecting via VPN has public_ip = home ISP IP (non-10.x).
-    claimed_lan    = p.lan_ip or ""
-    lan_is_office  = claimed_lan.startswith("10.126.") or claimed_lan.startswith("10.128.")
-    conn_is_sky    = public_ip.startswith("10.") or public_ip in ("127.0.0.1", "::1")
-    fabricated_sig = lan_is_office and not conn_is_sky
-
-    if fabricated_sig:
-        # Client claims office LAN but is connecting from outside Sky network.
-        # This means the pending_queue.json was edited with fake office signals.
-        # Override all client signals — classify as WFH with flag.
-        logger.warning(
-            f"[SECURITY] Signal fabrication detected: {device.employee_id} "
-            f"claims lan={claimed_lan} but connecting from {public_ip}. "
-            f"Overriding to WFH and flagging."
-        )
-        from detection import DetectionResult
-        result = DetectionResult(
-            auto_status="wfh", confidence="high",
-            vpn_active=False, flagged=True,
-            flag_reason=f"Signal fabrication: claimed office LAN {claimed_lan} "
-                        f"but connected from {public_ip}. Recorded as WFH.",
-            detail=f"Fabricated office signals detected from {public_ip}.",
-        )
-    else:
-        result = classify(public_ip=public_ip, lan_ip=p.lan_ip,
-                         vpn_tunnel_ip=p.vpn_tunnel_ip, ssid=None,
-                         is_ethernet=p.is_ethernet,
-                         dns_servers=p.dns_servers, dns_domains=p.dns_domains)
+    # Cross-check what the client claims about its network against where the
+    # request actually came from — see detection.verify_client_signals for
+    # why (short version: catches a hand-edited offline queue file, or a
+    # hand-crafted request, claiming office LAN/DNS/VPN signals that don't
+    # match where the request actually originated from).
+    result = verify_client_signals(
+        public_ip=public_ip, lan_ip=p.lan_ip, vpn_tunnel_ip=p.vpn_tunnel_ip,
+        is_ethernet=p.is_ethernet, dns_servers=p.dns_servers, dns_domains=p.dns_domains)
+    if result.flagged and (result.flag_reason or "").startswith("Signal fabrication:"):
+        # result.flag_reason already names exactly which claim(s) were
+        # fabricated (LAN/DNS/VPN) — log that instead of assuming it was
+        # always the LAN IP, which stopped being true once the DNS/VPN
+        # claims got the same cross-check.
+        logger.warning(f"[SECURITY] {device.employee_id}: {result.flag_reason}")
 
     logger.info(f"CheckIn: {device.employee_id} lan={p.lan_ip} conn={public_ip} -> {result.auto_status}({result.confidence}){' [FLAGGED]' if result.flagged else ''}")
     if result.auto_status == "vpn_ambiguous":
@@ -176,8 +166,7 @@ async def confirm(p: ConfirmPayload, request: Request, db: AsyncSession = Depend
     device = await db.get(Device, p.hostname)
     if not device: raise HTTPException(404, "Not registered")
     token = get_device_token(request)
-    if not token or not device.api_token or not secrets.compare_digest(token, device.api_token):
-        raise HTTPException(401, "Valid X-Device-Token header required.")
+    await verify_device_auth(device, token, db)
     if p.declared_status not in ("wfo","wfh"): raise HTTPException(400, "must be wfo|wfh")
     today    = today_str()
     open_seg = await get_open_segment(device.employee_id, today, db)

@@ -15,6 +15,29 @@
   --sans:'Geist',-apple-system,sans-serif;
   --serif:'Instrument Serif',Georgia,serif;
 }
+/* Same Claude-light palette as rto-ui.css — see the comment there. */
+:root[data-theme="light"]{
+  --bg:#faf9f5;--bg1:#ffffff;--bg2:#f3f1ea;--bg3:#eae7de;--bg4:#e2ded2;
+  --b0:rgba(0,0,0,0.08);--b1:rgba(0,0,0,0.13);--b2:rgba(0,0,0,0.18);
+  --tx:#262624;--tx2:#6b6a66;--tx3:#a19e97;--tx4:#b8b5ac;
+  --acc:#bd5d3a;--accl:#9c4a28;--accg:rgba(189,93,58,0.10);
+  --green:#16a34a;--gbg:rgba(22,163,74,0.08);
+  --red:#dc2626;--rbg:rgba(220,38,38,0.08);
+  --blue:#2563eb;--bbg:rgba(37,99,235,0.08);
+  --amber:#d97706;--abg:rgba(217,119,6,0.08);
+}
+@media (prefers-color-scheme: light){
+  :root:not([data-theme="dark"]):not([data-theme="light"]){
+    --bg:#faf9f5;--bg1:#ffffff;--bg2:#f3f1ea;--bg3:#eae7de;--bg4:#e2ded2;
+    --b0:rgba(0,0,0,0.08);--b1:rgba(0,0,0,0.13);--b2:rgba(0,0,0,0.18);
+    --tx:#262624;--tx2:#6b6a66;--tx3:#a19e97;--tx4:#b8b5ac;
+    --acc:#bd5d3a;--accl:#9c4a28;--accg:rgba(189,93,58,0.10);
+    --green:#16a34a;--gbg:rgba(22,163,74,0.08);
+    --red:#dc2626;--rbg:rgba(220,38,38,0.08);
+    --blue:#2563eb;--bbg:rgba(37,99,235,0.08);
+    --amber:#d97706;--abg:rgba(217,119,6,0.08);
+  }
+}
 body{font-family:var(--sans);background:var(--bg);color:var(--tx);
      min-height:100vh;-webkit-font-smoothing:antialiased;display:flex;flex-direction:column;}
 

@@ -21,6 +21,7 @@ Configuration (in ~/.rto_tracker/config.json):
 """
 
 import json
+import re
 import logging
 import platform
 import subprocess
@@ -32,6 +33,21 @@ from pathlib import Path
 from typing import Optional
 
 logger = logging.getLogger("notifier")
+
+# Masks the last two octets of any IPv4 address before it goes out in a
+# Teams message — cards land in a channel that's visible to more people
+# than the compliance data itself normally is, so no reason to broadcast
+# someone's exact home/office IP there. First two octets are usually enough
+# for a manager to recognise "yeah that's the office range" without
+# exposing the specific address. Works as a blanket regex swap rather than
+# a strict IP parser, so it also catches IPs embedded in free-text
+# descriptions (flag_reason strings etc.), not just dedicated IP fields.
+_IP_RE = re.compile(r"\b(\d{1,3})\.(\d{1,3})\.\d{1,3}\.\d{1,3}\b")
+
+def _redact_ip(value):
+    if value is None:
+        return value
+    return _IP_RE.sub(r"\1.\2.X.X", str(value))
 
 # -- Notification levels -----------------------------------
 LEVEL_ALL       = "all"        # every event
@@ -128,7 +144,7 @@ def _build_card(event: str, title: str, body: str,
         },
         {
             "type": "TextBlock",
-            "text": body,
+            "text": _redact_ip(body),
             "wrap": True,
             "spacing": "Small",
         },
@@ -139,7 +155,7 @@ def _build_card(event: str, title: str, body: str,
         body_blocks.append({
             "type": "FactSet",
             "spacing": "Small",
-            "facts": [{"title": k, "value": v} for k, v in facts],
+            "facts": [{"title": k, "value": _redact_ip(v)} for k, v in facts],
         })
 
     # Timestamp

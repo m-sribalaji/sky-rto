@@ -7,6 +7,9 @@ home of its own.
 """
 import json
 import os
+import hmac
+import hashlib
+import time as _time
 import secrets
 import logging
 import pathlib as _pathlib
@@ -16,7 +19,7 @@ from fastapi import Request, HTTPException
 from slowapi import Limiter
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 
 from database import Device, Role
 
@@ -76,6 +79,101 @@ DEFAULT_TEAMS = [
 def generate_api_token() -> str:
     return secrets.token_urlsafe(32)
 
+# ── Token expiry / rotation ───────────────────────────────────────────────
+# Tokens used to be issued once and live forever. That meant a leaked or
+# misused token stayed valid indefinitely. TOKEN_TTL bounds that: a token
+# stops working this many days after it was (re)issued, full stop, no
+# matter how it's being used. TOKEN_RENEW_WINDOW is how early the client is
+# expected to proactively rotate before that happens, so a well-behaved
+# agent never actually hits the hard expiry in normal use — expiry is the
+# backstop for tokens that got separated from a well-behaved agent.
+TOKEN_TTL_DAYS          = 90
+TOKEN_RENEW_WINDOW_DAYS = 14
+
+def _utcnow() -> datetime:
+    # Naive UTC on purpose — SQLite has no real timezone-aware datetime
+    # type, so values round-trip through the DB as naive. Comparing a
+    # timezone-aware "now" against a naive DB value throws; keeping
+    # everything naive-but-UTC here avoids that mismatch everywhere a token
+    # expiry gets checked.
+    return datetime.utcnow()
+
+def issue_token_expiry() -> tuple[datetime, datetime]:
+    now = _utcnow()
+    return now, now + timedelta(days=TOKEN_TTL_DAYS)
+
+async def verify_device_auth(device: Device | None, token: str | None, db: AsyncSession) -> None:
+    """
+    The one place that decides "is this token good enough to act as this
+    device" — used everywhere X-Device-Token shows up. Checks the token
+    value itself, then whether it's still within its validity window.
+    Devices registered before token expiry existed have no expiry set yet;
+    rather than lock out the whole existing user base the moment this
+    ships, the first time one of those older tokens is used successfully
+    we quietly start its expiry clock from now. Every token gets a real
+    expiry either way, just not a retroactive one that logs everyone out
+    on deploy day.
+    """
+    if not token or not device or not device.api_token or not secrets.compare_digest(token, device.api_token):
+        raise HTTPException(401, "Valid X-Device-Token header required.")
+    if device.token_expires_at is not None and _utcnow() > device.token_expires_at:
+        raise HTTPException(
+            401,
+            "Device token expired. Reconnect to the Sky network and let the "
+            "agent renew its token, or re-run registration.",
+            headers={"X-Token-Expired": "true"},
+        )
+    if device.token_issued_at is None or device.token_expires_at is None:
+        device.token_issued_at, device.token_expires_at = issue_token_expiry()
+        await db.commit()
+
+# ── Request signing (HMAC) ────────────────────────────────────────────────
+# Bearer-token auth alone doesn't prove a request's body wasn't tampered
+# with in flight, and doesn't stop a captured request being replayed later.
+# For /api/checkin specifically (the one endpoint whose whole job is
+# recording "verified, high-confidence" signals) the agent signs each
+# request with a key derived from its own device token, over the exact
+# request body plus a timestamp and one-time nonce. This does NOT stop the
+# device's legitimate owner from signing a request they fabricated
+# themselves — nothing can, short of hardware attestation — but it does
+# stop a captured request from being edited or replayed by anyone who
+# doesn't hold the token, which a bare bearer token alone doesn't.
+SIGNATURE_FRESHNESS_SECONDS = 300  # 5 minutes — generous for clock drift, tight enough to bound replay
+
+_seen_nonces: dict[str, float] = {}  # "hostname:nonce" -> expiry epoch, purged lazily
+
+def _purge_expired_nonces(now: float) -> None:
+    expired = [k for k, exp in _seen_nonces.items() if exp < now]
+    for k in expired:
+        _seen_nonces.pop(k, None)
+
+def verify_request_signature(request: Request, raw_body: bytes, device: Device) -> None:
+    sig       = request.headers.get("X-Signature")
+    ts_header = request.headers.get("X-Timestamp")
+    nonce     = request.headers.get("X-Nonce")
+    if not sig or not ts_header or not nonce:
+        raise HTTPException(401, "Request signature required.")
+    try:
+        ts = int(ts_header)
+    except ValueError:
+        raise HTTPException(401, "Invalid request timestamp.")
+
+    now = _time.time()
+    if abs(now - ts) > SIGNATURE_FRESHNESS_SECONDS:
+        raise HTTPException(401, "Request timestamp outside allowed window — check the agent's clock.")
+
+    _purge_expired_nonces(now)
+    nonce_key = f"{device.hostname}:{nonce}"
+    if nonce_key in _seen_nonces:
+        raise HTTPException(401, "Request already used (replay detected).")
+
+    message  = f"{ts_header}.{nonce}.".encode() + raw_body
+    expected = hmac.new(device.api_token.encode(), message, hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(expected, sig):
+        raise HTTPException(401, "Invalid request signature.")
+
+    _seen_nonces[nonce_key] = now + SIGNATURE_FRESHNESS_SECONDS
+
 # ── Rate limiting ──────────────────────────────────────────────────────────
 # Protects credential-issuance and self-declared-attendance endpoints from
 # enumeration/abuse. Keyed by the SAME client-IP resolution the rest of the
@@ -94,6 +192,13 @@ limiter = Limiter(key_func=_limiter_key, key_style="endpoint")
 def get_client_ip(r: Request) -> str:
     xff = r.headers.get("X-Forwarded-For")
     return xff.split(",")[0].strip() if xff else r.client.host
+
+def is_sky_network(client_ip: str) -> bool:
+    """Same "are you actually on our network" check several pre-auth
+    endpoints use (registration, token issuance, nonce creation...) — pulled
+    out to one place instead of copy-pasted at each call site, so the
+    trusted-IP definition can't quietly drift between them."""
+    return client_ip.startswith("10.") or client_ip in ("127.0.0.1", "::1", "172.17.0.1")
 
 def today_str() -> str:
     return date.today().isoformat()
@@ -143,8 +248,7 @@ async def require_role(request: Request, db: AsyncSession,
         raise HTTPException(401, "X-Employee-Id and X-Device-Token headers required.")
     q = await db.execute(select(Device).where(Device.employee_id == header_eid))
     device = q.scalars().first()
-    if not device or not device.api_token or not secrets.compare_digest(token, device.api_token):
-        raise HTTPException(401, "Invalid token.")
+    await verify_device_auth(device, token, db)
     # If caller_id provided (e.g. from body), it must match the authenticated header identity
     if caller_id and caller_id != header_eid:
         raise HTTPException(403, "Caller ID mismatch — cannot act on behalf of another user.")
@@ -162,8 +266,7 @@ async def require_registered_caller(request: Request, db: AsyncSession):
     if not device:
         raise HTTPException(404, "Not registered")
     token = get_device_token(request)
-    if not token or not device.api_token or not secrets.compare_digest(token, device.api_token):
-        raise HTTPException(401, "Valid X-Device-Token header required.")
+    await verify_device_auth(device, token, db)
     return device
 
 async def get_caller_context(request: Request, db: AsyncSession):

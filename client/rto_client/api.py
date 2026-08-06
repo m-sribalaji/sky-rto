@@ -7,6 +7,10 @@ all boil down to "reach outside this process."
 """
 
 import json
+import time
+import hmac
+import hashlib
+import secrets
 import subprocess
 import webbrowser
 import urllib.request
@@ -15,11 +19,34 @@ import urllib.error
 from .config import logger, IS_MAC, IS_WIN, _NO_WIN
 
 
-def api_post(url, payload, timeout=10, auth_headers: dict = None, return_status: bool = False):
+def _sign_request(sign_key: str, body: bytes) -> dict:
+    """
+    Build the X-Signature/X-Timestamp/X-Nonce headers the server checks in
+    deps.verify_request_signature — see that function's docstring for what
+    this does and doesn't protect against. The important part here: the
+    bytes we sign have to be byte-for-byte identical to what actually goes
+    out over the wire, so this is computed from the exact same `data` the
+    caller already serialized, not re-encoded from the payload dict (which
+    could reorder keys and produce a different signature than the request
+    the server actually receives).
+    """
+    ts    = str(int(time.time()))
+    nonce = secrets.token_hex(8)
+    message = f"{ts}.{nonce}.".encode() + body
+    sig = hmac.new(sign_key.encode(), message, hashlib.sha256).hexdigest()
+    return {"X-Timestamp": ts, "X-Nonce": nonce, "X-Signature": sig}
+
+
+def api_post(url, payload, timeout=10, auth_headers: dict = None, return_status: bool = False,
+             sign_key: str = None):
     """
     POST JSON. Returns parsed response dict on success.
     If return_status=True, returns (response_or_None, http_status_or_None) instead —
     lets callers distinguish "denied" (403) from "unreachable" (timeout/network error).
+    Pass sign_key (the device token) for endpoints that require a signed
+    request — currently just /api/checkin. Leave it out for everything else;
+    signing only makes sense once a device has a token to sign with, and
+    only matters for the endpoint that produces "verified" attendance data.
     """
     try:
         data = json.dumps(payload).encode()
@@ -31,6 +58,8 @@ def api_post(url, payload, timeout=10, auth_headers: dict = None, return_status:
         }
         if auth_headers:
             hdrs.update(auth_headers)
+        if sign_key:
+            hdrs.update(_sign_request(sign_key, data))
         req  = urllib.request.Request(url, data=data,
                    headers=hdrs, method="POST")
         with urllib.request.urlopen(req, timeout=timeout) as r:

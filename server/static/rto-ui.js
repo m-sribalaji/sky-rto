@@ -78,6 +78,14 @@ async function del(p,b={}){
     return{ok:r.ok,data:await r.json()};
   }catch(e){return{ok:false,data:{}};}
 }
+async function patch(p,b={}){
+  try{
+    const r=await fetch(API+p,{method:'PATCH',
+      headers:{'Content-Type':'application/json','X-Employee-Id':MY_ID||'','X-Device-Token':MY_TOKEN||''},
+      body:JSON.stringify(b)});
+    return{ok:r.ok,data:await r.json()};
+  }catch(e){return{ok:false,data:{}};}
+}
 function renderSplitLabel(label){
   if(!label) return '';
   const parts = label.split(' → ');
@@ -102,7 +110,12 @@ function splitLabelForDisplay(label){
   // Remove " HH:MM" tokens — e.g. "WFH 07:21 → WFO 08:57" → "WFH → WFO"
   return label.replace(/\s+\d{2}:\d{2}/g, '');
 }
-function fmt(d){if(!d)return'-';return new Date(d).toLocaleTimeString('en-IN',{hour:'2-digit',minute:'2-digit',hour12:false,timeZone:'Asia/Kolkata'});}
+function fmt(d){if(!d)return'-';return new Date(d).toLocaleTimeString('en-IN',{hour:'numeric',minute:'2-digit',hour12:true,timeZone:'Asia/Kolkata'});}
+// Masks the last two octets of any IPv4 address it finds — works on a bare
+// IP string ("192.168.1.2" -> "192.168.X.X") and on free text that happens
+// to have one embedded in it (anomaly/flag descriptions), since it's just
+// a regex swap, not a strict field parser.
+function redactIp(s){if(s==null)return s;return String(s).replace(/\b(\d{1,3})\.(\d{1,3})\.\d{1,3}\.\d{1,3}\b/g,'$1.$2.X.X');}
 function colorFor(id){const C=['#7c3aed','#2563eb','#059669','#d97706','#dc2626','#0891b2','#db2777'];let h=0;for(const c of(id||''))h=(h*31+c.charCodeAt(0))%C.length;return C[h];}
 function iniOf(n){return(n||'?').split(' ').map(w=>w[0]).join('').slice(0,2).toUpperCase();}
 function chipS(s,sl){
@@ -479,7 +492,7 @@ async function loadDashboard(){
     document.getElementById('dash-tbody').innerHTML=visibleCheckins.length
       ?visibleCheckins.map(c=>{const color=colorFor(c.employee_id),ini=iniOf(c.employee_name);
         const status=c.display_status||c.status;
-        return`<tr><td><div style="display:flex;align-items:center;gap:9px"><div style="width:26px;height:26px;border-radius:50%;background:${color};display:flex;align-items:center;justify-content:center;font-size:9px;font-weight:600;color:#fff">${ini}</div><div><div style="font-size:12px;font-weight:500">${c.employee_name}</div><div style="font-family:var(--mono);font-size:10px;color:var(--tx3)">${c.employee_id}</div></div></div></td><td><div style="display:inline-flex;align-items:center;gap:6px;flex-wrap:wrap">${chipS(status,c.split_label)}${renderSplitLabel(c.split_label)}</div></td><td><code style="font-size:10px;background:var(--bg2);padding:2px 6px;border-radius:4px">${c.lan_ip||'-'}</code></td><td style="font-family:var(--mono);font-size:10px;color:${c.vpn_active?'var(--amber)':'var(--tx3)'}">${c.vpn_active?'<span style="color:var(--amber);display:inline-flex;align-items:center;gap:3px">' + svgI('lock',11) + ' On</span>':'<span style="color:var(--tx3)">Off</span>'}</td><td>${chipC(c.confidence)}</td><td style="font-family:var(--mono);font-size:10px;color:var(--tx3)">${fmt(c.timestamp)}</td></tr>`;
+        return`<tr><td><div style="display:flex;align-items:center;gap:9px"><div style="width:26px;height:26px;border-radius:50%;background:${color};display:flex;align-items:center;justify-content:center;font-size:9px;font-weight:600;color:#fff">${ini}</div><div><div style="font-size:12px;font-weight:500">${c.employee_name}</div><div style="font-family:var(--mono);font-size:10px;color:var(--tx3)">${c.employee_id}</div></div></div></td><td><div style="display:inline-flex;align-items:center;gap:6px;flex-wrap:wrap">${chipS(status,c.split_label)}${renderSplitLabel(c.split_label)}</div></td><td><code style="font-size:10px;background:var(--bg2);padding:2px 6px;border-radius:4px">${redactIp(c.lan_ip)||'-'}</code></td><td style="font-family:var(--mono);font-size:10px;color:${c.vpn_active?'var(--amber)':'var(--tx3)'}">${c.vpn_active?'<span style="color:var(--amber);display:inline-flex;align-items:center;gap:3px">' + svgI('lock',11) + ' On</span>':'<span style="color:var(--tx3)">Off</span>'}</td><td>${chipC(c.confidence)}</td><td style="font-family:var(--mono);font-size:10px;color:var(--tx3)">${fmt(c.timestamp)}</td></tr>`;
       }).join('')
       :'<tr><td colspan="6" style="text-align:center;color:var(--tx3);padding:24px;font-family:var(--mono);font-size:11px">No check-ins today yet.</td></tr>';
     reIcons();
@@ -506,7 +519,7 @@ async function loadToday(){
     const color=colorFor(c.employee_id),ini=iniOf(c.employee_name);
     const status=c.display_status||c.status; // split for pill, dominant for compliance
     const leaveHtml=(c.leaves||[]).map(l=>`<div class="leave-tag">${svgI(LEAVE_TYPES[l.leave_type]?.icon||'calendar')} ${l.label}</div>`).join('');
-    return`<div class="person-card${c.flagged?' flagged':''}"><div class="pc-top"><div class="pc-ava" style="background:${color}">${ini}</div><div><div class="pc-name">${c.employee_name}</div><div class="pc-id">${c.employee_id}</div></div></div><div style="display:flex;flex-direction:column;align-items:flex-start;gap:4px;margin-top:4px">${chipS(status,c.split_label)}${renderSplitLabel(c.split_label)}</div>${leaveHtml}<div style="font-family:var(--mono);font-size:10px;color:var(--tx3)">${c.lan_ip||'-'}</div></div>`;
+    return`<div class="person-card${c.flagged?' flagged':''}"><div class="pc-top"><div class="pc-ava" style="background:${color}">${ini}</div><div><div class="pc-name">${c.employee_name}</div><div class="pc-id">${c.employee_id}</div></div></div><div style="display:flex;flex-direction:column;align-items:flex-start;gap:4px;margin-top:4px">${chipS(status,c.split_label)}${renderSplitLabel(c.split_label)}</div>${leaveHtml}<div style="font-family:var(--mono);font-size:10px;color:var(--tx3)">${redactIp(c.lan_ip)||'-'}</div></div>`;
   }).join('');
   reIcons();
 }
@@ -525,7 +538,7 @@ async function loadMyStatus(){
       <div style="display:inline-flex;align-items:center;gap:6px;flex-wrap:wrap;margin-bottom:6px">
         ${chipS(s, me.split_label)}${renderSplitLabel(me.split_label)}
       </div>
-      <div style="font-family:var(--mono);font-size:10px;color:var(--tx3);margin-bottom:6px">LAN: ${me.lan_ip||'-'} &middot; ${fmt(me.timestamp)}</div>
+      <div style="font-family:var(--mono);font-size:10px;color:var(--tx3);margin-bottom:6px">LAN: ${redactIp(me.lan_ip)||'-'} &middot; ${fmt(me.timestamp)}</div>
       <div>${chipC(me.confidence)}</div>`;
   }else{el.innerHTML=`<div style="color:var(--tx3);font-family:var(--mono);font-size:12px;padding:16px 0">No check-in recorded today yet.</div>`;}
   buildLeaveApplyForm();
@@ -1069,9 +1082,48 @@ async function loadAnomalies(){
   const flagged=today?.checkins?.filter(c=>c.flagged)||[];
   document.getElementById('flag-count').textContent=`${flagged.length} records`;
   document.getElementById('flagged-list').innerHTML=flagged.length
+    // Anomalies is manager/admin-only (see buildNav — the nav item itself
+    // only renders for isMgr), so unlike the general Today/history views,
+    // this one deliberately shows the real, unredacted flag_reason — the
+    // whole point of this panel is investigating exactly what was flagged.
     ?flagged.map(c=>`<div style="display:flex;align-items:center;gap:12px;padding:12px 14px;background:var(--bg2);border:1px solid var(--b0);border-left:3px solid var(--red);border-radius:7px;margin-bottom:8px"><div style="width:30px;height:30px;border-radius:50%;background:${colorFor(c.employee_id)};display:flex;align-items:center;justify-content:center;font-size:10px;font-weight:600;color:#fff">${iniOf(c.employee_name)}</div><div style="flex:1"><div style="font-size:12px;font-weight:500">${c.employee_name} <span style="font-family:var(--mono);font-size:10px;color:var(--tx3)">${c.employee_id}</span></div><div style="font-family:var(--mono);font-size:10px;color:var(--tx3)">${c.flag_reason||'Flagged record'}</div></div><span style="font-family:var(--mono);font-size:11px;color:var(--accl);cursor:pointer;text-decoration:underline" onclick="nav('override')">Override →</span></div>`).join('')
     :'<div style="color:var(--tx3);font-family:var(--mono);font-size:11px;padding:8px 0">No flagged records today.</div>';
+
+  // The real audit trail — everything anomaly-worthy the server has ever
+  // logged (signal fabrication, unverified WFO claims, token enumeration,
+  // WFO-while-on-leave, mismatched missed-day claims...), not just today's
+  // flagged check-ins. This used to only exist in the raw admin table
+  // browser; wiring it in here so managers/admins actually see it without
+  // digging through /admin.
+  const anomalies = await get('/api/anomalies'+tp.replace('&','?')) || {anomalies:[]};
+  const list = anomalies.anomalies || [];
+  document.getElementById('anomaly-count').textContent = `${list.length} active`;
+  document.getElementById('anomaly-list').innerHTML = list.length
+    ? list.map(a=>{
+        const sevColor = a.severity==='high' ? 'var(--red)' : a.severity==='medium' ? 'var(--amber)' : 'var(--tx3)';
+        const sevBg    = a.severity==='high' ? 'var(--rbg)' : a.severity==='medium' ? 'rgba(193,123,63,0.12)' : 'var(--bg2)';
+        const typeLabel = (a.type||'').replace(/_/g,' ').replace(/\b\w/g, ch=>ch.toUpperCase());
+        return `<div style="display:flex;align-items:flex-start;gap:12px;padding:12px 14px;background:var(--bg2);border:1px solid var(--b0);border-left:3px solid ${sevColor};border-radius:7px;margin-bottom:8px">
+          <div style="flex:1">
+            <div style="display:flex;align-items:center;gap:8px;margin-bottom:4px">
+              <span style="font-family:var(--mono);font-size:9px;padding:2px 7px;border-radius:10px;background:${sevBg};color:${sevColor}">${(a.severity||'').toUpperCase()}</span>
+              <span style="font-size:12px;font-weight:500">${typeLabel}</span>
+              ${a.employee_name?`<span style="font-family:var(--mono);font-size:10px;color:var(--tx3)">${a.employee_name}${a.employee_id&&a.employee_id!=='unknown'?' · '+a.employee_id:''}</span>`:''}
+            </div>
+            <div style="font-family:var(--mono);font-size:10px;color:var(--tx3)">${a.description||''}</div>
+            <div style="font-family:var(--mono);font-size:9px;color:var(--tx3);margin-top:4px">${fmt(a.detected_at)}</div>
+          </div>
+          <span style="font-family:var(--mono);font-size:11px;color:var(--accl);cursor:pointer;text-decoration:underline;white-space:nowrap" onclick="resolveAnomaly(${a.id})">Resolve</span>
+        </div>`;
+      }).join('')
+    : '<div style="color:var(--tx3);font-family:var(--mono);font-size:11px;padding:8px 0">No active anomalies.</div>';
+
   reIcons();
+}
+
+async function resolveAnomaly(id){
+  const r = await patch(`/api/anomalies/${id}/resolve`);
+  if(r.ok) loadAnomalies();
 }
 
 // -- OVERRIDE ------------------------------------------

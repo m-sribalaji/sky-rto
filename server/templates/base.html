@@ -6,6 +6,14 @@
 <title>{% block title %}RTO Tracker{% endblock %}</title>
 <link rel="icon" type="image/png" href="/static/sky-logo.png"/>
 <script src="https://cdn.jsdelivr.net/npm/lucide@latest/dist/umd/lucide.min.js"></script>
+<script>
+// Has to run here, synchronously, before the stylesheet below paints
+// anything — reading localStorage and setting data-theme after the page
+// has already rendered in the wrong theme would flash. The rest of the
+// theme switcher (the actual toggle UI) loads later via theme.js since
+// that part doesn't need to block paint.
+(function(){var t=localStorage.getItem('_sk_theme');if(t==='light'||t==='dark')document.documentElement.setAttribute('data-theme',t);})();
+</script>
 <style>
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
 :root{
@@ -18,6 +26,29 @@
   --amber:#fbbf24;--abg:rgba(251,191,36,0.08);
   --red:#f87171;--rbg:rgba(248,113,113,0.08);
   --mono:'Geist Mono',monospace;--sans:-apple-system,sans-serif;
+}
+/* Same Claude-light palette as the dashboard/admin pages — see rto-ui.css. */
+:root[data-theme="light"]{
+  --bg:#faf9f5;--bg1:#ffffff;--bg2:#f3f1ea;--bg3:#eae7de;
+  --b0:rgba(0,0,0,0.08);--b1:rgba(0,0,0,0.14);
+  --tx:#262624;--tx2:#6b6a66;--tx3:#a19e97;
+  --acc:#bd5d3a;--accl:#9c4a28;--accg:rgba(189,93,58,0.10);
+  --green:#16a34a;--gbg:rgba(22,163,74,0.08);
+  --blue:#2563eb;--bbg:rgba(37,99,235,0.08);
+  --amber:#d97706;--abg:rgba(217,119,6,0.08);
+  --red:#dc2626;--rbg:rgba(220,38,38,0.08);
+}
+@media (prefers-color-scheme: light){
+  :root:not([data-theme="dark"]):not([data-theme="light"]){
+    --bg:#faf9f5;--bg1:#ffffff;--bg2:#f3f1ea;--bg3:#eae7de;
+    --b0:rgba(0,0,0,0.08);--b1:rgba(0,0,0,0.14);
+    --tx:#262624;--tx2:#6b6a66;--tx3:#a19e97;
+    --acc:#bd5d3a;--accl:#9c4a28;--accg:rgba(189,93,58,0.10);
+    --green:#16a34a;--gbg:rgba(22,163,74,0.08);
+    --blue:#2563eb;--bbg:rgba(37,99,235,0.08);
+    --amber:#d97706;--abg:rgba(217,119,6,0.08);
+    --red:#dc2626;--rbg:rgba(220,38,38,0.08);
+  }
 }
 body{font-family:var(--sans);background:var(--bg);color:var(--tx);
      min-height:100vh;display:flex;align-items:center;justify-content:center;
@@ -84,8 +115,10 @@ input::placeholder{color:var(--tx3);}
 </style>
 </head>
 <body>
+<div data-theme-toggle></div>
 {% block body %}{% endblock %}
 <script>lucide.createIcons();</script>
+<script src="/static/theme.js"></script>
 {% block script %}{% endblock %}
 </body>
 </html>

@@ -24,7 +24,8 @@
   </div>
   <div class="field">
     <label>Employee ID</label>
-    <input type="text" id="eid" placeholder="Enter employee ID"/>
+    <input type="text" id="eid" placeholder="Enter employee ID (ex abc123)"/>
+    <div id="eid-err" style="display:none;color:var(--red);font-size:11px;font-family:var(--mono);margin-top:2px">Please enter proper employee NTID (ex abc123)</div>
   </div>
   <div class="field">
     <label>Team</label>
@@ -67,11 +68,20 @@
   }
 })();
 
+// Sky's NTID format: exactly 3 letters then 3 digits, e.g. "abc123".
+// Mirrors the same check the server does in schemas.py — this one's just
+// for instant feedback without a round trip; the server is what actually
+// enforces it, so someone can't bypass this by hand-crafting a request.
+const NTID_RE = /^[A-Za-z]{3}\d{3}$/;
+
 async function register() {
   const nm  = document.getElementById('nm').value.trim();
   const eid = document.getElementById('eid').value.trim();
   const tm  = document.getElementById('tm').value.trim();
+  const eidErr = document.getElementById('eid-err');
   if (!nm || !eid) { alert('Name and Employee ID are required.'); return; }
+  if (!NTID_RE.test(eid)) { eidErr.style.display = 'block'; return; }
+  eidErr.style.display = 'none';
   const btn = document.getElementById('reg-btn');
   btn.innerHTML = '<i data-lucide="loader"></i> Registering...';
   lucide.createIcons();
@@ -85,6 +95,17 @@ async function register() {
                              employee_id: eid, team: tm, platform: plt, nonce: nonce })
     });
     const data = await resp.json();
+    if (!resp.ok) {
+      // e.g. the server rejecting a malformed NTID the client-side check
+      // somehow missed, or a stale/expired nonce — show the real reason
+      // instead of quietly claiming success like this used to.
+      const msg = (data.detail && data.detail[0] && data.detail[0].msg) ||
+                  data.detail || 'Registration failed - try again.';
+      btn.innerHTML = '<i data-lucide="x-circle"></i> ' + msg.replace(/^Value error,\s*/, '');
+      btn.className = 'btn';
+      lucide.createIcons();
+      return;
+    }
     localStorage.setItem('_sk_ei', eid);
     localStorage.setItem('_sk_host', '{{ hostname }}');
     if (data.api_token) localStorage.setItem('_sk_dt', data.api_token);

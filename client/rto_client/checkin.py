@@ -213,7 +213,7 @@ def run_checkin(force: bool = False):
         # Missed day check (once per day)
         check_missed_yesterday(server, hostname, cfg, today)
 
-        response = api_post(f"{server}/api/checkin", payload, auth_headers=_get_auth_headers(cfg))
+        response = api_post(f"{server}/api/checkin", payload, auth_headers=_get_auth_headers(cfg), sign_key=cfg.get("device_token"))
         if not response:
             logger.error("[FAIL] Check-in POST failed - queuing for retry")
             if local_class in ("wfo", "wfh"):
@@ -252,7 +252,7 @@ def run_checkin(force: bool = False):
             existing_status = response.get("status")
             if local_class in ("wfo", "wfh") and existing_status != local_class and force:
                 force_payload = {**payload, "force_update": True}
-                resp2 = api_post(f"{server}/api/checkin", force_payload, auth_headers=_get_auth_headers(cfg))
+                resp2 = api_post(f"{server}/api/checkin", force_payload, auth_headers=_get_auth_headers(cfg), sign_key=cfg.get("device_token"))
                 if resp2 and resp2.get("action") == "ok":
                     status = resp2.get("status")
                     logger.info(f"[OK] Status updated: {status}")

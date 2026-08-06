@@ -61,7 +61,7 @@ def flush_queue(server: str, cfg: dict = None) -> tuple:
             if _dt.strptime(date_str, "%Y-%m-%d").weekday() >= 5:
                 synced.append(payload); continue
         except Exception: pass
-        resp = api_post(f"{server}/api/checkin", payload, auth_headers=_get_auth_headers(cfg))
+        resp = api_post(f"{server}/api/checkin", payload, auth_headers=_get_auth_headers(cfg), sign_key=cfg.get("device_token"))
         if resp and resp.get("action") in ("ok", "already_checked_in",
                                             "confirm_needed", "override_locked",
                                             "leave_recorded"):

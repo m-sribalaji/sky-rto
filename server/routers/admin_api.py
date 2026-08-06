@@ -15,6 +15,20 @@ from deps import require_role
 router = APIRouter()
 logger = logging.getLogger("rto")
 
+# Every other endpoint in this app goes out of its way to never hand back
+# api_token in a response — /api/device/{hostname} even says so in its own
+# docstring. This generic browser reads every column off the model via
+# reflection, which quietly walked straight past that rule: any admin
+# opening the Devices table could read every employee's live bearer token
+# and impersonate their agent from then on. Redact it the same way here —
+# enough left visible to recognise which token you're looking at, not
+# enough to reuse it.
+def _redact(table_name: str, field: str, value):
+    if table_name == "devices" and field == "api_token" and value:
+        s = str(value)
+        return s[:4] + "…redacted…" + s[-4:] if len(s) > 8 else "…redacted…"
+    return value
+
 @router.get("/api/admin/tables")
 async def admin_tables(request: Request, db: AsyncSession = Depends(get_db)):
     """Return row counts for all tables."""
@@ -76,7 +90,7 @@ async def admin_table_data(
             val = getattr(r, col, None)
             if hasattr(val, "isoformat"):
                 val = val.isoformat()
-            d[col] = val
+            d[col] = _redact(table_name, col, val)
         return d
 
     return {"table": table_name, "columns": cols, "rows": [row_to_dict(r) for r in rows],

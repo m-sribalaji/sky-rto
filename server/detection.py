@@ -186,6 +186,62 @@ def classify(
     )
 
 
+def verify_client_signals(
+    public_ip:     str,
+    lan_ip:        str | None,
+    vpn_tunnel_ip: str | None,
+    is_ethernet:   bool,
+    dns_servers:   list | None,
+    dns_domains:   list | None,
+) -> DetectionResult:
+    """
+    The one place that turns "here's what the client claims about its
+    network" into "here's what we actually trust". Used by both the live
+    /api/checkin path and the /api/missed backfill path (when someone
+    submits cached signals from a day they were offline) — anywhere a
+    client hands us lan_ip/dns/vpn info, it should go through here rather
+    than being taken at face value.
+
+    The check that matters: a real office machine's requests — whether
+    they're actually on the office LAN, or connected in over Sky's VPN —
+    arrive from Sky's own network (public_ip starts with 10.x, or is
+    localhost during dev; that's the same address space a genuine VPN
+    tunnel egresses through). So ANY claim that implies "I'm at the office"
+    — an office LAN IP, office DNS servers, or a VPN tunnel address —
+    needs that same real-network origin to back it up. This used to only
+    check the LAN IP claim, which meant dns_servers and vpn_tunnel_ip were
+    trusted purely on the client's word — someone at home could claim
+    dns_servers=["10.126.63.5"] (no LAN IP needed at all) and get a fully
+    "verified" WFO record with zero real corroboration. All three claims
+    go through the same check now.
+    """
+    claimed_lan     = lan_ip or ""
+    lan_is_office    = claimed_lan.startswith("10.126.") or claimed_lan.startswith("10.128.")
+    dns_claims_office = dns_is_office(dns_servers or [], dns_domains or [])
+    vpn_claimed       = bool(vpn_tunnel_ip)
+    conn_is_sky      = public_ip.startswith("10.") or public_ip in ("127.0.0.1", "::1")
+
+    fabricated_sig = (lan_is_office or dns_claims_office or vpn_claimed) and not conn_is_sky
+
+    if fabricated_sig:
+        claims = []
+        if lan_is_office:      claims.append(f"office LAN {claimed_lan}")
+        if dns_claims_office:  claims.append(f"office DNS {dns_servers}")
+        if vpn_claimed:        claims.append(f"VPN tunnel {vpn_tunnel_ip}")
+        claim_desc = " + ".join(claims)
+        return DetectionResult(
+            auto_status="wfh", confidence="high",
+            vpn_active=False, flagged=True,
+            flag_reason=f"Signal fabrication: claimed {claim_desc} "
+                        f"but connected from {public_ip}. Recorded as WFH.",
+            detail=f"Fabricated office signals detected from {public_ip}.",
+        )
+    return classify(public_ip=public_ip, lan_ip=lan_ip,
+                     vpn_tunnel_ip=vpn_tunnel_ip, ssid=None,
+                     is_ethernet=is_ethernet,
+                     dns_servers=dns_servers, dns_domains=dns_domains)
+
+
 def score_declaration(declared: str, result: DetectionResult,
                        lan_ip: str | None) -> tuple:
     """Score a user's VPN self-declaration against detected signals."""
