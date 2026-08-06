@@ -15,7 +15,7 @@ RUN ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone
 ENV TEAMS_WEBHOOK=""
 ENV SERVER_URL=""
 
-COPY requirements.txt .
+COPY server/requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Build context is the repo root (see docker-compose.yml) so notifier.py
