@@ -1,6 +1,13 @@
 """
 notifier.py - RTO Tracker Teams + Desktop notification module
 
+This used to be duplicated as server/notifier.py and client/notifier.py,
+two byte-identical files that would inevitably drift apart. It now lives
+here in shared/ so both the server and the PyInstaller-built client agent
+import the same code. See server/main.py and client/checkin_core.py for
+how each side adds this directory to sys.path, and build.sh for how the
+client binary bundles it.
+
 Supports two notification channels:
   1. Microsoft Teams  - via Incoming Webhook (no API/admin needed)
   2. Desktop          - via platform-native notification (existing notify())

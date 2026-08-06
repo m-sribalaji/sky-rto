@@ -24,6 +24,7 @@ set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CLIENT_DIR="$SCRIPT_DIR/client"
+SHARED_DIR="$SCRIPT_DIR/shared"
 INSTALLER_DIR="$SCRIPT_DIR/scripts"
 DIST_DIR="$SCRIPT_DIR/dist"
 
@@ -88,6 +89,16 @@ if [ ! -f "$CLIENT_DIR/checkin_core.py" ]; then
     exit 1
 fi
 
+if [ ! -d "$CLIENT_DIR/rto_client" ]; then
+    echo "  [FAIL] client/rto_client package not found at $CLIENT_DIR"
+    exit 1
+fi
+
+if [ ! -f "$SHARED_DIR/notifier.py" ]; then
+    echo "  [FAIL] shared/notifier.py not found at $SHARED_DIR"
+    exit 1
+fi
+
 if [ ! -f "$INSTALLER_DIR/rto_agent_mac.py" ] && [ "$IS_MAC" = true ]; then
     echo "  [FAIL] scripts/rto_agent_mac.py not found at $INSTALLER_DIR"
     exit 1
@@ -108,11 +119,22 @@ COMMON_FLAGS=(
     --distpath "$DIST_DIR"
     --workpath "$SCRIPT_DIR/build"
     --specpath "$SCRIPT_DIR/build"
-    # Bundle checkin_core and notifier alongside the agent
+    # Bundle checkin_core, the rto_client package, and notifier alongside the agent
     --add-data "$CLIENT_DIR/checkin_core.py:."
-    --add-data "$CLIENT_DIR/notifier.py:."
+    --add-data "$CLIENT_DIR/rto_client:rto_client"
+    --add-data "$SHARED_DIR/notifier.py:."
     # Hidden imports that PyInstaller may miss
     --hidden-import=checkin_core
+    --hidden-import=rto_client
+    --hidden-import=rto_client.config
+    --hidden-import=rto_client.network
+    --hidden-import=rto_client.classify
+    --hidden-import=rto_client.queue
+    --hidden-import=rto_client.api
+    --hidden-import=rto_client.lock
+    --hidden-import=rto_client.update
+    --hidden-import=rto_client.missed
+    --hidden-import=rto_client.checkin
     --hidden-import=notifier
     --hidden-import=platform
     --hidden-import=ipaddress

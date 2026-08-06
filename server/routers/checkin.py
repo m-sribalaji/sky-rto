@@ -1,0 +1,279 @@
+"""
+The core attendance loop: the agent posts a check-in, the user can confirm
+an ambiguous one, and a manager can override a day's status by hand. This
+is the most security-sensitive router in the app (signal fabrication
+checks, WFO-on-leave detection) so it's kept tight and on its own.
+"""
+import json
+import secrets
+import logging
+from datetime import datetime, timezone
+from fastapi import APIRouter, Request, HTTPException, Depends
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select, and_
+
+from database import get_db, Device, CheckIn, AnomalyLog, DaySegment, LeaveRequest, PublicHoliday
+from detection import classify
+from segments import (
+    dominant_status_from_segments, handle_checkin, get_open_segment,
+    close_segment, open_new_segment, LEAVE_TYPES,
+)
+from deps import (
+    get_client_ip, get_device_token, today_str, is_weekend, require_role,
+    NOTIFIER_AVAILABLE, notify_override_applied, LEVEL_ALL,
+    _SERVER_WEBHOOK, _SERVER_URL,
+)
+from schemas import CheckInPayload, ConfirmPayload, OverridePayload
+
+router = APIRouter()
+logger = logging.getLogger("rto")
+
+# -- 3. CHECK-IN -------------------------------------------
+@router.post("/api/checkin")
+async def checkin(p: CheckInPayload, request: Request, db: AsyncSession = Depends(get_db)):
+    device = await db.get(Device, p.hostname)
+    if not device: return {"action": "register_first"}
+    token = get_device_token(request)
+    if not token or not device.api_token or not secrets.compare_digest(token, device.api_token):
+        raise HTTPException(401, "Valid X-Device-Token header required.")
+    today     = p.date if p.date else today_str()
+    # Skip weekends
+    if is_weekend(today):
+        logger.info(f"Weekend check-in skipped: {today} ({device.employee_id})")
+        return {"action": "weekend_skip", "date": today}
+    public_ip = get_client_ip(request)
+
+    # ── Signal integrity check ────────────────────────────────────────────
+    # Client supplies lan_ip, dns, vpn from its own network interfaces.
+    # Cross-validate: if client claims office LAN IP but is connecting from
+    # outside the Sky VPN range, the signals are fabricated — flag and override.
+    # A real office machine connects from 10.x.x.x (Sky VPN/LAN).
+    # A home machine connecting via VPN has public_ip = home ISP IP (non-10.x).
+    claimed_lan    = p.lan_ip or ""
+    lan_is_office  = claimed_lan.startswith("10.126.") or claimed_lan.startswith("10.128.")
+    conn_is_sky    = public_ip.startswith("10.") or public_ip in ("127.0.0.1", "::1")
+    fabricated_sig = lan_is_office and not conn_is_sky
+
+    if fabricated_sig:
+        # Client claims office LAN but is connecting from outside Sky network.
+        # This means the pending_queue.json was edited with fake office signals.
+        # Override all client signals — classify as WFH with flag.
+        logger.warning(
+            f"[SECURITY] Signal fabrication detected: {device.employee_id} "
+            f"claims lan={claimed_lan} but connecting from {public_ip}. "
+            f"Overriding to WFH and flagging."
+        )
+        from detection import DetectionResult
+        result = DetectionResult(
+            auto_status="wfh", confidence="high",
+            vpn_active=False, flagged=True,
+            flag_reason=f"Signal fabrication: claimed office LAN {claimed_lan} "
+                        f"but connected from {public_ip}. Recorded as WFH.",
+            detail=f"Fabricated office signals detected from {public_ip}.",
+        )
+    else:
+        result = classify(public_ip=public_ip, lan_ip=p.lan_ip,
+                         vpn_tunnel_ip=p.vpn_tunnel_ip, ssid=None,
+                         is_ethernet=p.is_ethernet,
+                         dns_servers=p.dns_servers, dns_domains=p.dns_domains)
+
+    logger.info(f"CheckIn: {device.employee_id} lan={p.lan_ip} conn={public_ip} -> {result.auto_status}({result.confidence}){' [FLAGGED]' if result.flagged else ''}")
+    if result.auto_status == "vpn_ambiguous":
+        return {"action": "confirm_needed", "lan_ip": p.lan_ip, "public_ip": public_ip, "detail": result.detail}
+    seg_result = await handle_checkin(
+        device.employee_id, device.employee_name, p.hostname, today,
+        result.auto_status, result.confidence, p.source or "auto_detected",
+        public_ip, p.lan_ip, bool(p.vpn_tunnel_ip), p.vpn_tunnel_ip,
+        p.dns_servers or [], p.dns_domains or [], p.is_ethernet, p.platform,
+        result.flagged, result.flag_reason, db,
+        queued_at=p.queued_at)
+
+    # Don't overwrite DB if day is locked by override or leave
+    if seg_result.get("action") in ("override_locked", "leave_recorded"):
+        # WFO-on-leave/holiday alert: if employee is on leave/holiday but
+        # office signals are detected, notify their team manager
+        if result.auto_status == "wfo":
+            is_ph = False
+            ph_check = await db.execute(select(PublicHoliday).where(
+                PublicHoliday.date == today))
+            if ph_check.scalars().first():
+                is_ph = True
+            leave_type = seg_result.get("status", "leave")
+            alert_reason = "public holiday" if is_ph else f"leave ({leave_type})"
+            logger.info(
+                f"WFO-on-{alert_reason}: {device.employee_id} "
+                f"({device.employee_name}) detected in office on {today} "
+                f"while marked as {alert_reason}"
+            )
+            # Log anomaly so it appears in the Anomalies panel
+            db.add(AnomalyLog(
+                employee_id   = device.employee_id,
+                employee_name = device.employee_name,
+                anomaly_type  = "wfo_on_leave",
+                description   = (
+                    f"{device.employee_name} ({device.employee_id}) "
+                    f"has office network signals on {today} "
+                    f"but is recorded as {alert_reason}. "
+                    f"LAN: {p.lan_ip or 'unknown'}."
+                ),
+                severity = "medium",
+            ))
+            await db.commit()
+            # Send Teams notification to channel
+            from notifier import notify_wfo_on_leave
+            try:
+                import os
+                wh = os.environ.get("TEAMS_WEBHOOK", "")
+                notify_wfo_on_leave(
+                    employee_name = device.employee_name,
+                    employee_id   = device.employee_id,
+                    date          = today,
+                    leave_type    = alert_reason,
+                    lan_ip        = p.lan_ip,
+                    webhook       = wh or None,
+                )
+            except Exception as e:
+                logger.warning(f"[WARN] notify_wfo_on_leave failed: {e}")
+        return {**seg_result, "detail": result.detail}
+
+    await _upsert_checkin(device, today, public_ip, p, result, db)
+    if result.flagged and result.flag_reason:
+        db.add(AnomalyLog(employee_id=device.employee_id, employee_name=device.employee_name,
+                          anomaly_type="lan_mismatch", description=result.flag_reason, severity="high"))
+        await db.commit()
+    return {**seg_result, "detail": result.detail}
+
+async def _upsert_checkin(device, today, public_ip, p, result, db):
+    q   = await db.execute(select(CheckIn).where(and_(
+        CheckIn.employee_id == device.employee_id, CheckIn.date == today)))
+    rec = q.scalars().first()
+    if not rec:
+        rec = CheckIn(employee_id=device.employee_id, employee_name=device.employee_name,
+                      hostname=p.hostname, date=today); db.add(rec)
+    rec.public_ip=public_ip; rec.lan_ip=p.lan_ip; rec.vpn_tunnel_ip=p.vpn_tunnel_ip
+    rec.vpn_active=bool(p.vpn_tunnel_ip); rec.is_ethernet=p.is_ethernet
+    rec.dns_servers=json.dumps(p.dns_servers or []); rec.dns_domains=json.dumps(p.dns_domains or [])
+    rec.platform=p.platform; rec.auto_status=result.auto_status
+    # final_status must reflect WFO priority across all segments for the day.
+    # A split day (WFH→WFO) must store "wfo" not the last raw detection.
+    # Re-derive from all segments so CheckIn.final_status is always the dominant status.
+    segs_q = await db.execute(select(DaySegment).where(and_(
+        DaySegment.employee_id == device.employee_id,
+        DaySegment.date == today,
+    )))
+    all_segs = segs_q.scalars().all()
+    if all_segs:
+        seg_data = [{"status": s.final_status or s.status} for s in all_segs]
+        rec.final_status = dominant_status_from_segments(seg_data) or result.auto_status
+    else:
+        rec.final_status = result.auto_status
+    rec.confidence=result.confidence; rec.flagged=result.flagged; rec.flag_reason=result.flag_reason
+    await db.commit()
+
+# -- 4. CONFIRM --------------------------------------------
+@router.post("/api/confirm")
+async def confirm(p: ConfirmPayload, request: Request, db: AsyncSession = Depends(get_db)):
+    device = await db.get(Device, p.hostname)
+    if not device: raise HTTPException(404, "Not registered")
+    token = get_device_token(request)
+    if not token or not device.api_token or not secrets.compare_digest(token, device.api_token):
+        raise HTTPException(401, "Valid X-Device-Token header required.")
+    if p.declared_status not in ("wfo","wfh"): raise HTTPException(400, "must be wfo|wfh")
+    today    = today_str()
+    open_seg = await get_open_segment(device.employee_id, today, db)
+    if open_seg: await close_segment(open_seg, db)
+    await open_new_segment(device.employee_id, device.employee_name, p.hostname, today,
+                           p.declared_status, p.declared_status, "medium", "user_confirmed",
+                           None, None, True, None, [], [], False, None, False, None, db)
+    q   = await db.execute(select(CheckIn).where(and_(
+        CheckIn.employee_id == device.employee_id, CheckIn.date == today)))
+    rec = q.scalars().first()
+    if rec: rec.final_status=p.declared_status; rec.user_declared=True; await db.commit()
+    return {"status": "confirmed", "final_status": p.declared_status}
+
+# -- 5. OVERRIDE -------------------------------------------
+@router.post("/api/override")
+async def override(p: OverridePayload, request: Request,
+                   db: AsyncSession = Depends(get_db)):
+    await require_role(request, db, "manager", caller_id=p.override_by)
+    dq     = await db.execute(select(Device).where(Device.employee_id == p.employee_id))
+    device = dq.scalars().first()
+    if not device: raise HTTPException(404, "Employee not found")
+
+    old_status = "unknown"
+
+    # -- If new status is a leave type, upsert LeaveRequest ---
+    if p.new_status in LEAVE_TYPES:
+        lq  = await db.execute(select(LeaveRequest).where(and_(
+            LeaveRequest.employee_id == p.employee_id, LeaveRequest.date == p.date)))
+        rec = lq.scalars().first()
+        if not rec:
+            db.add(LeaveRequest(employee_id=p.employee_id, employee_name=device.employee_name,
+                                date=p.date, leave_type=p.new_status, note=p.note,
+                                applied_by=p.override_by, source="manager"))
+        else:
+            old_status = rec.leave_type
+            rec.leave_type=p.new_status; rec.note=p.note; rec.applied_by=p.override_by
+    else:
+        # -- Overriding TO wfo/wfh - delete any leave record for this date --
+        lq  = await db.execute(select(LeaveRequest).where(and_(
+            LeaveRequest.employee_id == p.employee_id, LeaveRequest.date == p.date)))
+        leave_rec = lq.scalars().first()
+        if leave_rec:
+            old_status = leave_rec.leave_type
+            await db.delete(leave_rec)
+
+        # -- Upsert DaySegment so UI picks it up (segments take priority) --
+        seg_q = await db.execute(select(DaySegment).where(and_(
+            DaySegment.employee_id == p.employee_id,
+            DaySegment.date == p.date,
+        )).order_by(DaySegment.segment_number))
+        segs = seg_q.scalars().all()
+        if segs:
+            # Update the first segment's final_status; remove extras
+            old_status = old_status if old_status != "unknown" else (segs[0].final_status or segs[0].status)
+            segs[0].final_status = p.new_status
+            segs[0].overridden   = True
+            segs[0].override_by  = p.override_by
+            segs[0].override_note = p.note
+            for extra in segs[1:]:
+                await db.delete(extra)
+        else:
+            # No segment exists - create one so the UI shows the override
+            from datetime import datetime as _dt
+            db.add(DaySegment(
+                employee_id=p.employee_id, employee_name=device.employee_name,
+                hostname=device.hostname or "", date=p.date, segment_number=1,
+                status=p.new_status, final_status=p.new_status,
+                confidence="high", source="manager_override",
+                started_at=_dt.now(timezone.utc),
+                overridden=True, override_by=p.override_by, override_note=p.note,
+            ))
+
+    # -- Always update legacy CheckIn too (for backwards compat) --
+    q    = await db.execute(select(CheckIn).where(and_(
+        CheckIn.employee_id == p.employee_id, CheckIn.date == p.date)))
+    crec = q.scalars().first()
+    if not crec:
+        crec = CheckIn(employee_id=p.employee_id, employee_name=device.employee_name,
+                       hostname=device.hostname or "", date=p.date, auto_status="manual"); db.add(crec)
+    if old_status == "unknown":
+        old_status = crec.auto_status or "unknown"
+    crec.final_status=p.new_status; crec.overridden=True
+    crec.override_by=p.override_by; crec.override_note=p.note; crec.confidence="high"
+    await db.commit()
+    # -- Notify Teams --------------------------------------
+    if NOTIFIER_AVAILABLE:
+        notify_override_applied(
+            target_name=device.employee_name,
+            target_id=p.employee_id,
+            date=p.date,
+            old_status=old_status,
+            new_status=p.new_status,
+            override_by=p.override_by,
+            note=p.note,
+            webhook=_SERVER_WEBHOOK,
+            level=LEVEL_ALL,
+            server_url=_SERVER_URL,
+        )
+    return {"status": "overridden", "employee_id": p.employee_id, "date": p.date}

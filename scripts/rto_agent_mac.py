@@ -1,26 +1,16 @@
 #!/usr/bin/env python3
 """
-rto_agent_mac.py - RTO Attendance Agent (macOS)
+This is the Mac build of the RTO agent — gets compiled into a standalone
+binary and quietly runs in the background, checking someone in when they
+show up to work.
 
-Compiled into a standalone binary by PyInstaller — no Python needed on
-the target machine.
+Uses NSWorkspace to hear about screen unlocks instantly (falls back to
+polling ioreg via CGSession if PyObjC isn't bundled), launchd to
+auto-start on login, and a 5-minute poll as a backstop for stuff the
+unlock event might miss (VPN reconnects, offline queue flushing, etc).
 
-Two-trigger system:
-  1. NSWorkspace screen unlock (event-driven, instant)
-     Falls back to CGSession polling if PyObjC unavailable
-  2. Background polling every 5 minutes (VPN reconnects, location
-     changes, offline queue sync, missed unlocks)
-
-CLI flags (same as the old checkin.py, now on the binary itself):
-  rto-mac                 normal background agent mode
-  rto-mac --force         force a fresh check-in right now
-  rto-mac --reset         clear all caches + force check-in
-  rto-mac --retry         retry any queued offline check-ins
-  rto-mac --install       (re)install the launchd agent
-  rto-mac --uninstall     remove the launchd agent
-  rto-mac --purge         uninstall AND delete ~/.rto_tracker entirely
-
-First run (no --flag): auto-installs launchd, then enters agent loop.
+See rto_agent_win.py for the Windows sibling — same job, done with WTS
+session notifications and the Registry/Task Scheduler instead.
 """
 
 import sys
@@ -127,6 +117,7 @@ PLIST_TEMPLATE = """\
   <key>ProcessType</key>
   <string>Background</string>
 
+  <!-- Minimum seconds between restarts if it keeps crashing -->
   <key>ThrottleInterval</key>
   <integer>10</integer>
 </dict>

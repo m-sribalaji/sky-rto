@@ -1,31 +1,15 @@
 #!/usr/bin/env python3
 """
-rto_agent_win.py - RTO Attendance Agent (Windows)
+This is the Windows build of the RTO agent — same job as rto_agent_mac.py
+(auto check someone in when they show up), just done with Windows-native
+APIs instead of Apple's.
 
-Compiled into a standalone .exe by PyInstaller — no Python needed on
-the target machine.
-
-Two-trigger system:
-  1. WTS Session Notifications via ctypes (event-driven, instant)
-     Falls back to OpenInputDesktop polling if WTS unavailable
-  2. Background polling every 5 minutes (VPN reconnects, location
-     changes, offline queue sync, missed unlocks)
-
-CLI flags (same as the old checkin.py, now on the .exe itself):
-  rto-win.exe                  normal background agent mode
-  rto-win.exe --force          force a fresh check-in right now
-  rto-win.exe --reset          clear all caches + force check-in
-  rto-win.exe --retry          retry any queued offline check-ins
-  rto-win.exe --install        (re)register startup entries
-  rto-win.exe --uninstall      remove startup entries
-  rto-win.exe --purge          uninstall AND delete ~/.rto_tracker entirely
-
-First run (no --flag): auto-registers startup, then enters agent loop.
-
-NOTE: pywin32 is NOT required. WTS notifications are handled via
-pure-ctypes (bundled in stdlib). pywin32 is used as an optional
-enhancement if present (slightly more reliable on some Windows builds)
-but the binary works fully without it.
+Screen unlock detection is raw ctypes calls listening for
+WM_WTSSESSION_CHANGE messages (no pywin32 required — falls back to
+polling OpenInputDesktop if that fails). Auto-start uses the HKCU Run
+registry key plus a Startup folder shortcut as backup, instead of
+launchd. Also runs the same 5-minute background poll as the Mac agent,
+for the same reasons (VPN reconnects, missed events, etc).
 """
 
 import sys
@@ -85,7 +69,7 @@ if getattr(sys, "frozen", False):
 else:
     BINARY_PATH = Path(__file__).resolve()
 
-RUN_KEY  = r"Software\Microsoft\Windows\CurrentVersion\Run"
+RUN_KEY  = r"Software\Microsoft\Windows\CurrentVersion\Run"  # HKCU, no admin needed
 RUN_NAME = "SkyRTOTracker"
 
 AGENT_LOG.parent.mkdir(parents=True, exist_ok=True)
@@ -139,7 +123,7 @@ def install_startup(verbose: bool = True) -> bool:
             f'[Environment]::GetFolderPath("Startup")+"\\SkyRTOTracker.lnk");'
             f'$s.TargetPath="{binary_str}";'
             f'$s.WorkingDirectory="{str(BINARY_PATH.parent)}";'
-            f'$s.WindowStyle=7;'
+            f'$s.WindowStyle=7;'  # 7 = minimized, so no console flash on login
             f'$s.Description="Sky RTO Tracker";$s.Save()'
         )
         subprocess.run(
@@ -643,6 +627,7 @@ Examples:
     # Prevents two agent processes running simultaneously.
     # This happens when both HKCU\Run key AND Startup shortcut are registered,
     # or when the user double-clicks the binary while agent is already running.
+    _mutex = None
     if sys.platform == "win32":
         _mutex_name = "Global\\SkyRTOTrackerAgent"
         try:
@@ -654,12 +639,41 @@ Examples:
         except Exception as e:
             logger.warning(f"Mutex creation failed: {e} - continuing without single-instance guard")
 
-    # First run: startup not yet registered
+    # First run: startup not yet registered.
+    # On the Mac side, installing the launchd agent (`launchctl load`) starts
+    # a real running instance immediately, so that script just exits and lets
+    # launchd's copy take over. The HKCU Run key / Startup shortcut we use
+    # here don't do that — they only fire on the NEXT login — so exiting the
+    # same way here would leave nothing actually running until next login.
+    # To behave the same way as Mac (install, get a live instance running,
+    # exit the foreground one), spawn a detached copy of ourselves in the
+    # background right after setup, then exit.
     if not is_startup_installed():
         first_run_setup()
-        # After setup, start the agent loop in the same process
-        # (the HKCU Run key will launch a fresh instance on next login)
-        logger.info("First-run setup complete - entering agent loop")
+        try:
+            # We're still holding the single-instance mutex from above — the
+            # child we're about to spawn needs to grab it for itself, so let
+            # go of it first or the child will see ERROR_ALREADY_EXISTS and
+            # immediately exit thinking we're still running.
+            if _mutex:
+                try:
+                    ctypes.windll.kernel32.CloseHandle(_mutex)
+                except Exception:
+                    pass
+            DETACHED_PROCESS = getattr(subprocess, "DETACHED_PROCESS", 0x00000008)
+            CREATE_NEW_PROCESS_GROUP = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200)
+            subprocess.Popen(
+                [str(BINARY_PATH)],
+                creationflags=DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | NO_WIN,
+                close_fds=True,
+            )
+            logger.info("First-run setup complete - launched background instance, exiting")
+        except Exception as e:
+            # Best effort — if the relaunch fails, fall back to running the
+            # loop in this same process rather than leaving nothing running.
+            logger.warning(f"Could not spawn detached background instance: {e} - continuing in this process")
+        else:
+            sys.exit(0)
     else:
         logger.info("Agent started via startup registration - entering normal operation")
 

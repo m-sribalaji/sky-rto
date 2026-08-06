@@ -12,6 +12,7 @@ on:
     paths:
       - 'client/**'
       - 'scripts/**'
+      - 'shared/**'
       - 'build.sh'
       - '.github/workflows/build.yml'
   workflow_dispatch:
@@ -33,14 +34,14 @@ jobs:
         run: |
           pip install pyinstaller pyobjc-framework-Cocoa certifi
 
-      - name: Inject version and secrets into checkin_core.py
+      - name: Inject version and secrets into rto_client/config.py
         env:
           BUILD_NUM: ${{ github.run_number }}
           BAKED_SERVER_URL: ${{ secrets.BAKED_SERVER_URL }}
           BAKED_TEAMS_WEBHOOK: ${{ secrets.BAKED_TEAMS_WEBHOOK }}
         run: |
-          python3 inject_version.py "0.0.${BUILD_NUM}" client/checkin_core.py
-          grep "_BAKED_VERSION\|_BAKED_SERVER_URL" client/checkin_core.py
+          python3 inject_version.py "0.0.${BUILD_NUM}" client/rto_client/config.py
+          grep "_BAKED_VERSION\|_BAKED_SERVER_URL" client/rto_client/config.py
 
       - name: Build rto-mac-arm64
         run: |
@@ -48,8 +49,19 @@ jobs:
             --onefile --noconfirm --clean --noupx \
             --distpath dist \
             --add-data "client/checkin_core.py:." \
-            --add-data "client/notifier.py:." \
+            --add-data "client/rto_client:rto_client" \
+            --add-data "shared/notifier.py:." \
             --hidden-import=checkin_core \
+            --hidden-import=rto_client \
+            --hidden-import=rto_client.config \
+            --hidden-import=rto_client.network \
+            --hidden-import=rto_client.classify \
+            --hidden-import=rto_client.queue \
+            --hidden-import=rto_client.api \
+            --hidden-import=rto_client.lock \
+            --hidden-import=rto_client.update \
+            --hidden-import=rto_client.missed \
+            --hidden-import=rto_client.checkin \
             --hidden-import=notifier \
             --hidden-import=platform \
             --hidden-import=ipaddress \
@@ -97,15 +109,15 @@ jobs:
         run: |
           pip install pyinstaller pywin32 certifi
 
-      - name: Inject version and secrets into checkin_core.py
+      - name: Inject version and secrets into rto_client/config.py
         shell: bash
         env:
           BUILD_NUM: ${{ github.run_number }}
           BAKED_SERVER_URL: ${{ secrets.BAKED_SERVER_URL }}
           BAKED_TEAMS_WEBHOOK: ${{ secrets.BAKED_TEAMS_WEBHOOK }}
         run: |
-          python3 inject_version.py "0.0.${BUILD_NUM}" client/checkin_core.py
-          grep "_BAKED_VERSION\|_BAKED_SERVER_URL" client/checkin_core.py
+          python3 inject_version.py "0.0.${BUILD_NUM}" client/rto_client/config.py
+          grep "_BAKED_VERSION\|_BAKED_SERVER_URL" client/rto_client/config.py
 
       - name: Build rto-win.exe
         shell: bash
@@ -114,8 +126,19 @@ jobs:
             --onefile --noconfirm --clean --noupx \
             --distpath dist \
             --add-data "client/checkin_core.py;." \
-            --add-data "client/notifier.py;." \
+            --add-data "client/rto_client;rto_client" \
+            --add-data "shared/notifier.py;." \
             --hidden-import=checkin_core \
+            --hidden-import=rto_client \
+            --hidden-import=rto_client.config \
+            --hidden-import=rto_client.network \
+            --hidden-import=rto_client.classify \
+            --hidden-import=rto_client.queue \
+            --hidden-import=rto_client.api \
+            --hidden-import=rto_client.lock \
+            --hidden-import=rto_client.update \
+            --hidden-import=rto_client.missed \
+            --hidden-import=rto_client.checkin \
             --hidden-import=notifier \
             --hidden-import=platform \
             --hidden-import=ipaddress \

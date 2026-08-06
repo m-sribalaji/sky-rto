@@ -591,7 +591,8 @@ def compute_forecast(
 
     monthly = _monthly_progress(att, today, ph_dates, current_month_wfo)
     compliance_meta = _compliance_forecast_weeks(
-        att, today, ph_dates, dow_rates_stable, current_month_wfo)
+        att, today, ph_dates, dow_rates_stable, current_month_wfo,
+        dow_confidence=dow_confidence)
     month_rem = [f for f in forecast
                  if f["date"][:7] == today.strftime("%Y-%m")
                  and not f.get("certain") and f["status"] == "predicted_wfo"]
@@ -653,6 +654,7 @@ def _compliance_forecast_weeks(
     ph_dates: set[str],
     dow_rates_stable: dict[int, float],
     current_month_wfo: int,
+    dow_confidence: dict[int, str] | None = None,
     monthly_target: int = 12,
     weekly_target: int = 3,
 ) -> dict:
@@ -660,12 +662,23 @@ def _compliance_forecast_weeks(
     Compute per-remaining-week compliance outlook for the current month.
     Uses stable (slow-moving) dow rates so projections don't chase behavior.
 
+    Every day here is either a FACT (an actual check-in, approved leave, or
+    override already on record — zero uncertainty) or a FORECAST (a future
+    day where we're guessing based on that person's past pattern for that
+    weekday). We never blur the two: forecasts always carry the honest
+    Wilson-score confidence tier for that weekday (dow_confidence), so
+    someone with 2 weeks of history doesn't get shown the same false
+    certainty as someone with 6 months of history. There is no such thing
+    as a 100%-certain prediction of a future day — people get sick, plans
+    change — so we don't pretend otherwise anywhere in this output.
+
     Returns:
         compliance_weeks  — list of week dicts for the UI
         wfh_budget        — total WFH days you can take and still hit monthly target
         total_needed      — WFO days still needed this month
         projected_month_total — actual + projected WFO (may exceed target)
     """
+    dow_confidence = dow_confidence or {}
     yr, mo = today.year, today.month
     workdays  = _workdays_in_month(yr, mo, ph_dates)
     elapsed   = [d for d in workdays if d < today.isoformat()]
@@ -704,25 +717,43 @@ def _compliance_forecast_weeks(
             is_today      = ds == today.isoformat() and att.get(ds) not in ("wfo", "wfh")
             actual_status  = att.get(ds) if ds <= today.isoformat() else None
 
+            # is_fact: this day is already decided — a real check-in, leave,
+            # or holiday — not a guess. Everything else is a forecast and
+            # must be labelled with how much we actually trust it.
+            is_fact = is_leave or is_past_actual
+
             if is_leave:
-                rate = 0.0
-                leave_count += 1
+                rate             = 0.0
+                leave_count     += 1
+                predicted_status = "leave"
+                confidence_tier  = "certain"
             elif is_past_actual:
-                rate = 1.0 if actual_status == "wfo" else 0.0
-                week_proj += rate
+                rate              = 1.0 if actual_status == "wfo" else 0.0
+                week_proj        += rate
+                predicted_status  = actual_status
+                confidence_tier   = "certain"
             else:
-                rate = dow_rates_stable.get(dow, 0.40)
-                week_proj += rate
+                rate              = dow_rates_stable.get(dow, 0.40)
+                week_proj        += rate
+                predicted_status  = "wfo" if rate >= 0.5 else "wfh"
+                confidence_tier   = dow_confidence.get(dow, "insufficient")
 
             day_details.append({
-                "date":          ds,
-                "dow":           dow,
-                "dow_name":      d_obj.strftime("%A")[:3],
-                "rate":          round(rate, 3),
-                "is_leave":      is_leave,
-                "is_today":      is_today,
-                "is_actual":     is_past_actual,
-                "actual_status": actual_status,
+                "date":              ds,
+                "dow":               dow,
+                "dow_name":          d_obj.strftime("%A")[:3],
+                "rate":              round(rate, 3),
+                "is_leave":          is_leave,
+                "is_today":          is_today,
+                "is_actual":         is_past_actual,
+                "is_fact":           is_fact,
+                "actual_status":     actual_status,
+                # What we're telling the person will happen on this day.
+                # "certain" only ever means it's already a recorded fact —
+                # never used for a genuine future prediction.
+                "predicted_status":  predicted_status,
+                "confidence_tier":   confidence_tier,
+                "confidence_label":  "Recorded" if confidence_tier == "certain" else _confidence_label(confidence_tier),
             })
 
         working_days = len(days_in_week) - leave_count
@@ -731,6 +762,33 @@ def _compliance_forecast_weeks(
         # Scale weekly target for partial weeks (e.g. 2 days → ceil(2*3/5)=2)
         week_tgt = math.ceil(working_days * weekly_target / 5) if working_days < 5 else weekly_target
         risk     = week_proj < week_tgt and working_days > 0
+
+        # How many WFH days this person can still take this week and still
+        # hit their weekly office target — the number people actually want
+        # to know, not the raw projection.
+        week_wfh_budget = max(0, working_days - week_tgt)
+
+        # Plain-English summary of the week, built straight from the day
+        # list above so it can never say something the data doesn't back up.
+        office_facts, office_forecast, home_facts, home_forecast = [], [], [], []
+        for dd in day_details:
+            if dd["is_leave"]:
+                continue
+            bucket = office_facts if dd["predicted_status"] == "wfo" and dd["is_fact"] else \
+                     office_forecast if dd["predicted_status"] == "wfo" else \
+                     home_facts if dd["is_fact"] else home_forecast
+            bucket.append(dd["dow_name"])
+
+        summary_parts = []
+        if office_facts:
+            summary_parts.append(f"In office {', '.join(office_facts)}")
+        if office_forecast:
+            summary_parts.append(f"likely office {', '.join(office_forecast)}")
+        if home_facts:
+            summary_parts.append(f"WFH {', '.join(home_facts)}")
+        if home_forecast:
+            summary_parts.append(f"likely WFH {', '.join(home_forecast)}")
+        week_summary = " · ".join(summary_parts) if summary_parts else "No working days this week"
 
         projected_total_additional += week_proj
 
@@ -749,6 +807,8 @@ def _compliance_forecast_weeks(
             "working_days":    working_days,
             "leave_days":      leave_count,
             "week_target":     week_tgt,
+            "week_wfh_budget": week_wfh_budget,
+            "week_summary":    week_summary,
             "projected_wfo":   week_proj_r,
             "risk":            risk,
             "is_current_week": is_current,

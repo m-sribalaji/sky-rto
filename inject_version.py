@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-inject_version.py - Bake build-time secrets into checkin_core.py.
+inject_version.py - Bake build-time secrets into rto_client/config.py.
 Replaces placeholders with real values from environment variables.
 
 Usage: python3 inject_version.py <version> <filepath>
-Example: python3 inject_version.py 0.0.17 client/checkin_core.py
+Example: python3 inject_version.py 0.0.17 client/rto_client/config.py
 
 Environment variables required:
   BAKED_SERVER_URL    - RTO server URL

@@ -3,8 +3,8 @@ version: "3.9"
 services:
   rto-tracker:
     build:
-      context: ./server
-      dockerfile: Dockerfile
+      context: .
+      dockerfile: server/Dockerfile
     container_name: sky-rto-tracker
     restart: unless-stopped
     ports:
