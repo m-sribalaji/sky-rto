@@ -441,12 +441,18 @@ def upsert_employee_card(employee_id: str, employee_name: str, team: str | None,
         logger.warning(f"[WARN] Flow didn't return a message_id for {employee_id}'s new card")
     return new_id
 
-def post_employee_reply(message_id: str | None, text: str, webhook: str | None) -> bool:
+def post_employee_reply(employee_id: str, text: str, webhook: str | None) -> bool:
     """Post a threaded reply under an employee's card — this is the actual
-    'ping' people see; the card edit above is silent on its own."""
-    if not webhook or not message_id:
+    'ping' people see; the card edit above is silent on its own.
+
+    Keyed on employee_id, not a message_id from the server: the flow
+    doesn't return a Response (that needs Power Automate Premium), so the
+    server never actually learns the real message_id. The flow already
+    looks up each employee's card id itself via its own Excel table, so
+    employee_id is all it needs on the reply side too."""
+    if not webhook or not employee_id:
         return False
-    payload = {"action": "reply", "message_id": message_id, "text": _redact_ip(text)}
+    payload = {"action": "reply", "employee_id": employee_id, "text": _redact_ip(text)}
     return _send_teams_json(webhook, payload) is not None
 
 

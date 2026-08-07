@@ -115,8 +115,11 @@ async def sync_employee_teams_card(employee_id: str, employee_name: str, team: s
                 db.add(TeamsMessage(employee_id=employee_id, message_id=new_id))
             await db.commit()
 
-        if new_id:
-            post_employee_reply(new_id, event_text, _SERVER_WEBHOOK)
+        # Reply is keyed on employee_id, not message_id — the flow doesn't
+        # return a Response (Premium-only), so we never learn the real
+        # message_id here; the flow resolves it itself via Excel. Always
+        # fire this regardless of whether new_id came back.
+        post_employee_reply(employee_id, event_text, _SERVER_WEBHOOK)
     except Exception as e:
         logger.warning(f"[WARN] Teams card sync failed for {employee_id}: {e}")
 
