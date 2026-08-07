@@ -21,7 +21,7 @@ from deps import (
     get_client_ip, get_device_token, today_str, is_weekend, require_role,
     verify_device_auth, verify_request_signature,
     NOTIFIER_AVAILABLE, notify_override_applied, LEVEL_ALL,
-    _SERVER_WEBHOOK, _SERVER_URL,
+    _SERVER_WEBHOOK, _SERVER_URL, sync_employee_teams_card,
 )
 from schemas import CheckInPayload, ConfirmPayload, OverridePayload
 
@@ -124,6 +124,9 @@ async def checkin(p: CheckInPayload, request: Request, db: AsyncSession = Depend
                 )
             except Exception as e:
                 logger.warning(f"[WARN] notify_wfo_on_leave failed: {e}")
+            await sync_employee_teams_card(
+                device.employee_id, device.employee_name, device.team,
+                f"Office signals detected while marked as {alert_reason} — flagged for review.", db)
         return {**seg_result, "detail": result.detail}
 
     await _upsert_checkin(device, today, public_ip, p, result, db)
@@ -131,6 +134,15 @@ async def checkin(p: CheckInPayload, request: Request, db: AsyncSession = Depend
         db.add(AnomalyLog(employee_id=device.employee_id, employee_name=device.employee_name,
                           anomaly_type="lan_mismatch", description=result.flag_reason, severity="high"))
         await db.commit()
+
+    # Every check-in reaches a persistent Teams card for this person — see
+    # deps.sync_employee_teams_card. Runs after the DB write is already
+    # committed, and never raises, so a Teams outage can't affect whether
+    # the check-in itself succeeded.
+    status_text = "in the office" if result.auto_status == "wfo" else "working from home"
+    event_text = f"Checked in — {status_text}" + (f" (flagged: {result.flag_reason})" if result.flagged else "")
+    await sync_employee_teams_card(device.employee_id, device.employee_name, device.team, event_text, db)
+
     return {**seg_result, "detail": result.detail}
 
 async def _upsert_checkin(device, today, public_ip, p, result, db):
@@ -265,4 +277,8 @@ async def override(p: OverridePayload, request: Request,
             level=LEVEL_ALL,
             server_url=_SERVER_URL,
         )
+    await sync_employee_teams_card(
+        p.employee_id, device.employee_name, device.team,
+        f"Manager override: {old_status} → {p.new_status} (by {p.override_by})" + (f" — {p.note}" if p.note else ""),
+        db)
     return {"status": "overridden", "employee_id": p.employee_id, "date": p.date}

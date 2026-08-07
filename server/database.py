@@ -183,3 +183,20 @@ class TeamConfig(Base):
     name       = Column(String, nullable=False, unique=True, index=True)
     created_by = Column(String, nullable=True)
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+
+class TeamsMessage(Base):
+    """
+    One row per employee, tracking the single persistent Teams card that
+    represents their attendance status. Instead of a new message every
+    check-in, the same card gets edited in place — this table is just the
+    memory of "which message is theirs", so the next update knows whether
+    to create a new card (first time) or edit the existing one (every time
+    after). The actual edit/create happens through a Power Automate flow,
+    since only Power Automate (not the old Incoming Webhook) can update a
+    previously-posted Teams message.
+    """
+    __tablename__ = "teams_messages"
+    employee_id = Column(String, primary_key=True)
+    message_id  = Column(String, nullable=False)
+    updated_at  = Column(DateTime, default=lambda: datetime.now(timezone.utc),
+                          onupdate=lambda: datetime.now(timezone.utc))

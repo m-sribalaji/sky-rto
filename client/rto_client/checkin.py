@@ -17,7 +17,6 @@ from .config import (
     _get_auth_headers, _get_notify_cfg, _sync_device_auth,
     QUEUE_FILE, CONFIG_DIR,
     NOTIFIER_AVAILABLE,
-    notify_checkin_wfo, notify_checkin_wfh, notify_queue_flushed,
     notify_registration_needed, notify_registration_complete,
 )
 from .network import get_lan_ip, get_vpn_tunnel_ip, get_dns_info, get_is_ethernet
@@ -62,27 +61,13 @@ def run_checkin(force: bool = False):
             if QUEUE_FILE.exists() and server_reachable(server):
                 flushed, flushed_results = flush_queue(server, cfg)
                 if flushed > 0:
+                    # Teams notifications for these are handled server-side now
+                    # (see deps.sync_employee_teams_card) — each flushed record
+                    # is really just a normal /api/checkin call once it lands,
+                    # so the server already updates the person's card and posts
+                    # the reply for it. Posting our own card here too would just
+                    # double up the same event.
                     logger.info(f"Flushed {flushed} queued offline record(s)")
-                    if NOTIFIER_AVAILABLE:
-                        wh, lvl, srv = _get_notify_cfg(cfg)
-                        emp_name = cfg.get("employee_name", hostname)
-                        # Send individual check-in card per flushed record
-                        for f_payload, f_resp in flushed_results:
-                            if f_resp.get("action") == "ok":
-                                f_status = f_resp.get("status","")
-                                f_conf   = f_resp.get("confidence","")
-                                if f_status == "wfo":
-                                    notify_checkin_wfo(emp_name,
-                                        f_payload.get("lan_ip"), f_conf,
-                                        webhook=wh, level=lvl, server_url=srv)
-                                elif f_status == "wfh":
-                                    notify_checkin_wfh(emp_name,
-                                        f_payload.get("lan_ip"), f_conf,
-                                        vpn=bool(f_payload.get("vpn_tunnel_ip")),
-                                        webhook=wh, level=lvl, server_url=srv)
-                        # Summary card
-                        notify_queue_flushed(emp_name, flushed,
-                                             webhook=wh, level=lvl, server_url=srv)
             logger.info(f"Same location ({local_class}), same day - skipping"); return
 
         payload = {
@@ -119,27 +104,9 @@ def run_checkin(force: bool = False):
 
         flushed, flushed_results = flush_queue(server, cfg)
         if flushed > 0:
+            # Teams notification for these happens server-side (see the
+            # comment above) — nothing to send from here.
             logger.info(f"Flushed {flushed} offline record(s)")
-            if NOTIFIER_AVAILABLE:
-                wh, lvl, srv = _get_notify_cfg(cfg)
-                emp_name = cfg.get("employee_name", hostname)
-                # Send individual check-in card per flushed record
-                for f_payload, f_resp in flushed_results:
-                    if f_resp.get("action") == "ok":
-                        f_status = f_resp.get("status","")
-                        f_conf   = f_resp.get("confidence","")
-                        if f_status == "wfo":
-                            notify_checkin_wfo(emp_name,
-                                f_payload.get("lan_ip"), f_conf,
-                                webhook=wh, level=lvl, server_url=srv)
-                        elif f_status == "wfh":
-                            notify_checkin_wfh(emp_name,
-                                f_payload.get("lan_ip"), f_conf,
-                                vpn=bool(f_payload.get("vpn_tunnel_ip")),
-                                webhook=wh, level=lvl, server_url=srv)
-                # Summary card
-                notify_queue_flushed(emp_name, flushed,
-                                     webhook=wh, level=lvl, server_url=srv)
 
         device = _sync_device_auth(server, hostname, cfg)
         if not device or not device.get("registered"):
@@ -237,16 +204,11 @@ def run_checkin(force: bool = False):
                     cfg["employee_id"] = dev_check.get("employee_id")
                     cfg["device_token"] = dev_check.get("api_token")
             save_config(cfg)
-            if NOTIFIER_AVAILABLE:
-                wh, lvl, srv = _get_notify_cfg(cfg)
-                emp_name = cfg.get("employee_name") or hostname
-                if status == "wfo":
-                    notify_checkin_wfo(emp_name, lan_ip, confidence,
-                                       webhook=wh, level=lvl, server_url=srv)
-                elif status == "wfh":
-                    notify_checkin_wfh(emp_name, lan_ip, confidence,
-                                       vpn=bool(vpn_tun),
-                                       webhook=wh, level=lvl, server_url=srv)
+            # Teams card + notification for this check-in is handled
+            # server-side now (deps.sync_employee_teams_card, called from
+            # inside /api/checkin) — the server already knows the full
+            # current status and owns the one persistent card per person,
+            # so posting our own here would just double it up.
 
         elif action == "already_checked_in":
             existing_status = response.get("status")

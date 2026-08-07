@@ -17,6 +17,7 @@ from deps import (
     get_device_token, get_client_ip, require_role, require_registered_caller, get_caller_context,
     get_managed_teams, limiter, verify_device_auth,
     NOTIFIER_AVAILABLE, notify_leave_applied, LEVEL_ALL, _SERVER_WEBHOOK, _SERVER_URL,
+    sync_employee_teams_card,
 )
 from schemas import LeavePayload, DeleteLeavePayload, PublicHolidayPayload, MissedDayPayload
 
@@ -67,6 +68,9 @@ async def apply_leave(p: LeavePayload, request: Request,
             level=LEVEL_ALL,
             server_url=_SERVER_URL,
         )
+    await sync_employee_teams_card(
+        p.employee_id, device.employee_name, device.team,
+        f"Leave applied: {p.leave_type} on {p.date}" + (f" — {p.note}" if p.note else ""), db)
     return {"status": "ok", "leave_type": p.leave_type, "date": p.date}
 
 @router.delete("/api/leave")
@@ -301,4 +305,7 @@ async def record_missed(p: MissedDayPayload, request: Request, db: AsyncSession=
     crec.override_by=device.employee_id; crec.override_note=f"Missed day ({source})"
     crec.confidence=conf
     await db.commit()
+    await sync_employee_teams_card(
+        device.employee_id, device.employee_name, device.team,
+        f"Missed day backfilled: {p.date} → {lt if is_leave else final_status} ({source})", db)
     return {"status": "recorded", "date": p.date, "source": source}

@@ -18,10 +18,10 @@ import json as _sjson
 from fastapi import Request, HTTPException
 from slowapi import Limiter
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
+from sqlalchemy import select, and_, desc
 from datetime import datetime, date, timedelta
 
-from database import Device, Role
+from database import Device, Role, TeamsMessage, DaySegment, LeaveRequest
 
 logger = logging.getLogger("rto")
 
@@ -51,6 +51,7 @@ _SERVER_URL     = os.environ.get("SERVER_URL", "http://10.132.176.3:9999")
 try:
     from notifier import (
         notify_leave_applied, notify_override_applied,
+        build_status_pills, upsert_employee_card, post_employee_reply,
         LEVEL_ALL,
     )
     NOTIFIER_AVAILABLE = bool(_SERVER_WEBHOOK)
@@ -61,6 +62,63 @@ except ImportError:
     NOTIFIER_AVAILABLE = False
     def notify_leave_applied(*a, **kw): pass
     def notify_override_applied(*a, **kw): pass
+    def build_status_pills(*a, **kw): return []
+    def upsert_employee_card(*a, **kw): return None
+    def post_employee_reply(*a, **kw): return False
+
+async def sync_employee_teams_card(employee_id: str, employee_name: str, team: str | None,
+                                    event_text: str, db: AsyncSession) -> None:
+    """
+    The one place every status-changing event (check-in, override, leave,
+    WFO-while-on-leave) routes through to reach Teams. Two things happen:
+    1. The employee's single persistent card gets edited in place with
+       today's current full status (all pills — status, VPN, confidence,
+       flags — not just what happened in this one event).
+    2. A threaded reply gets posted under that card with event_text, which
+       is the actual visible "ping" — the card edit itself is silent.
+    Safe to call even when Teams notifications are off (NOTIFIER_AVAILABLE
+    is False) or the webhook call fails — this never raises, since a
+    notification failure should never break the actual attendance write
+    that triggered it.
+    """
+    if not NOTIFIER_AVAILABLE:
+        return
+    try:
+        today = date.today().isoformat()
+        seg_q = await db.execute(select(DaySegment).where(and_(
+            DaySegment.employee_id == employee_id, DaySegment.date == today,
+        )).order_by(desc(DaySegment.segment_number)))
+        latest_seg = seg_q.scalars().first()
+
+        lv_q = await db.execute(select(LeaveRequest).where(and_(
+            LeaveRequest.employee_id == employee_id, LeaveRequest.date == today)))
+        leave = lv_q.scalars().first()
+
+        status      = (latest_seg.final_status or latest_seg.status) if latest_seg else None
+        vpn_active  = bool(latest_seg.vpn_tunnel_ip) if latest_seg else False
+        confidence  = latest_seg.confidence if latest_seg else None
+        flagged     = bool(latest_seg.flagged) if latest_seg else False
+        flag_reason = latest_seg.flag_reason if latest_seg else None
+        leave_label = leave.leave_type.replace("_", " ").title() if leave else None
+
+        pills = build_status_pills(status, vpn_active, confidence, flagged, flag_reason, leave_label)
+
+        row = await db.get(TeamsMessage, employee_id)
+        existing_id = row.message_id if row else None
+
+        new_id = upsert_employee_card(employee_id, employee_name, team, pills,
+                                       existing_id, _SERVER_WEBHOOK)
+        if new_id and new_id != existing_id:
+            if row:
+                row.message_id = new_id
+            else:
+                db.add(TeamsMessage(employee_id=employee_id, message_id=new_id))
+            await db.commit()
+
+        if new_id:
+            post_employee_reply(new_id, event_text, _SERVER_WEBHOOK)
+    except Exception as e:
+        logger.warning(f"[WARN] Teams card sync failed for {employee_id}: {e}")
 
 DEFAULT_TEAMS = [
     "Sky Mobile",

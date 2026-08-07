@@ -255,6 +255,201 @@ def _send_teams(webhook_url: str, payload: dict) -> bool:
         return False
 
 
+def _send_teams_json(webhook_url: str, payload: dict) -> dict | None:
+    """
+    Same as _send_teams, but for calls where we need something back —
+    specifically, the Power Automate flow handing us the Teams message ID
+    it just created so we can remember it for next time. Returns the
+    parsed JSON body on success, None on any failure (network, non-2xx,
+    or a response that isn't valid JSON).
+    """
+    try:
+        data = json.dumps(payload).encode("utf-8")
+        req  = urllib.request.Request(
+            webhook_url, data=data,
+            headers={"Content-Type": "application/json", "Accept-Encoding": "identity", "Connection": "close"},
+            method="POST",
+        )
+        import ssl as _ssl
+        ssl_ctx = None
+        try:
+            import certifi
+            ssl_ctx = _ssl.create_default_context(cafile=certifi.where())
+        except Exception:
+            pass
+        if ssl_ctx is None:
+            try:
+                ssl_ctx = _ssl.create_default_context()
+            except Exception:
+                ssl_ctx = _ssl._create_unverified_context()
+        with urllib.request.urlopen(req, timeout=10, context=ssl_ctx) as resp:
+            if resp.status not in (200, 202):
+                logger.warning(f"[WARN] Teams webhook returned HTTP {resp.status}")
+                return None
+            raw = resp.read().decode("utf-8", errors="ignore")
+            if not raw.strip():
+                return {}
+            return json.loads(raw)
+    except Exception as e:
+        logger.warning(f"[WARN] Teams webhook call failed: {e}")
+        return None
+
+
+# ---------------------------------------------------------
+# PERSISTENT PER-EMPLOYEE CARD (create-once, update-forever)
+# ---------------------------------------------------------
+# The old model: every event (check-in, override, leave...) posts a brand
+# new Teams message. At 140+ people checking in twice a day, that's a
+# firehose. The new model: each employee has exactly ONE card, which gets
+# edited in place every time their status changes — plus a threaded reply
+# under that card so a change is still visible in the channel feed, just
+# without spawning a new top-level post every time.
+#
+# This only works through a Power Automate flow (not the old Incoming
+# Webhook connector, which can only ever post new messages) — the flow
+# needs to branch on an `action` field in the payload:
+#
+#   action="create_or_update_card": if `message_id` is present, edit that
+#   message with the new `card`; if it's null, post `card` as a new
+#   message and respond with {"message_id": "<the new id>"} so we can
+#   remember it. Either way, respond synchronously (a Response action in
+#   the flow) — that's what lets us read the id straight off the HTTP
+#   response instead of needing a separate callback into our own API.
+#
+#   action="reply": post `text` as a threaded reply under `message_id`.
+#
+# Card content and history (who has which message_id) live in OUR
+# database, not the flow — the flow is deliberately kept dumb (create-or-
+# update, reply), all the actual logic of "what does this person's card
+# say right now" happens in Python where it's easy to test and change.
+
+# Maps a status word to a pill's colour. Adaptive Cards don't have a
+# native "pill/chip" component, so pills are built as small bordered
+# Containers with a semantic `style` (good/attention/warning/accent/
+# default) — that's the same styling vocabulary the rest of this file
+# already uses for card accent colours, just applied per-pill instead of
+# per-card.
+_PILL_STYLES = {
+    "wfo":              "good",
+    "wfh":               "accent",
+    "vpn_ambiguous":     "warning",
+    "leave":             "accent",
+    "public_holiday":    "accent",
+    "flagged":           "attention",
+    "vpn_on":            "accent",
+    "confidence_high":   "good",
+    "confidence_medium": "warning",
+    "confidence_low":    "attention",
+    "default":           "default",
+}
+
+def build_status_pills(status: str, vpn_active: bool, confidence: str,
+                        flagged: bool, flag_reason: str | None,
+                        leave_label: str | None = None) -> list[dict]:
+    """
+    Turns a person's current attendance state into the list of pills their
+    card should show right now — status, VPN, confidence, and a flag pill
+    if something looks off. Same inputs the dashboard's own status chips
+    are built from, just rendered for Teams instead of the browser.
+    """
+    pills = []
+    if leave_label:
+        pills.append({"text": leave_label, "style": _PILL_STYLES["leave"]})
+    elif status == "wfo":
+        pills.append({"text": "In office", "style": _PILL_STYLES["wfo"]})
+    elif status == "wfh":
+        pills.append({"text": "Working from home", "style": _PILL_STYLES["wfh"]})
+    elif status:
+        pills.append({"text": status.replace("_", " ").title(), "style": _PILL_STYLES["default"]})
+
+    if vpn_active:
+        pills.append({"text": "VPN on", "style": _PILL_STYLES["vpn_on"]})
+
+    if confidence:
+        pills.append({"text": f"{confidence.capitalize()} confidence",
+                       "style": _PILL_STYLES.get(f"confidence_{confidence}", "default")})
+
+    if flagged:
+        pills.append({"text": _redact_ip(flag_reason) or "Flagged", "style": _PILL_STYLES["flagged"]})
+
+    return pills
+
+def build_employee_card(employee_name: str, employee_id: str, team: str | None,
+                         pills: list[dict], last_updated: str) -> dict:
+    """The one persistent card per employee — see module docstring above."""
+    pill_columns = [{
+        "type": "Column", "width": "auto",
+        "items": [{
+            "type": "Container", "style": p["style"], "bleed": False,
+            "spacing": "None",
+            "items": [{"type": "TextBlock", "text": p["text"], "size": "Small",
+                       "weight": "Bolder", "wrap": False}],
+        }],
+    } for p in pills]
+
+    return {
+        "type": "AdaptiveCard",
+        "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+        "version": "1.4",
+        "body": [
+            {
+                "type": "ColumnSet",
+                "columns": [
+                    {"type": "Column", "width": "auto", "items": [{
+                        "type": "TextBlock", "text": employee_name, "weight": "Bolder", "size": "Medium",
+                    }]},
+                    {"type": "Column", "width": "stretch", "items": [{
+                        "type": "TextBlock", "text": f"{employee_id}" + (f" · {team}" if team else ""),
+                        "size": "Small", "isSubtle": True, "horizontalAlignment": "Right",
+                    }]},
+                ],
+            },
+            {"type": "ColumnSet", "spacing": "Medium", "wrap": True, "columns": pill_columns} if pill_columns
+                else {"type": "TextBlock", "text": "No status yet", "isSubtle": True},
+            {"type": "TextBlock", "text": f"Last updated {last_updated} · This card updates automatically",
+             "size": "Small", "isSubtle": True, "spacing": "Medium", "wrap": True},
+        ],
+    }
+
+def upsert_employee_card(employee_id: str, employee_name: str, team: str | None,
+                          pills: list[dict], existing_message_id: str | None,
+                          webhook: str | None) -> str | None:
+    """
+    Create the employee's card if they don't have one yet, or edit their
+    existing one in place. Returns the message_id to persist (same as
+    existing_message_id if this was an edit, a new one if this was a
+    create) — or None if the send failed, in which case the caller should
+    NOT overwrite whatever message_id it already had stored.
+    """
+    if not webhook:
+        return existing_message_id
+    from datetime import datetime as _dt
+    last_updated = _dt.now().strftime("%a %d %b, %H:%M")
+    card = build_employee_card(employee_name, employee_id, team, pills, last_updated)
+    payload = {
+        "action": "create_or_update_card",
+        "employee_id": employee_id,
+        "message_id": existing_message_id,
+        "card": card,
+    }
+    result = _send_teams_json(webhook, payload)
+    if result is None:
+        logger.warning(f"[WARN] Card upsert failed for {employee_id} - keeping old message_id")
+        return existing_message_id
+    new_id = result.get("message_id") or existing_message_id
+    if not new_id:
+        logger.warning(f"[WARN] Flow didn't return a message_id for {employee_id}'s new card")
+    return new_id
+
+def post_employee_reply(message_id: str | None, text: str, webhook: str | None) -> bool:
+    """Post a threaded reply under an employee's card — this is the actual
+    'ping' people see; the card edit above is silent on its own."""
+    if not webhook or not message_id:
+        return False
+    payload = {"action": "reply", "message_id": message_id, "text": _redact_ip(text)}
+    return _send_teams_json(webhook, payload) is not None
+
+
 def _send_desktop(title: str, body: str):
     """Send a native desktop notification."""
     system = platform.system()
