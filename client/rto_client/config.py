@@ -60,7 +60,7 @@ try:
         notify_vpn_ambiguous, notify_server_unreachable,
         notify_missed_days, notify_queue_flushed,
         notify_queue_saved, notify_registration_needed,
-        notify_registration_complete,
+        notify_registration_complete, post_employee_reply,
         LEVEL_ALL, LEVEL_IMPORTANT, LEVEL_ERRORS,
     )
     NOTIFIER_AVAILABLE = True
@@ -77,6 +77,7 @@ except ImportError:
     def notify_queue_saved(*a, **kw): pass
     def notify_registration_needed(*a, **kw): pass
     def notify_registration_complete(*a, **kw): pass
+    def post_employee_reply(*a, **kw): return False
     logger.warning("[WARN] notifier not available - Teams notifications disabled")
 
 # ── CONFIG ───────────────────────────────────────────────────────────────────

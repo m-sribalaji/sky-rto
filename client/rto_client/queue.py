@@ -26,12 +26,14 @@ def _write_secure_file(path: Path, content: str):
     except Exception:
         pass
 
-def queue_checkin(payload: dict):
+def queue_checkin(payload: dict) -> int:
+    """Stash payload for later sync. Returns the queue's new length so the
+    caller can report 'N records queued' without a separate read."""
     from datetime import datetime as _dt
     date_str = payload.get("date", "")
     try:
         if _dt.strptime(date_str, "%Y-%m-%d").weekday() >= 5:
-            logger.info(f"Weekend date {date_str} - not queuing"); return
+            logger.info(f"Weekend date {date_str} - not queuing"); return 0
     except Exception: pass
 
     queue = []
@@ -43,6 +45,7 @@ def queue_checkin(payload: dict):
     queue.append(payload)
     _write_secure_file(QUEUE_FILE, json.dumps(queue, indent=2))
     logger.info(f"Queued check-in for {payload.get('date')} (server unreachable)")
+    return len(queue)
 
 def flush_queue(server: str, cfg: dict = None) -> tuple:
     """Flush offline queue. Returns (count, [(payload, response)]) so caller

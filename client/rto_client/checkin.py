@@ -18,6 +18,7 @@ from .config import (
     QUEUE_FILE, CONFIG_DIR,
     NOTIFIER_AVAILABLE,
     notify_registration_needed, notify_registration_complete,
+    post_employee_reply,
 )
 from .network import get_lan_ip, get_vpn_tunnel_ip, get_dns_info, get_is_ethernet
 from .classify import classify_locally, location_changed
@@ -85,18 +86,31 @@ def run_checkin(force: bool = False):
         if not server_reachable(server):
             logger.warning(f"[WARN] Server unreachable at {server}")
             if local_class in ("wfo", "wfh"):
-                queue_checkin(payload)
+                queue_len = queue_checkin(payload)
                 cfg["last_checkin_date"]   = today
                 cfg["last_status"]         = local_class
                 cfg["last_detected_class"] = local_class
                 save_config(cfg)
-                # Desktop notification only when offline —
-                # Teams webhook also needs internet so don't attempt it.
-                # The proper WFH/WFO Teams card fires when VPN reconnects
-                # and the queue is flushed.
                 _desktop_notify("RTO Tracker",
                     f"Server offline. {local_class.upper()} check-in saved locally "
                     f"and will sync automatically when VPN connects.")
+                # The server being unreachable (internal VPN-only endpoint)
+                # doesn't mean the internet is down — the Teams webhook is
+                # a normal external HTTPS endpoint, so it's still reachable
+                # from here even when the RTO server isn't. Ping it
+                # directly so this doesn't go silent until whenever the
+                # queue eventually flushes; the eventual real sync still
+                # updates the persistent card itself (see queue-flush
+                # comment below), this is just the "saved offline" ping.
+                employee_id = cfg.get("employee_id")
+                if NOTIFIER_AVAILABLE and employee_id:
+                    post_employee_reply(
+                        employee_id,
+                        f"Server unreachable — {local_class.upper()} check-in saved "
+                        f"locally ({queue_len} record{'s' if queue_len != 1 else ''} "
+                        f"queued). Will sync automatically once VPN connects.",
+                        cfg.get("teams_webhook"),
+                    )
             else:
                 _desktop_notify("RTO Tracker",
                        "Server unreachable. Connect Sky VPN for attendance tracking.")
@@ -184,7 +198,16 @@ def run_checkin(force: bool = False):
         if not response:
             logger.error("[FAIL] Check-in POST failed - queuing for retry")
             if local_class in ("wfo", "wfh"):
-                queue_checkin(payload)
+                queue_len = queue_checkin(payload)
+                employee_id = cfg.get("employee_id")
+                if NOTIFIER_AVAILABLE and employee_id:
+                    post_employee_reply(
+                        employee_id,
+                        f"Check-in failed to reach server — {local_class.upper()} "
+                        f"saved locally ({queue_len} record{'s' if queue_len != 1 else ''} "
+                        f"queued). Will retry automatically.",
+                        cfg.get("teams_webhook"),
+                    )
             return
 
         action = response.get("action")
