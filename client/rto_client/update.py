@@ -167,15 +167,33 @@ def check_and_apply_update() -> bool:
             _desktop_notify("RTO Tracker", f"Updating to {latest_tag} — will restart shortly.")
             sys.exit(0)
         else:
-            # macOS: atomic replace then exec into new binary
+            # macOS: atomic replace, then hand off to the new binary as a
+            # fresh child process instead of self-exec'ing in place.
+            # os.execv() replacing a process's own image right after its
+            # backing file was rewritten out from under it is a fragile
+            # path on Apple Silicon — if it silently fails, the exception
+            # handler below just logs and returns, leaving this OLD
+            # process running forever with yesterday's _BAKED_VERSION
+            # baked into its already-loaded memory, even though the file
+            # on disk is already the new version. That's exactly what
+            # produced the stuck-forever "current: v0.0.41" loop: same
+            # build re-downloaded and "replaced" every day, never
+            # actually taking effect. Spawning a detached child and
+            # exiting (same pattern the Windows branch above already
+            # uses) means a failure here kills this process outright,
+            # so launchd's KeepAlive relaunches it fresh from the
+            # already-updated file instead of looping as a stale zombie.
             if current_binary.exists():
                 try: current_binary.rename(backup_path)
                 except Exception: pass
             tmp_path.rename(current_binary)
             current_binary.chmod(0o755)
-            logger.info(f"[update] Binary replaced. Restarting as v{latest_tag}...")
+            logger.info(f"[update] Binary replaced. Launching v{latest_tag}...")
             _desktop_notify("RTO Tracker", f"Updated to {latest_tag} — restarting.")
-            os.execv(str(current_binary), sys.argv)  # in-place restart
+            import subprocess as _sp
+            _sp.Popen([str(current_binary)] + sys.argv[1:],
+                      start_new_session=True, close_fds=True)
+            sys.exit(0)
     except Exception as e:
         logger.error(f"[update] Replace/restart failed: {e}")
         # Restore backup if available
