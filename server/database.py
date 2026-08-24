@@ -224,7 +224,14 @@ class Narrative(Base):
     subject_type  = Column(String, nullable=False)   # "employee" | "team"
     subject_id    = Column(String, nullable=False)   # employee_id or team name
     section       = Column(String, nullable=False)   # "progress" | "pattern" | "compliance_outlook" | "team_rhythm"
-    source_hash   = Column(String, nullable=False)
-    narrative_text = Column(Text, nullable=False)
-    generated_at  = Column(DateTime, default=lambda: datetime.now(timezone.utc),
-                            onupdate=lambda: datetime.now(timezone.utc))
+    source_hash   = Column(String, nullable=True)     # null until the first successful generation
+    narrative_text = Column(Text, nullable=True)       # null until the first successful generation
+    generated_at  = Column(DateTime, nullable=True)    # only set on a SUCCESSFUL generation
+    # Set on every call attempt, success or failure — this is what actually
+    # rate-limits the narrator. generated_at alone can't do it: a section
+    # whose every attempt fails (e.g. a bad API parameter) never gets a
+    # successful generated_at, so a rate floor keyed only on that field is
+    # a no-op for exactly the case that needs it most — a persistently
+    # failing section retrying, and getting billed for it, on every single
+    # page load with no backoff at all.
+    last_attempt_at = Column(DateTime, nullable=True)

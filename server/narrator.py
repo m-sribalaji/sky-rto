@@ -120,7 +120,17 @@ def _call_openai(facts: dict, section_hint: str) -> Optional[str]:
         # at a value: reasoning-capable models often restrict or reject it
         # entirely, and this task has no need for sampling variance anyway
         # — consistent, factual paraphrasing is the goal, not creativity.
-        "max_completion_tokens": 200,
+        "max_completion_tokens": 400,
+        # gpt-5.6-luna defaults to *medium* reasoning effort, which spends
+        # part of the token budget on hidden reasoning before it ever
+        # writes visible output — with the old 200-token ceiling that ate
+        # the entire budget and every single call failed with "max_tokens
+        # or model output limit was reached", silently, on every page
+        # load, forever (see get_narrative's failure-tracking for why that
+        # was also unrate-limited). This task is templated paraphrasing of
+        # a facts dict, not analysis — it has no use for reasoning at all,
+        # so turn it off outright rather than just budgeting around it.
+        "reasoning_effort": "none",
     }
     try:
         req = urllib.request.Request(
@@ -176,25 +186,40 @@ async def get_narrative(db: AsyncSession, subject_type: str, subject_id: str,
         if row and row.source_hash == new_hash:
             return row.narrative_text
 
-        if row and row.generated_at:
-            gen_at = row.generated_at.replace(tzinfo=timezone.utc) if row.generated_at.tzinfo is None else row.generated_at
-            age = (datetime.now(timezone.utc) - gen_at).total_seconds()
+        # Rate floor keyed on last_attempt_at, NOT generated_at — a section
+        # whose every call fails never sets generated_at, so a floor keyed
+        # only on that field would never engage for exactly the case that
+        # needs it: unbounded retries of a persistently-failing call.
+        if row and row.last_attempt_at:
+            last = row.last_attempt_at.replace(tzinfo=timezone.utc) if row.last_attempt_at.tzinfo is None else row.last_attempt_at
+            age = (datetime.now(timezone.utc) - last).total_seconds()
             if age < MIN_REGEN_SECONDS:
-                logger.info(f"[INFO] Skipping regen for {key} - last generated {int(age)}s ago (floor: {MIN_REGEN_SECONDS}s)")
+                logger.info(f"[INFO] Skipping regen for {key} - last attempt {int(age)}s ago (floor: {MIN_REGEN_SECONDS}s)")
                 return row.narrative_text
+
+        # Record the attempt BEFORE calling the API, and commit immediately
+        # — so even if this call fails, hangs, or the process dies mid-call,
+        # the next request still sees a recent last_attempt_at and backs
+        # off, instead of every concurrent/subsequent request racing to
+        # retry a call that was already known to be failing.
+        if row:
+            row.last_attempt_at = datetime.now(timezone.utc)
+        else:
+            row = Narrative(subject_type=subject_type, subject_id=subject_id, section=section,
+                             last_attempt_at=datetime.now(timezone.utc))
+            db.add(row)
+        await db.commit()
 
         text = _call_openai(facts, section)
         if text is None:
             # Generation failed — serve the last good narrative rather than
-            # nothing, if one exists. It's stale-but-plausible, which beats a
-            # blank card; the raw numbers are shown alongside it regardless.
-            return row.narrative_text if row else None
+            # nothing, if one exists (None if there's never been one). The
+            # attempt is already recorded above, so this failure is rate-
+            # limited on the next call regardless of what happens here.
+            return row.narrative_text
 
-        if row:
-            row.source_hash = new_hash
-            row.narrative_text = text
-        else:
-            db.add(Narrative(subject_type=subject_type, subject_id=subject_id,
-                              section=section, source_hash=new_hash, narrative_text=text))
+        row.source_hash = new_hash
+        row.narrative_text = text
+        row.generated_at = datetime.now(timezone.utc)
         await db.commit()
         return text
