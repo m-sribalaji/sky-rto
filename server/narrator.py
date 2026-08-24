@@ -19,12 +19,14 @@ Failure is always silent and non-fatal: a narrator outage means the UI
 falls back to showing the raw numbers it already showed before this
 existed, never a broken page.
 """
+import asyncio
 import hashlib
 import json
 import logging
 import os
 import urllib.request
 import urllib.error
+from datetime import datetime, timezone
 from typing import Optional
 
 from sqlalchemy import select
@@ -49,6 +51,30 @@ if not NARRATOR_AVAILABLE:
 # users instead of every previously-cached sentence just sitting there
 # looking unaffected until its own facts happen to change.
 PROMPT_VERSION = 2
+
+# Hard floor, independent of the hash-based caching above: no (subject,
+# section) may call the API more than once in this window, full stop,
+# even if its facts genuinely changed twice within it. This exists as a
+# circuit breaker for the failure mode this system actually hit — a
+# too-frequent page auto-refresh multiplying calls far beyond what the
+# facts justified. Caching alone assumes the request rate is sane; this
+# doesn't assume that.
+MIN_REGEN_SECONDS = 300
+
+# Per-(subject,section) locks, scoped to this process. Two overlapping
+# requests for the same row (two tabs, a refresh landing mid-request) used
+# to both pass the "no cached row yet" check before either had committed,
+# both call the API, and both try to insert — creating duplicate rows that
+# then made the cache lookup itself unreliable (get_narrative could hit
+# either duplicate depending on the SELECT order, so unrelated calls
+# started re-triggering too). This serializes access to a given key
+# instead.
+_locks: dict[str, asyncio.Lock] = {}
+
+def _lock_for(key: str) -> asyncio.Lock:
+    if key not in _locks:
+        _locks[key] = asyncio.Lock()
+    return _locks[key]
 
 _SYSTEM_PROMPT = """You summarize workplace attendance data for one person to read about themselves.
 
@@ -137,29 +163,38 @@ async def get_narrative(db: AsyncSession, subject_type: str, subject_id: str,
     if not NARRATOR_AVAILABLE:
         return None
 
-    new_hash = _facts_hash(section, facts)
-    q = await db.execute(select(Narrative).where(
-        Narrative.subject_type == subject_type,
-        Narrative.subject_id == subject_id,
-        Narrative.section == section,
-    ))
-    row = q.scalars().first()
+    key = f"{subject_type}:{subject_id}:{section}"
+    async with _lock_for(key):
+        new_hash = _facts_hash(section, facts)
+        q = await db.execute(select(Narrative).where(
+            Narrative.subject_type == subject_type,
+            Narrative.subject_id == subject_id,
+            Narrative.section == section,
+        ).order_by(Narrative.id.desc()))
+        row = q.scalars().first()
 
-    if row and row.source_hash == new_hash:
-        return row.narrative_text
+        if row and row.source_hash == new_hash:
+            return row.narrative_text
 
-    text = _call_openai(facts, section)
-    if text is None:
-        # Generation failed — serve the last good narrative rather than
-        # nothing, if one exists. It's stale-but-plausible, which beats a
-        # blank card; the raw numbers are shown alongside it regardless.
-        return row.narrative_text if row else None
+        if row and row.generated_at:
+            gen_at = row.generated_at.replace(tzinfo=timezone.utc) if row.generated_at.tzinfo is None else row.generated_at
+            age = (datetime.now(timezone.utc) - gen_at).total_seconds()
+            if age < MIN_REGEN_SECONDS:
+                logger.info(f"[INFO] Skipping regen for {key} - last generated {int(age)}s ago (floor: {MIN_REGEN_SECONDS}s)")
+                return row.narrative_text
 
-    if row:
-        row.source_hash = new_hash
-        row.narrative_text = text
-    else:
-        db.add(Narrative(subject_type=subject_type, subject_id=subject_id,
-                          section=section, source_hash=new_hash, narrative_text=text))
-    await db.commit()
-    return text
+        text = _call_openai(facts, section)
+        if text is None:
+            # Generation failed — serve the last good narrative rather than
+            # nothing, if one exists. It's stale-but-plausible, which beats a
+            # blank card; the raw numbers are shown alongside it regardless.
+            return row.narrative_text if row else None
+
+        if row:
+            row.source_hash = new_hash
+            row.narrative_text = text
+        else:
+            db.add(Narrative(subject_type=subject_type, subject_id=subject_id,
+                              section=section, source_hash=new_hash, narrative_text=text))
+        await db.commit()
+        return text

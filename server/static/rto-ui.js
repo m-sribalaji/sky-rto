@@ -1463,8 +1463,14 @@ async function initApp(){
       else if(a==='leavemgmt')  loadTeamLeave();   // only refresh the calendar, not the form
       else if(a==='anomalies')  loadAnomalies();
       else if(a==='team')       loadTeam();
-      else if(a==='insights') loadInsights();
-      else if(a==='rhythm')   loadRhythm();
+      // insights/rhythm deliberately excluded from the 60s auto-refresh:
+      // both call the OpenAI-backed narrator on every load, and that's
+      // designed around updating roughly once a day (or on a real status
+      // change), not once a minute. Auto-polling them here was hitting
+      // the API dozens of times an hour just from a tab sitting open —
+      // real cost for zero benefit, since the underlying numbers weren't
+      // changing that often anyway. The manual Refresh button still
+      // reloads them on demand.
       else nav(a); // for other pages (config, roles etc) full nav is fine
     }catch(e){}
   },60000);
