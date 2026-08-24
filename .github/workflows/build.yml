@@ -90,6 +90,19 @@ jobs:
             --name rto-mac-arm64 \
             scripts/rto_agent_mac.py
 
+      - name: Ad-hoc codesign the binary
+        run: |
+          # Apple Silicon macOS refuses to even start an unsigned Mach-O
+          # binary — the kernel kills it before any code runs, no error
+          # message, nothing. That bit twice: once on a manual curl
+          # download, once via the client's own self-updater silently
+          # downloading and swapping in this same unsigned binary. Signing
+          # it once here means every future download (manual or
+          # auto-update) inherits a valid signature automatically, since
+          # they're all just fetching these exact same release bytes.
+          codesign --force --deep --sign - dist/rto-mac-arm64
+          codesign --verify --verbose dist/rto-mac-arm64
+
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
