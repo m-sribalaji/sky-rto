@@ -1772,7 +1772,7 @@ async function loadInsights(){
         </div>
         ${d.confidence !== 'insufficient' ? `
         <div style="font-family:var(--mono);font-size:10px;color:var(--tx3)">
-          Based on ${ownerLabel.toLowerCase()} pattern: predicted month-end total ~${Math.round(projected)} days
+          Based on recorded pattern: predicted month-end total ~${Math.round(projected)} days
         </div>` : ''}
       </div>` : `
       <div style="font-family:var(--mono);font-size:11px;color:var(--green)">
@@ -2031,7 +2031,7 @@ async function loadInsights(){
         ${budgetHtml}
         <div style="display:flex;flex-direction:column;gap:10px">${weekRows}</div>
         <div style="font-family:var(--mono);font-size:10px;color:var(--tx3);margin-top:10px;padding-top:8px;border-top:1px solid var(--b0)">
-          Forecast days are based on ${ownerLabel.toLowerCase()} usual pattern for that weekday — hover any
+          Forecast days are based on the usual pattern for that weekday — hover any
           day for its confidence level. No forecast is a guarantee, it just reflects past behaviour.
         </div>
       </div>`;
