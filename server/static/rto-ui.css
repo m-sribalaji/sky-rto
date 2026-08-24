@@ -139,3 +139,33 @@ input::placeholder,textarea::placeholder{color:var(--tx3);}textarea{resize:verti
 .role-pill.admin{background:var(--pbg);color:var(--purple);}.role-pill.manager{background:var(--abg);color:var(--amber);}.role-pill.employee{background:var(--bg3);color:var(--tx3);}
 .day-preview{font-family:var(--mono);font-size:11px;color:var(--accl);min-height:16px;margin:-6px 0 8px;}
 ::-webkit-scrollbar{width:4px;}::-webkit-scrollbar-thumb{background:var(--bg3);border-radius:4px;}
+
+/* ── Insights / Team Rhythm legibility ────────────────────────────────────
+   These two pages build almost everything through inline styles in
+   rto-ui.js, most of it at 7-10px with --tx3 (a deliberately low-contrast
+   gray, fine for a stat label next to a big number, not fine for a whole
+   sentence of body copy — several rows here are dense enough to read as
+   near-illegible, especially in light mode where --tx3 sits closer to the
+   background). Rather than hand-edit every inline style across a page
+   that size, override by attribute match, scoped to just these two pages
+   so nothing elsewhere in the app changes. */
+#page-insights [style*="font-size:7px"],
+#page-insights [style*="font-size:8px"],
+#page-insights [style*="font-size:9px"],
+#page-rhythm   [style*="font-size:7px"],
+#page-rhythm   [style*="font-size:8px"],
+#page-rhythm   [style*="font-size:9px"]{
+  font-size:11px !important;
+}
+#page-insights [style*="font-size:10px"],
+#page-rhythm   [style*="font-size:10px"]{
+  font-size:12px !important;
+}
+#page-insights [style*="color:var(--tx3)"],
+#page-rhythm   [style*="color:var(--tx3)"]{
+  color:var(--tx2) !important;
+}
+#page-insights,
+#page-rhythm{
+  line-height:1.65;
+}

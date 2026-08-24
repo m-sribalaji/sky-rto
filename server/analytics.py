@@ -820,6 +820,57 @@ def compute_predictability(att: dict[str, str], today: date, ph_dates: set[str],
     return max(0.0, min(1.0, skill))
 
 
+def detect_trend_shift(att: dict[str, str], today: date, ph_dates: set[str],
+                        window: int = RECENT_LEVEL_WINDOW, min_prior: int = 10,
+                        threshold: float = 0.25) -> dict:
+    """
+    Descriptive only — this does NOT feed the prediction pipeline (that's
+    already handled by compute_recent_level naturally following a regime
+    change). This exists purely so the narrator can say "your pattern
+    shifted" as a stated fact instead of the LLM inferring it from raw
+    history, which is exactly the kind of unverified pattern-reading this
+    whole model rebuild was about removing.
+
+    Because it doesn't touch a prediction, it isn't backtested for Brier
+    score the way the prediction terms are — there's no probability here
+    to score. What "correct" means for this function is narrower and
+    checkable directly: does recent behaviour actually differ from prior
+    behaviour by more than `threshold`, with enough observations on both
+    sides to say so. That's a deterministic comparison, not a forecast.
+
+    Returns {detected: False} when there isn't enough history on both
+    sides of the window, or the difference is within noise range.
+    """
+    working_days = sorted(
+        ds for ds, st in att.items()
+        if st in ("wfo", "wfh") and ds < today.isoformat()
+        and ds not in ph_dates and _is_weekday(date.fromisoformat(ds))
+    )
+    if len(working_days) < min_prior + max(4, window // 2):
+        return {"detected": False}
+
+    recent_days = working_days[-window:]
+    prior_days  = working_days[:-window]
+    if len(recent_days) < max(4, window // 2) or len(prior_days) < min_prior:
+        return {"detected": False}
+
+    recent_rate = sum(1 for ds in recent_days if att[ds] == "wfo") / len(recent_days)
+    prior_rate  = sum(1 for ds in prior_days if att[ds] == "wfo") / len(prior_days)
+    magnitude = recent_rate - prior_rate
+
+    if abs(magnitude) < threshold:
+        return {"detected": False}
+
+    return {
+        "detected": True,
+        "since": recent_days[0],
+        "direction": "toward_office" if magnitude > 0 else "toward_home",
+        "magnitude_percent": round(abs(magnitude) * 100),
+        "recent_rate_percent": round(recent_rate * 100),
+        "prior_rate_percent": round(prior_rate * 100),
+    }
+
+
 def compute_compliance_responsiveness(att: dict[str, str], ph_dates: set[str], today: date,
                                        weekly_target: int = WEEKLY_WFO_TARGET,
                                        alpha: float = 0.35) -> float:
@@ -1097,6 +1148,7 @@ def compute_forecast(
                  and not f.get("certain") and f["status"] == "predicted_wfo"]
     monthly["predicted_additional"] = len(month_rem)
     monthly["predicted_total"]      = monthly["actual_wfo"] + len(month_rem)
+    trend_shift = detect_trend_shift(att, today, ph_dates)
 
     return {
         "model_version":         MODEL_VERSION,
@@ -1104,6 +1156,7 @@ def compute_forecast(
         "employee_name":         employee_name,
         "confidence":            reported_conf,
         "confidence_label":      _confidence_label(reported_conf),
+        "trend_shift":           trend_shift,
         "data_confidence":       global_conf,      # how much history exists
         "predictability":        round(predictability, 3),  # measured skill, 0..1
         "active_weeks":          active_weeks,

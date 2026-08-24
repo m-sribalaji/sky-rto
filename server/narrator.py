@@ -35,10 +35,9 @@ from database import Narrative
 logger = logging.getLogger("narrator")
 
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
-# No specific model is hardcoded here on purpose — set this to whatever
-# your OpenAI account's current flagship model is called at deploy time.
-# Check the OpenAI dashboard/docs for the current model ID; don't guess.
-OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o")
+# Still overridable via env var — set OPENAI_MODEL if this needs to change
+# without a redeploy.
+OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-5.6-luna")
 OPENAI_URL = "https://api.openai.com/v1/chat/completions"
 
 NARRATOR_AVAILABLE = bool(OPENAI_API_KEY)
@@ -53,7 +52,8 @@ Rules, all of them hard requirements:
 - Never state or imply more certainty than the facts themselves state. If a fact says confidence is low, your tone must reflect that.
 - Write 1-3 plain sentences, no bullet points, no markdown, no headers, no emoji.
 - Address the reader as "you". Be direct and factual, not motivational or apologetic.
-- If the facts are sparse or the situation is unremarkable, say less — don't pad."""
+- If the facts are sparse or the situation is unremarkable, say less — don't pad.
+- Some facts describe something that may or may not have happened, marked with a "detected" or similar boolean. If it's false, don't mention that fact at all — don't say "no shift was detected", just omit it entirely."""
 
 
 def _facts_hash(section: str, facts: dict) -> str:

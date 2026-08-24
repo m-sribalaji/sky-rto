@@ -156,12 +156,14 @@ async def get_insights(employee_id: str, request: Request = None,
             "on_track": m["on_track"], "predicted_total": m.get("predicted_total"),
             "confidence_label": result["confidence_label"],
             "predictability": result["predictability"],
+            "trend_shift": result["trend_shift"],
         }
         pattern_facts = {
             "dow_rates_percent": {_DOW_NAMES[int(k)]: round(v * 100) for k, v in result["dow_rates_stable"].items()},
             "active_weeks": result["active_weeks"],
             "confidence_label": result["confidence_label"],
             "predictability": result["predictability"],
+            "trend_shift": result["trend_shift"],
         }
         outlook_facts = {
             "wfh_budget": result["wfh_budget"],
