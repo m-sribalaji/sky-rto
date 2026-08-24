@@ -1769,10 +1769,14 @@ async function loadInsights(){
       <div class="card-title">${ownerLabel} WFO Pattern <span class="card-sub">Day-of-week baseline</span></div>
       <div style="display:flex;gap:8px;align-items:flex-end;height:80px">${dowBars}</div>
       <div style="font-family:var(--mono);font-size:10px;color:var(--tx3);margin-top:8px">
-        Based on ${d.active_weeks} week${d.active_weeks!==1?'s':''} of data — ${d.confidence_label}
+        Based on ${d.active_weeks} week${d.active_weeks!==1?'s':''} of recorded days — this is what has
+        actually happened, not a prediction.
       </div>
       <div style="font-family:var(--mono);font-size:10px;color:var(--tx3);margin-top:4px;border-top:1px solid var(--b0);padding-top:6px">
-        Stable 12-week average. Single deviations do not change this view.
+        Stable 12-week average — single deviations don't move these bars.
+        ${d.predictability !== undefined ? `<br>How well this predicts upcoming days: <span style="color:${
+          d.confidence==='high'?'var(--green)':d.confidence==='medium'?'var(--amber)':'var(--tx2)'
+        }">${d.confidence_label}</span>` : ''}
       </div>
     </div>`;
 

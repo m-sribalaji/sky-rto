@@ -157,10 +157,40 @@ def _confidence_tier(n_obs: int) -> str:
 def _confidence_label(tier: str) -> str:
     return {
         "insufficient": "Not enough data yet",
-        "low":          "Low confidence — limited history",
-        "medium":       "Medium confidence — pattern stabilising",
-        "high":         "High confidence — strong historical pattern",
+        "low":          "Low confidence — recent days don't follow a clear pattern",
+        "medium":       "Medium confidence — pattern is somewhat variable",
+        "high":         "High confidence — consistent, predictable pattern",
     }.get(tier, tier)
+
+_TIER_ORDER = ["insufficient", "low", "medium", "high"]
+
+def _predictability_tier(skill: float) -> str:
+    """
+    Turn a measured skill score (see compute_predictability) into a tier.
+    Thresholds are deliberately demanding: beating a flat "predict this
+    person's own base rate" benchmark by a few percent is not a pattern
+    worth calling strong.
+    """
+    if skill >= 0.30: return "high"
+    if skill >= 0.15: return "medium"
+    if skill >= 0.05: return "low"
+    return "insufficient"
+
+def _combined_confidence(data_tier: str, skill_tier: str) -> str:
+    """
+    Report the WEAKER of "how much history exists" and "how well that
+    history actually predicts this person" — because both have to hold for
+    a confident forecast to be honest.
+
+    Data volume alone used to drive this, which produced the exact claim
+    this model was rebuilt to stop making: an employee with two months of
+    records was labelled "High confidence — strong historical pattern"
+    while the model's own measured skill on them was ~0.1, barely above
+    guessing. Plenty of data about someone whose behaviour just changed is
+    still plenty of data — it just doesn't license confidence about
+    tomorrow.
+    """
+    return _TIER_ORDER[min(_TIER_ORDER.index(data_tier), _TIER_ORDER.index(skill_tier))]
 
 # ── Wilson score confidence interval (Fix #2) ──────────────────────────────
 def _wilson_interval(successes: int, n: int, z: float = WILSON_Z) -> tuple[float, float]:
@@ -952,6 +982,9 @@ def compute_forecast(
     # four, where a linear curve under-sharpened real patterns and a raw
     # pass-through over-trusted noise.
     shrink = max(0.10, min(0.90, (predictability ** 0.5) * 0.9))
+    # What gets shown to the user: the weaker of "how much history exists"
+    # and "how well that history actually predicts this person".
+    reported_conf = _combined_confidence(global_conf, _predictability_tier(predictability))
 
     prev_status = _last_workday_status(att, today, ph_dates)
 
@@ -1069,8 +1102,10 @@ def compute_forecast(
         "model_version":         MODEL_VERSION,
         "employee_id":           employee_id,
         "employee_name":         employee_name,
-        "confidence":            global_conf,
-        "confidence_label":      _confidence_label(global_conf),
+        "confidence":            reported_conf,
+        "confidence_label":      _confidence_label(reported_conf),
+        "data_confidence":       global_conf,      # how much history exists
+        "predictability":        round(predictability, 3),  # measured skill, 0..1
         "active_weeks":          active_weeks,
         "dow_rates":             {str(k): round(v,3) for k,v in dow_rates.items()},
         "dow_rates_stable":      {str(k): v for k, v in dow_rates_stable.items()},
