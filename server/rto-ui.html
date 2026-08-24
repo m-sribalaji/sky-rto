@@ -7,7 +7,7 @@
 <script>
 // Set before the stylesheet loads so there's no flash of the wrong theme
 // on first paint — see theme.js for the rest of the light/dark/system switcher.
-(function(){var t=localStorage.getItem('_sk_theme');if(t==='light'||t==='dark')document.documentElement.setAttribute('data-theme',t);})();
+(function(){var t=localStorage.getItem('_sk_theme');if(t!=='light'&&t!=='dark'&&t!=='system')t='light';if(t==='light'||t==='dark')document.documentElement.setAttribute('data-theme',t);})();
 </script>
 <!-- CSS and JS used to live inline here; they now live in server/static/rto-ui.css and rto-ui.js -->
 <link rel="icon" type="image/png" href="/static/sky-logo.png"/>
@@ -20,18 +20,34 @@
 <aside class="sidebar">
   <div class="sb-top"><div class="logo"><div class="logo-icon"><img src="/static/sky-logo.png" alt="Sky RTO"/></div><div><div class="logo-name">RTO Tracker</div><div class="logo-sub"></div></div></div></div>
   <nav class="sb-nav" id="sb-nav"></nav>
-  <div class="sb-footer"><div class="user-chip">
-    <div class="ava" id="sb-ava">?</div>
-    <div style="flex:1;min-width:0"><div class="u-name" id="sb-name">Loading</div><div class="u-id" id="sb-id">-</div><div class="u-role" id="sb-role-badge"></div></div>
-    <div class="s-dot" id="s-dot"></div>
-  </div>
-  <div style="display:flex;justify-content:center;margin-top:10px"><div data-theme-toggle="inline"></div></div>
-  </div>
 </aside>
 <main class="main">
   <div class="topbar">
     <div><span class="topbar-title" id="pg-title">Dashboard</span><span class="topbar-date" id="pg-date"></span></div>
-    <div class="topbar-right" id="topbar-actions"></div>
+    <div class="topbar-right" id="topbar-actions" style="display:flex;align-items:center;gap:10px"></div>
+    <div id="user-menu-wrap" style="position:relative">
+      <button id="user-menu-trigger" onclick="toggleUserMenu()" type="button"
+              style="display:flex;align-items:center;gap:8px;padding:4px 8px 4px 4px;border:1px solid var(--b0);
+                     border-radius:20px;background:var(--bg1);cursor:pointer;font:inherit;color:inherit">
+        <div class="ava" id="sb-ava">?</div>
+        <div style="text-align:left;min-width:0"><div class="u-name" id="sb-name" style="font-size:12px">Loading</div><div class="u-id" id="sb-id" style="font-family:var(--mono);font-size:10px;color:var(--tx3)">-</div></div>
+        <div class="s-dot" id="s-dot"></div>
+        <i data-lucide="chevron-down" style="width:12px;height:12px;color:var(--tx3);flex-shrink:0"></i>
+      </button>
+      <div id="user-menu-dropdown" style="display:none;position:absolute;right:0;top:calc(100% + 8px);
+           min-width:200px;background:var(--bg1);border:1px solid var(--b1);border-radius:10px;
+           box-shadow:0 8px 24px rgba(0,0,0,0.15);padding:12px;z-index:100">
+        <div class="u-role" id="sb-role-badge" style="margin-bottom:10px"></div>
+        <div style="font-family:var(--mono);font-size:9px;text-transform:uppercase;letter-spacing:0.08em;
+             color:var(--tx3);margin-bottom:6px">Theme</div>
+        <div data-theme-toggle="inline" style="margin-bottom:10px"></div>
+        <a id="admin-menu-link" href="/admin" style="display:none;align-items:center;gap:8px;
+           padding:8px 10px;margin:6px -12px -12px;border-top:1px solid var(--b0);font-size:12px;
+           color:var(--tx2);text-decoration:none">
+          <i data-lucide="shield" style="width:14px;height:14px"></i>Admin panel
+        </a>
+      </div>
+    </div>
   </div>
   <div class="content">
 
@@ -207,14 +223,22 @@
           <button class="btn btn-ghost btn-sm" onclick="exportCSV()"><i data-lucide="download"></i>Export CSV</button>
         </div>
       </div>
-      <div class="notice info" id="compliance-legend" onclick="toggleComplianceLegend()" style="cursor:pointer;overflow:hidden">
-        <i data-lucide="info" style="flex-shrink:0"></i>
-        <span id="compliance-legend-text" style="max-width:0;opacity:0;white-space:nowrap;overflow:hidden;transition:max-width 0.25s ease,opacity 0.2s ease">Target: <strong>12 WFO days/month</strong> &mdash; <span style="color:var(--green)">Green</span> = met &nbsp;|&nbsp; <span style="color:var(--amber)">Amber</span> = in progress, on track &nbsp;|&nbsp; <span style="color:#f97316">Orange</span> = some weeks below 3 days, month ongoing &nbsp;|&nbsp; <span style="color:var(--red)">Red</span> = month ended, target missed.</span>
-      </div>
       <div class="tbl-wrap"><table>
         <thead><tr><th></th><th>Employee</th><th>Team</th><th>WFO</th><th>WFH</th><th>Leave</th><th>Status</th><th>Weeks</th></tr></thead>
         <tbody id="compliance-tbody"><tr><td colspan="8"><div class="loading" style="padding:16px 14px"><div class="spinner"></div></div></td></tr></tbody>
       </table></div>
+      <div style="display:flex;justify-content:flex-end;margin-top:10px">
+        <div id="compliance-legend" onclick="toggleComplianceLegend()"
+             style="display:inline-flex;align-items:center;cursor:pointer;overflow:hidden;
+                    background:var(--bbg);border:1px solid rgba(96,165,250,0.15);border-radius:8px;
+                    color:var(--blue);font-family:var(--mono);font-size:11px;line-height:1.6">
+          <span style="display:flex;align-items:center;justify-content:center;width:28px;height:28px;flex-shrink:0">
+            <i data-lucide="info" style="width:13px;height:13px;stroke-width:2"></i>
+          </span>
+          <span id="compliance-legend-text" style="max-width:0;opacity:0;white-space:nowrap;overflow:hidden;
+                transition:max-width 0.25s ease,opacity 0.2s ease;padding-right:0">Target: <strong>12 WFO days/month</strong> &mdash; <span style="color:var(--green)">Green</span> = met &nbsp;|&nbsp; <span style="color:var(--amber)">Amber</span> = in progress, on track &nbsp;|&nbsp; <span style="color:#f97316">Orange</span> = some weeks below 3 days, month ongoing &nbsp;|&nbsp; <span style="color:var(--red)">Red</span> = month ended, target missed.</span>
+        </div>
+      </div>
     </div>
 
     <!-- LEAVE MANAGEMENT -->

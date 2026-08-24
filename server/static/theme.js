@@ -18,7 +18,13 @@ const THEME_KEY = '_sk_theme'; // 'light' | 'dark' | 'system' (default when unse
 
 function _sk_getStoredTheme(){
   const v = localStorage.getItem(THEME_KEY);
-  return (v === 'light' || v === 'dark') ? v : 'system';
+  // Default is 'light', not 'system' — a first-time visitor whose OS
+  // happens to be in dark mode used to see the dark theme with zero
+  // explicit choice on their part, before they'd ever touched the
+  // toggle. 'system' is still available as an explicit pick, just not
+  // silently what everyone starts on.
+  if(v === 'light' || v === 'dark' || v === 'system') return v;
+  return 'light';
 }
 
 function _sk_applyTheme(pref){

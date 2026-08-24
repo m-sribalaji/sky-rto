@@ -7,7 +7,7 @@
 <script>
 // Set before the stylesheet loads so there's no flash of the wrong theme
 // on first paint — see theme.js for the rest of the light/dark/system switcher.
-(function(){var t=localStorage.getItem('_sk_theme');if(t==='light'||t==='dark')document.documentElement.setAttribute('data-theme',t);})();
+(function(){var t=localStorage.getItem('_sk_theme');if(t!=='light'&&t!=='dark'&&t!=='system')t='light';if(t==='light'||t==='dark')document.documentElement.setAttribute('data-theme',t);})();
 </script>
 <!-- CSS and JS used to live inline here; they now live in server/static/admin.css and admin.js -->
 <link rel="icon" type="image/png" href="/static/sky-logo.png"/>

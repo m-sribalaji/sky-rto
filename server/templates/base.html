@@ -12,7 +12,7 @@
 // has already rendered in the wrong theme would flash. The rest of the
 // theme switcher (the actual toggle UI) loads later via theme.js since
 // that part doesn't need to block paint.
-(function(){var t=localStorage.getItem('_sk_theme');if(t==='light'||t==='dark')document.documentElement.setAttribute('data-theme',t);})();
+(function(){var t=localStorage.getItem('_sk_theme');if(t!=='light'&&t!=='dark'&&t!=='system')t='light';if(t==='light'||t==='dark')document.documentElement.setAttribute('data-theme',t);})();
 </script>
 <style>
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}

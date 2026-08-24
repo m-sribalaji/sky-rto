@@ -89,9 +89,10 @@ async function patch(p,b={}){
 // Renders an LLM-generated narrative sentence, or nothing at all if one
 // isn't available — the raw numbers around this block already stand on
 // their own, so absence is never a broken state, just a plainer one.
-// Styled distinctly (italic, left accent bar) so it visibly reads as
-// commentary rather than another data field, given it's paraphrase, not
-// a new source of truth.
+// A small "AI" tag does the "this is generated commentary, not a new
+// source of truth" job explicitly now, so the text itself can read as
+// normal body copy instead of being styled unusually (italics) to imply
+// the same thing less directly.
 function narrativeBlock(text){
   if(!text) return '';
   const esc = String(text).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
@@ -100,10 +101,12 @@ function narrativeBlock(text){
   // above those in the same color read as another warning rather than
   // commentary. Bottom-margin only (no top) so it sits flush under the
   // title/legend above it instead of adding an extra, uneven gap.
-  return `<div style="font-size:12px;font-style:italic;color:var(--tx2);line-height:1.5;
+  return `<div style="font-size:12px;color:var(--tx2);line-height:1.5;
               padding:8px 12px;margin:0 0 14px;border-left:2px solid var(--blue);
               border-radius:0 6px 6px 0;background:var(--bg2)">
-    ${esc}
+    <span style="display:inline-block;font-family:var(--mono);font-size:9px;font-weight:600;
+                 letter-spacing:0.04em;color:var(--blue);background:var(--bbg);
+                 border-radius:4px;padding:1px 5px;margin-right:6px;vertical-align:1px">AI</span>${esc}
   </div>`;
 }
 
@@ -114,7 +117,28 @@ function toggleComplianceLegend(){
   el.style.maxWidth = expanded ? '0px' : '900px';
   el.style.opacity  = expanded ? '0' : '1';
   el.style.whiteSpace = expanded ? 'nowrap' : 'normal';
+  el.style.paddingRight = expanded ? '0' : '10px';
 }
+
+function toggleUserMenu(){
+  const dd = document.getElementById('user-menu-dropdown');
+  if(!dd) return;
+  dd.style.display = dd.style.display==='none' ? 'block' : 'none';
+}
+// Click anywhere outside the dropdown (or Escape) closes it — a menu that
+// only closes by clicking its own trigger again is a common source of
+// "stuck open" complaints once there's real content inside it.
+document.addEventListener('click', (e) => {
+  const wrap = document.getElementById('user-menu-wrap');
+  const dd   = document.getElementById('user-menu-dropdown');
+  if(!wrap || !dd || dd.style.display==='none') return;
+  if(!wrap.contains(e.target)) dd.style.display = 'none';
+});
+document.addEventListener('keydown', (e) => {
+  if(e.key !== 'Escape') return;
+  const dd = document.getElementById('user-menu-dropdown');
+  if(dd) dd.style.display = 'none';
+});
 
 function renderSplitLabel(label){
   if(!label) return '';
@@ -283,7 +307,10 @@ function buildNav(){
 function buildTopbarActions(){
   const el=document.getElementById('topbar-actions');
   const isMgr=MY_ROLE==='manager'||MY_ROLE==='admin';
-  el.innerHTML=`<button class="btn btn-ghost btn-sm" onclick="refreshAll()"><i data-lucide="refresh-cw"></i>Refresh</button>${isMgr?`<button class="btn btn-ghost btn-sm" onclick="exportCSV()"><i data-lucide="download"></i>Export CSV</button>`:''} ${isMgr?`<button class="btn btn-acc btn-sm" onclick="nav('override')"><i data-lucide="square-pen"></i>Override</button>`:''}`;
+  // Override button removed — it's redundant with the sidebar's own
+  // Override nav item (see the nav() switch above), which already gets
+  // people to the same place.
+  el.innerHTML=`<button class="btn btn-ghost btn-sm" onclick="refreshAll()"><i data-lucide="refresh-cw"></i>Refresh</button>${isMgr?`<button class="btn btn-ghost btn-sm" onclick="exportCSV()"><i data-lucide="download"></i>Export CSV</button>`:''}`;
   reIcons();
 }
 
@@ -441,6 +468,8 @@ async function loadSidebarUser(){
     badge.style.cursor='pointer';
     badge.title='Open DB Admin';
     badge.onclick=()=>window.open('/admin','_blank');
+    const adminLink=document.getElementById('admin-menu-link');
+    if(adminLink) adminLink.style.display='flex';
   }
   buildNav(); buildTopbarActions();
   if(MY_ROLE!=='employee'){
@@ -2153,7 +2182,7 @@ async function loadRhythm(){
   const bestCard = `
     <div class="card">
       <div class="card-title">Best Meeting Days <span class="card-sub">${team}</span></div>
-      <div style="display:flex;gap:8px;align-items:flex-end;height:56px;margin-bottom:8px">${bestBars}</div>
+      <div style="display:flex;gap:8px;align-items:flex-end;margin-bottom:8px">${bestBars}</div>
       <div style="font-family:var(--mono);font-size:10px;color:var(--tx3)">
         Based on last ${d.lookback_weeks} weeks · ${d.team_size} member${d.team_size!==1?'s':''}
         ${d.data_start ? ` · Data from ${d.data_start}` : ''}
