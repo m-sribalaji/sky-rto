@@ -465,9 +465,9 @@ async function loadSidebarUser(){
   badge.textContent=MY_ROLE.charAt(0).toUpperCase()+MY_ROLE.slice(1);
   badge.className=`u-role role-${MY_ROLE}`;
   if(MY_ROLE==='admin'){
-    badge.style.cursor='pointer';
-    badge.title='Open DB Admin';
-    badge.onclick=()=>window.open('/admin','_blank');
+    // The pill itself is no longer a click target — "Admin panel" below
+    // it in the dropdown already does this, and having both read as two
+    // different-looking things doing the same thing.
     const adminLink=document.getElementById('admin-menu-link');
     if(adminLink) adminLink.style.display='flex';
   }
