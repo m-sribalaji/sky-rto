@@ -70,8 +70,13 @@ def _call_openai(facts: dict, section_hint: str) -> Optional[str]:
             {"role": "system", "content": _SYSTEM_PROMPT},
             {"role": "user", "content": f"Section: {section_hint}\nFacts (JSON): {json.dumps(facts, default=str)}"},
         ],
-        "temperature": 0.3,
-        "max_tokens": 200,
+        # max_completion_tokens, not max_tokens — newer models (including
+        # gpt-5.6-luna) reject the legacy Chat Completions parameter name
+        # outright with a 400. temperature is dropped rather than guessed
+        # at a value: reasoning-capable models often restrict or reject it
+        # entirely, and this task has no need for sampling variance anyway
+        # — consistent, factual paraphrasing is the goal, not creativity.
+        "max_completion_tokens": 200,
     }
     try:
         req = urllib.request.Request(
