@@ -1920,6 +1920,28 @@ async function loadInsights(){
       // so this number can never disagree with what the bars show.
       const officeDayCount = wk.days.filter(d => !d.is_leave && d.predicted_status === 'wfo').length;
 
+      // Chips built straight from the same per-day list the bars below use
+      // — replaces a single plain-text sentence (which mixed "In office"
+      // and "likely office" inline, easy to misread at a glance) with
+      // visually distinct groups that use the exact same solid/dashed,
+      // green/blue vocabulary as the bar chart directly underneath, so the
+      // summary can never visually disagree with what the bars show.
+      const chipGroups = [
+        {key:'office_fact',   label:'In office',     match: d=>!d.is_leave && d.is_fact && d.predicted_status==='wfo', color:'var(--green)', dashed:false},
+        {key:'office_forecast', label:'Likely office', match: d=>!d.is_leave && !d.is_fact && d.predicted_status==='wfo', color:'var(--green)', dashed:true},
+        {key:'home_fact',     label:'WFH',           match: d=>!d.is_leave && d.is_fact && d.predicted_status==='wfh', color:'var(--blue)', dashed:false},
+        {key:'home_forecast', label:'Likely WFH',    match: d=>!d.is_leave && !d.is_fact && d.predicted_status==='wfh', color:'var(--blue)', dashed:true},
+      ].map(g => {
+        const days = wk.days.filter(g.match).map(d=>d.dow_name);
+        if(!days.length) return '';
+        return `<span style="display:inline-flex;align-items:center;gap:5px;font-family:var(--mono);font-size:10px;
+                    padding:3px 8px;border-radius:12px;background:var(--bg3);color:var(--tx2)">
+          <span style="width:8px;height:8px;border-radius:50%;background:${g.color};
+                       ${g.dashed?`opacity:0.45;border:1px dashed ${g.color}`:''}"></span>
+          ${g.label} <b style="color:var(--tx1);font-weight:500">${days.join(', ')}</b>
+        </span>`;
+      }).join('');
+
       return `
         <div style="background:var(--bg2);border:1px solid ${wk.risk?'rgba(248,113,113,0.2)':'var(--b0)'};
                     border-radius:8px;padding:12px 14px;${wk.is_current_week?'border-color:rgba(193,123,63,0.3)':''}">
@@ -1932,9 +1954,7 @@ async function loadInsights(){
             </div>
             ${badge}
           </div>
-          <div style="font-family:var(--mono);font-size:10px;color:var(--tx2);margin-bottom:10px">
-            ${wk.week_summary}
-          </div>
+          <div style="display:flex;flex-wrap:wrap;gap:6px;margin-bottom:10px">${chipGroups}</div>
           <div style="display:flex;gap:6px;align-items:flex-end;height:56px;margin-bottom:8px">${dayBars}</div>
           <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
             <span style="font-family:var(--mono);font-size:10px;color:${wk.risk?'var(--red)':'var(--green)'}">
@@ -1947,17 +1967,31 @@ async function loadInsights(){
         </div>`;
     }).join('');
 
+    // Up-front legend, not a buried footnote — the single thing everyone
+    // reading this card needs to know before the numbers make sense: solid
+    // = already happened, dashed = a guess based on past pattern.
+    const legendHtml = `
+      <div style="display:flex;align-items:center;gap:16px;padding:8px 12px;margin-bottom:12px;
+                  background:var(--bg3);border-radius:6px;flex-wrap:wrap">
+        <div style="display:flex;align-items:center;gap:6px;font-family:var(--mono);font-size:10px;color:var(--tx2)">
+          <span style="width:10px;height:10px;border-radius:2px;background:var(--tx2)"></span> Recorded fact
+        </div>
+        <div style="display:flex;align-items:center;gap:6px;font-family:var(--mono);font-size:10px;color:var(--tx2)">
+          <span style="width:10px;height:10px;border-radius:2px;background:var(--tx2);opacity:0.45;border:1px dashed var(--tx2)"></span> Forecast — not a guarantee
+        </div>
+      </div>`;
+
     outlookCard = `
       <div class="card">
         <div class="card-title">Compliance Outlook
           <span class="card-sub">${m.month} — remaining weeks</span>
         </div>
+        ${legendHtml}
         ${budgetHtml}
         <div style="display:flex;flex-direction:column;gap:10px">${weekRows}</div>
         <div style="font-family:var(--mono);font-size:10px;color:var(--tx3);margin-top:10px;padding-top:8px;border-top:1px solid var(--b0)">
-          Solid bars are recorded fact (a real check-in, leave, or holiday). Dashed, lighter bars are
-          forecasts based on ${ownerLabel.toLowerCase()} usual pattern for that weekday — hover a day to see
-          how confident that forecast is. No forecast is a guarantee; it just reflects past behaviour.
+          Forecast days are based on ${ownerLabel.toLowerCase()} usual pattern for that weekday — hover any
+          day for its confidence level. No forecast is a guarantee, it just reflects past behaviour.
         </div>
       </div>`;
   }
@@ -2102,7 +2136,11 @@ async function loadRhythm(){
       ${overlapRows ? `<div class="tbl-wrap"><table>
         <thead><tr><th>Pair</th><th>Overlap score</th><th>Shared days</th><th>Assessment</th></tr></thead>
         <tbody>${overlapRows}</tbody>
-      </table></div>` : '<div style="color:var(--tx3);font-family:var(--mono);font-size:11px">Not enough data yet.</div>'}
+      </table></div>` : `<div style="color:var(--tx3);font-family:var(--mono);font-size:11px;line-height:1.6">
+          Not enough data yet — an overlap score only shows once two people have at least
+          5 shared office days on record, so a couple of early check-ins can't produce a
+          misleadingly confident number.
+        </div>`}
     </div>`;
 
   // ── Heatmap card ────────────────────────────────────────────────────────
@@ -2174,11 +2212,12 @@ async function loadRhythm(){
     const bars = rates.map(([dow, rate]) => {
       const h = Math.round(rate * 32);
       const c = rate >= 0.65 ? 'var(--green)' : rate >= 0.35 ? 'var(--amber)' : 'var(--red)';
-      return `<div style="display:flex;flex-direction:column;align-items:center;gap:1px">
+      const pct = Math.round(rate * 100);
+      return `<div title="${dowNames[dow]}: ${pct}% WFO" style="display:flex;flex-direction:column;align-items:center;gap:1px;cursor:default">
         <div style="width:14px;height:32px;display:flex;align-items:flex-end">
           <div style="width:100%;height:${Math.max(h,2)}px;background:${c};border-radius:2px 2px 0 0"></div>
         </div>
-        <div style="font-family:var(--mono);font-size:8px;color:var(--tx3)">${dowShort[dow]}</div>
+        <div style="font-family:var(--mono);font-size:9px;color:var(--tx3)">${dowShort[dow]}</div>
       </div>`;
     }).join('');
     const streak = p.current_streak_wfo;
@@ -2196,7 +2235,13 @@ async function loadRhythm(){
   const indivCard = `
     <div class="card">
       <div class="card-title">Individual Patterns <span class="card-sub">Day-of-week WFO tendency</span></div>
-      <div style="display:flex;flex-direction:column;gap:8px">${indivRows}</div>
+      <div style="display:flex;align-items:center;gap:12px;margin-bottom:10px;font-family:var(--mono);font-size:9px;color:var(--tx3)">
+        <span style="display:flex;align-items:center;gap:4px"><span style="width:8px;height:8px;border-radius:2px;background:var(--green)"></span>High WFO</span>
+        <span style="display:flex;align-items:center;gap:4px"><span style="width:8px;height:8px;border-radius:2px;background:var(--amber)"></span>Medium</span>
+        <span style="display:flex;align-items:center;gap:4px"><span style="width:8px;height:8px;border-radius:2px;background:var(--red)"></span>Low — mostly WFH</span>
+        <span>· hover a bar for the exact %</span>
+      </div>
+      <div style="display:flex;flex-direction:column;gap:8px">${indivRows || '<div style="font-family:var(--mono);font-size:11px;color:var(--tx3)">No one on this team has enough history yet.</div>'}</div>
     </div>`;
 
   el.innerHTML = `

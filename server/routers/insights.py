@@ -11,8 +11,9 @@ from sqlalchemy import select, and_
 
 from database import get_db, Device, CheckIn, DaySegment, LeaveRequest, PublicHoliday
 from segments import dominant_status_from_segments
-from deps import get_caller_context, get_caller_id, get_managed_teams
+from deps import get_caller_context, get_caller_id, get_managed_teams, require_role
 from analytics import compute_forecast, compute_team_rhythm, _workdays_in_month
+from backtest import run_backtest
 
 router = APIRouter()
 
@@ -94,6 +95,21 @@ async def get_insights(employee_id: str, request: Request = None,
     ph_q = await db.execute(select(PublicHoliday))
     ph_dates = {h.date for h in ph_q.scalars().all()}
 
+    # Teammates' combined check-in history — pooled into a team-wide
+    # day-of-week baseline that this person's own rate shrinks toward when
+    # they don't have much personal data yet (see analytics._shrink_to_team).
+    # Not required for the forecast to work — compute_forecast no-ops the
+    # shrinkage if this comes back empty — just meaningfully better for
+    # anyone new enough that their own history is thin.
+    team_checkins: list[dict] = []
+    if device.team:
+        team_ci_q = await db.execute(select(CheckIn).where(and_(
+            CheckIn.employee_id != employee_id,
+            CheckIn.date >= cutoff,
+        )).join(Device, Device.employee_id == CheckIn.employee_id).where(Device.team == device.team))
+        team_checkins = [{"date": r.date, "status": r.final_status or r.auto_status or "wfh"}
+                          for r in team_ci_q.scalars().all()]
+
     # Current month actual WFO count
     seg_q = await db.execute(select(DaySegment).where(and_(
         DaySegment.employee_id == employee_id,
@@ -119,6 +135,7 @@ async def get_insights(employee_id: str, request: Request = None,
         forecast_days       = 14,
         current_month_wfo   = current_month_wfo,
         current_month_total_workdays = len(_workdays_in_month(today.year, today.month, ph_dates)),
+        team_checkins       = team_checkins,
     )
     return result
 
@@ -226,3 +243,18 @@ async def get_team_rhythm(team: str, request: Request = None,
     )
     result["team"] = team
     return result
+
+
+@router.get("/api/admin/backtest")
+async def get_backtest(request: Request, db: AsyncSession = Depends(get_db)):
+    """
+    Replays everyone's real history through the forecast model — for each
+    employee's own recorded workday, predicts it using only data that
+    predated it, and compares to what actually happened. Reports Brier
+    score against a naive baseline (each employee's own long-run WFO rate,
+    no day-of-week or Markov structure) so "the model scores 0.18" has
+    something to be judged against. See backtest.py for the full method.
+    Admin-only: this walks every employee's full history in one request.
+    """
+    await require_role(request, db, "admin")
+    return await run_backtest(db)

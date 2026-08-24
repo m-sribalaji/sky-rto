@@ -47,6 +47,14 @@ from typing import Optional
 
 logger = logging.getLogger("analytics")
 
+# ── model version ─────────────────────────────────────────────────────────
+# Bumped whenever the forecast math itself changes (not for UI/copy-only
+# changes). Stamped onto every forecast response so a stored/exported
+# forecast stays interpretable after the algorithm moves on, and so
+# backtest.py can report results per version rather than conflating
+# different eras of the model together.
+MODEL_VERSION = "2.1.0"  # 2.1: gap-based EWMA decay, unified dow_rates_stable as canonical rate
+
 # ── constants ──────────────────────────────────────────────────────────────
 LEAVE_TYPES = {
     "annual","casual","sick","public_holiday","optional_holiday",
@@ -82,6 +90,20 @@ ABSENCE_DECAY = 0.15
 
 # Wilson score z-value for 90% confidence interval
 WILSON_Z = 1.645
+
+# Compliance targets — named here instead of scattered as literal 3s and
+# 12s through _monthly_progress / _compliance_forecast_weeks, so there's
+# exactly one place to change if policy ever does.
+WEEKLY_WFO_TARGET  = 3
+MONTHLY_WFO_TARGET = 12
+
+# Empirical-Bayes shrinkage strength for pooling toward the team baseline —
+# how many "pseudo-observations" of team-wide behaviour a personal rate is
+# weighed against. Someone with this many (or more) of their own real
+# observations for a weekday is barely nudged toward the team; someone
+# with 1-2 is pulled most of the way there instead of relying on a single
+# data point or an arbitrary "new employee" alpha heuristic.
+TEAM_POOL_STRENGTH = 15
 
 # ── confidence label ───────────────────────────────────────────────────────
 def _confidence_tier(n_obs: int) -> str:
@@ -139,6 +161,45 @@ def _adaptive_alpha(obs: list[tuple[int, bool]], n_weeks: int) -> float:
     if n_weeks >= 12 and variance <= 0.20:
         return EWMA_ALPHA_STABLE    # stable, tenured employee
     return EWMA_ALPHA_DEFAULT
+
+# ── Calendar-aware EWMA (fixes double-decay) ───────────────────────────────
+def _ewma_gap_decay(obs_dates: list[tuple[str, bool]], alpha: float,
+                    current_week_start: date, prior: float = 0.40) -> float:
+    """
+    Blend a sequence of (date_str, was_wfo) observations — sorted oldest to
+    newest — into a single EWMA estimate, decaying by the actual calendar
+    gap between consecutive observations rather than by list position, so
+    a missed week counts as a bigger jump than a consecutive one.
+
+    The previous approach computed each observation's weight from its
+    distance-from-today directly (`alpha * (1-alpha)**weeks_ago`) and THEN
+    still ran it through the same sequential blend — which erodes earlier
+    contributions a second time on every later blend step. Concretely, an
+    observation 3 weeks old ended up with roughly HALF the influence its
+    own assigned weight implied, once you unroll the recursion. This
+    version decays exactly once per elapsed week: the running estimate is
+    aged by (1-alpha)**gap before each new observation is blended in, and
+    by one final gap-to-now step at the end so a long-stale estimate still
+    drifts back toward the neutral prior instead of freezing at whatever
+    the last observation happened to be.
+    """
+    if not obs_dates:
+        return prior
+    ewma_val = prior
+    prev_week_start: Optional[date] = None
+    for ds_str, was_wfo in obs_dates:
+        obs_date = date.fromisoformat(ds_str)
+        obs_week_start = obs_date - timedelta(days=obs_date.weekday())
+        gap_weeks = 1 if prev_week_start is None else max(1, (obs_week_start - prev_week_start).days // 7)
+        decay = (1 - alpha) ** gap_weeks
+        v = 1.0 if was_wfo else 0.0
+        ewma_val = decay * ewma_val + (1 - decay) * v
+        prev_week_start = obs_week_start
+    gap_to_now = max(0, (current_week_start - prev_week_start).days // 7)
+    if gap_to_now > 0:
+        decay = (1 - alpha) ** gap_to_now
+        ewma_val = decay * ewma_val + (1 - decay) * prior
+    return ewma_val
 
 # ── Date helpers ───────────────────────────────────────────────────────────
 def _is_weekday(d: date) -> bool:
@@ -213,6 +274,7 @@ def build_attendance(
 def compute_dow_rates(
     att: dict[str, str],
     ph_dates: set[str],
+    today: Optional[date] = None,
 ) -> tuple[dict[int, float], int, dict[int, dict], dict[int, str]]:
     """
     Compute EWMA WFO probability for each weekday (0=Mon … 4=Fri).
@@ -273,8 +335,13 @@ def compute_dow_rates(
             dow_obs[dow].append((week_idx, st == "wfo"))
 
     n_weeks = active_weeks_for_ewma  # use all weeks for EWMA decay
-    # Current week start — used for calendar distance (Fix 1)
-    today_ref = max(
+    # Current week start — used for calendar distance in the EWMA decay.
+    # Must come from the caller's actual `today`, not be inferred from the
+    # data itself — inferring it from the latest attendance date silently
+    # broke backtesting (which deliberately evaluates a past "today" with
+    # later data truncated away) and would also drift for anyone whose
+    # most recent check-in wasn't literally today (a day off, a gap).
+    today_ref = today if today is not None else max(
         (date.fromisoformat(ds) for ds in att if att[ds] not in ("leave","public_holiday")),
         default=date.today()
     )
@@ -298,18 +365,7 @@ def compute_dow_rates(
         # Adaptive alpha for this weekday's observations
         alpha = _adaptive_alpha(obs, n_weeks)
 
-        # Fix 1 + Fix 5 (EWMA init prior):
-        # - Calendar-aware recency_exp: weeks since observation, not list index
-        # - Init ewma_val with prior (0.40) instead of first raw value
-        ewma_val = 0.40  # Bayesian prior: neutral before any data (Fix 5)
-        for ds_str, was_wfo in obs_dates:
-            obs_date = date.fromisoformat(ds_str)
-            obs_week_start = obs_date - timedelta(days=obs_date.weekday())
-            weeks_ago = max(0, (current_week_start - obs_week_start).days // 7)
-            w = alpha * ((1 - alpha) ** weeks_ago)
-            v = 1.0 if was_wfo else 0.0
-            ewma_val = (1 - w) * ewma_val + w * v
-
+        ewma_val = _ewma_gap_decay(obs_dates, alpha, current_week_start)
         rate = max(0.05, min(0.95, ewma_val or 0.40))
         dow_rates[dow] = rate
 
@@ -325,6 +381,7 @@ def compute_dow_rates(
 def compute_dow_rates_stable(
     att: dict[str, str],
     ph_dates: set[str],
+    today: Optional[date] = None,
 ) -> dict[int, float]:
     """
     Compute a STABLE WFO probability for each weekday — display only, not prediction.
@@ -337,7 +394,13 @@ def compute_dow_rates_stable(
     - Single off-day deviations still cause some movement, but historical anchor
       from 12 weeks of data dampens wild swings.
     """
-    today_ref = date.today()
+    # Must come from the caller, not real wall-clock date.today() — this
+    # function used to hardcode date.today() internally, which silently
+    # ignored whatever `today` compute_forecast was actually called with.
+    # Invisible in normal use (real "today" calls happen to match), but
+    # it meant backtesting a past date transparently leaked in real
+    # present-day data past the simulated cutoff.
+    today_ref = today if today is not None else date.today()
     cutoff_12w = (today_ref - timedelta(weeks=12)).isoformat()
     current_week_start = today_ref - timedelta(days=today_ref.weekday())
 
@@ -372,14 +435,7 @@ def compute_dow_rates_stable(
         # Convert to (int, bool) format expected by _adaptive_alpha.
         obs_for_alpha = [(i, v) for i, (_, v) in enumerate(obs)]
         alpha = _adaptive_alpha(obs_for_alpha, n_weeks_stable)
-        ewma_val = 0.40  # neutral prior
-        for ds_str, was_wfo in obs:
-            obs_date = date.fromisoformat(ds_str)
-            obs_week_start = obs_date - timedelta(days=obs_date.weekday())
-            weeks_ago = max(0, (current_week_start - obs_week_start).days // 7)
-            w = alpha * ((1 - alpha) ** weeks_ago)
-            v = 1.0 if was_wfo else 0.0
-            ewma_val = (1 - w) * ewma_val + w * v
+        ewma_val = _ewma_gap_decay(obs, alpha, current_week_start)
         dow_rates[dow] = round(max(0.05, min(0.95, ewma_val)), 3)
     return dow_rates
 
@@ -436,16 +492,37 @@ def _build_personal_markov(att: dict[str, str], ph_dates: set[str],
 
     return personal
 
+# ── Log-odds helpers ────────────────────────────────────────────────────────
+# Combining independently-estimated effects (day-of-week base rate, Markov
+# transition, quota pressure) by multiplying raw probabilities together has
+# no principled ceiling — a 0.90 base times a 2.5x multiplier is 2.25,
+# which only "worked" before because of an ad hoc clamp afterward, and it
+# distorts the tails exactly where the clamp bites hardest. Adding in
+# log-odds (logit) space instead and converting back with sigmoid is the
+# textbook-correct way to combine a base rate with a multiplicative effect
+# — the same mechanism logistic regression uses to combine feature effects.
+def _logit(p: float) -> float:
+    p = min(max(p, 1e-6), 1 - 1e-6)
+    return math.log(p / (1 - p))
+
+def _sigmoid(x: float) -> float:
+    if x >= 0:
+        return 1 / (1 + math.exp(-x))
+    z = math.exp(x)
+    return z / (1 + z)
+
 def markov_adjust(base_prob: float, prev_status: Optional[str],
                   personal_markov: Optional[dict] = None) -> float:
     """
-    Adjust base probability using personal Markov (preferred) or global fallback.
-    Clamps to [0.05, 0.95].
+    Adjust base probability using personal Markov (preferred) or global
+    fallback. Combines in log-odds space (see helpers above) rather than
+    multiplying raw probabilities. Clamps to [0.05, 0.95].
     """
     prev = prev_status if prev_status in ("wfo","wfh","leave") else None
     table = personal_markov if personal_markov else MARKOV_GLOBAL
     mul = table.get((prev, "wfo"), 1.0)
-    return max(0.05, min(0.95, base_prob * mul))
+    combined_logit = _logit(base_prob) + math.log(max(mul, 1e-6))
+    return max(0.05, min(0.95, _sigmoid(combined_logit)))
 
 # ── Absence signal ─────────────────────────────────────────────────────────
 def apply_absence_signal(prob: float, att: dict[str, str],
@@ -463,6 +540,109 @@ def apply_absence_signal(prob: float, att: dict[str, str],
         return prob * ABSENCE_DECAY
     return prob
 
+# ── Team-pooled shrinkage (practical partial pooling) ──────────────────────
+def compute_team_pool_rates(pooled_checkins: list[dict]) -> dict[int, float]:
+    """
+    A stable, long-run day-of-week WFO rate computed across an entire
+    team's *combined* history, ignoring who each record belongs to — the
+    prior that individual forecasts shrink toward when they don't have
+    much personal data yet (see _shrink_to_team).
+
+    Deliberately not an EWMA: a pooling prior should represent "what's
+    typical on this team," not chase recent movement the way a personal
+    forecast does — that's the personal EWMA's job, not this one's.
+    """
+    totals     = defaultdict(int)
+    wfo_counts = defaultdict(int)
+    for c in pooled_checkins:
+        st = c.get("status")
+        if st not in ("wfo", "wfh"):
+            continue
+        try:
+            dow = date.fromisoformat(c["date"]).weekday()
+        except Exception:
+            continue
+        if dow >= 5:
+            continue
+        totals[dow] += 1
+        if st == "wfo":
+            wfo_counts[dow] += 1
+    # Laplace-smoothed so a thin team pool can't produce a hard 0 or 1
+    return {dow: round((wfo_counts.get(dow, 0) + 1) / (totals.get(dow, 0) + 2), 3)
+            for dow in range(5)}
+
+def _shrink_to_team(dow_rates_stable: dict[int, float], dow_intervals: dict[int, dict],
+                    team_dow_rates: Optional[dict[int, float]]) -> dict[int, float]:
+    """
+    Empirical-Bayes shrinkage: blend each weekday's personal rate toward
+    the team-wide rate in proportion to how little personal data exists
+    for that specific weekday. This is a lightweight, practical version of
+    the same idea behind hierarchical/mixed-effects models (pool
+    statistical strength across many small groups) without requiring an
+    actual model fit — someone with TEAM_POOL_STRENGTH+ observed
+    Wednesdays is barely nudged; someone with 1 is pulled most of the way
+    to the team baseline instead of relying on a single data point.
+    No-ops (returns input unchanged) when no team data was supplied — callers
+    without team context (e.g. a lone-employee test) still get a sane result.
+    """
+    if not team_dow_rates:
+        return dow_rates_stable
+    shrunk = {}
+    for dow, personal_rate in dow_rates_stable.items():
+        n = dow_intervals.get(dow, {}).get("n", 0)
+        team_rate = team_dow_rates.get(dow, 0.40)
+        shrunk[dow] = round((n * personal_rate + TEAM_POOL_STRENGTH * team_rate) / (n + TEAM_POOL_STRENGTH), 3)
+    return shrunk
+
+# ── Quota pressure ──────────────────────────────────────────────────────────
+def _quota_pressure_for_day(fd: date, ds: str, att: dict[str, str],
+                            ph_dates: set[str], weekly_target: int) -> tuple[int, int]:
+    """
+    (days_needed_remaining, days_left_inclusive) for fd's own ISO week,
+    based on what's already recorded — a real, already-committed shortfall,
+    not a hypothetical one built from this same forecast run's own earlier
+    predictions. That's a deliberate simplification: the pressure that
+    actually drives someone's behaviour is a real recorded gap, not a
+    forecast-on-a-forecast.
+    """
+    monday        = fd - timedelta(days=fd.weekday())
+    week_day_strs = [(monday + timedelta(days=i)).isoformat() for i in range(5)
+                      if (monday + timedelta(days=i)).isoformat() not in ph_dates]
+    leave_count        = sum(1 for wd in week_day_strs if att.get(wd) in ("leave", "public_holiday"))
+    working_days_in_wk = len(week_day_strs) - leave_count
+    week_target = math.ceil(working_days_in_wk * weekly_target / 5) if working_days_in_wk < 5 else weekly_target
+    wfo_so_far  = sum(1 for wd in week_day_strs if wd < ds and att.get(wd) == "wfo")
+    days_needed_remaining = max(0, week_target - wfo_so_far)
+    days_left_inclusive = sum(1 for wd in week_day_strs
+                              if wd >= ds and att.get(wd) not in ("leave", "public_holiday"))
+    return days_needed_remaining, days_left_inclusive
+
+def _quota_pressure_adjust(prob: float, days_needed_remaining: int, days_left_inclusive: int) -> float:
+    """
+    Nudges probability toward "will hit quota" behaviour as a week gets
+    tight — someone 2 days behind with 2 workdays left is going to come in
+    almost regardless of what a normal Tuesday looks like for them. This
+    is real, learnable, target-seeking behaviour the day-of-week/Markov
+    signals alone have no way to see, since neither knows anything about
+    the weekly target.
+
+    Blends in log-odds space, weighted by how binding the quota actually
+    is right now (needed / left): no pressure when comfortably ahead of
+    target (weight 0 — pure habit governs), full override of habit when
+    the target can only still be hit by coming in every remaining day
+    (weight 1 — quota dominates regardless of what this weekday usually
+    looks like for this person).
+    """
+    if days_left_inclusive <= 0:
+        return prob
+    quota_rate = max(0.0, min(1.0, days_needed_remaining / days_left_inclusive))
+    weight = quota_rate
+    if weight <= 0:
+        return prob
+    quota_logit = _logit(0.97 if quota_rate >= 0.999 else max(quota_rate, 0.03))
+    combined_logit = (1 - weight) * _logit(prob) + weight * quota_logit
+    return max(0.05, min(0.97, _sigmoid(combined_logit)))
+
 # ── Main forecast function ─────────────────────────────────────────────────
 def compute_forecast(
     employee_id:          str,
@@ -475,12 +655,25 @@ def compute_forecast(
     current_month_wfo:    int = 0,
     current_month_total_workdays: int = 0,
     check_in_hour_today:  Optional[int] = None,
+    team_checkins:        Optional[list[dict]] = None,
 ) -> dict:
-    """Compute personal WFO forecast for next forecast_days working days."""
+    """
+    Compute personal WFO forecast for next forecast_days working days.
+
+    team_checkins (optional): every teammate's checkin history, pooled
+    (see compute_team_pool_rates) into a team-wide day-of-week baseline
+    that this person's own rate gets shrunk toward in proportion to how
+    little personal data they have — new joiners inherit something close
+    to "what's typical here" instead of an arbitrary fast-learning alpha
+    heuristic. Omit it and this behaves exactly as before (no shrinkage).
+    """
     att = build_attendance(checkins, leaves, ph_dates)
-    dow_rates, active_weeks, dow_intervals, dow_confidence = compute_dow_rates(att, ph_dates)
+    dow_rates, active_weeks, dow_intervals, dow_confidence = compute_dow_rates(att, ph_dates, today)
     # Stable display baseline — slow alpha, max 12 weeks, won't swing on a single day
-    dow_rates_stable = compute_dow_rates_stable(att, ph_dates)
+    dow_rates_stable = compute_dow_rates_stable(att, ph_dates, today)
+    if team_checkins:
+        team_dow_rates   = compute_team_pool_rates(team_checkins)
+        dow_rates_stable = _shrink_to_team(dow_rates_stable, dow_intervals, team_dow_rates)
 
     # Insufficiency check based on per-weekday observation counts
     # Use global active_weeks as primary gate (fastest check)
@@ -490,6 +683,7 @@ def compute_forecast(
     global_conf = _confidence_tier(total_actual_obs)
     if active_weeks < 2:
         return {
+            "model_version":     MODEL_VERSION,
             "employee_id":       employee_id,
             "employee_name":     employee_name,
             "confidence":        "insufficient",
@@ -559,9 +753,27 @@ def compute_forecast(
             running_prev = actual
             continue
 
-        # Probabilistic prediction
-        base = dow_rates.get(fd.weekday(), 0.40)
+        # Probabilistic prediction — base rate comes from dow_rates_stable,
+        # same source the Compliance Outlook week view uses (see
+        # _compliance_forecast_weeks below). These used to be two different
+        # rates (this one from the fast/adaptive dow_rates, that one from
+        # the 12-week-capped stable version), which meant the exact same
+        # future date could show a different predicted status depending on
+        # which panel you were looking at. dow_rates (fast) is still
+        # computed and returned — it's what personal_markov and the
+        # Wilson confidence intervals are keyed to, which is legitimately
+        # about sample size, not point-estimate volatility — it's just no
+        # longer the number used for the actual predicted probability.
+        base = dow_rates_stable.get(fd.weekday(), 0.40)
         prob = markov_adjust(base, running_prev, personal_markov)
+
+        # Quota pressure — a real, learnable signal the day-of-week/Markov
+        # rates alone can't see: someone behind on their weekly target with
+        # few workdays left is going to come in regardless of habit. See
+        # _quota_pressure_for_day / _quota_pressure_adjust for the method.
+        days_needed_remaining, days_left_inclusive = _quota_pressure_for_day(
+            fd, ds, att, ph_dates, WEEKLY_WFO_TARGET)
+        prob = _quota_pressure_adjust(prob, days_needed_remaining, days_left_inclusive)
 
         # Absence signal — only for today (Fix #4: now reachable)
         if fd == today:
@@ -592,7 +804,7 @@ def compute_forecast(
     monthly = _monthly_progress(att, today, ph_dates, current_month_wfo)
     compliance_meta = _compliance_forecast_weeks(
         att, today, ph_dates, dow_rates_stable, current_month_wfo,
-        dow_confidence=dow_confidence)
+        dow_confidence=dow_confidence, personal_markov=personal_markov)
     month_rem = [f for f in forecast
                  if f["date"][:7] == today.strftime("%Y-%m")
                  and not f.get("certain") and f["status"] == "predicted_wfo"]
@@ -600,6 +812,7 @@ def compute_forecast(
     monthly["predicted_total"]      = monthly["actual_wfo"] + len(month_rem)
 
     return {
+        "model_version":         MODEL_VERSION,
         "employee_id":           employee_id,
         "employee_name":         employee_name,
         "confidence":            global_conf,
@@ -634,11 +847,11 @@ def _monthly_progress(att, today, ph_dates, current_month_wfo=0):
         sum(1 for d in elapsed if att.get(d) == "wfo"),
         current_month_wfo
     )
-    needed    = max(0, 12 - actual_wfo)
+    needed    = max(0, MONTHLY_WFO_TARGET - actual_wfo)
     return {
         "month":          today.strftime("%B %Y"),
         "actual_wfo":     actual_wfo,
-        "target":         12,
+        "target":         MONTHLY_WFO_TARGET,
         "needed":         needed,
         "elapsed_days":   len(elapsed),
         "remaining_days": len(remaining),
@@ -655,8 +868,9 @@ def _compliance_forecast_weeks(
     dow_rates_stable: dict[int, float],
     current_month_wfo: int,
     dow_confidence: dict[int, str] | None = None,
-    monthly_target: int = 12,
-    weekly_target: int = 3,
+    monthly_target: int = MONTHLY_WFO_TARGET,
+    weekly_target: int = WEEKLY_WFO_TARGET,
+    personal_markov: Optional[dict] = None,
 ) -> dict:
     """
     Compute per-remaining-week compliance outlook for the current month.
@@ -700,6 +914,10 @@ def _compliance_forecast_weeks(
 
     compliance_weeks = []
     projected_total_additional = 0.0
+    # Carried across the whole remaining range (not reset per week) so the
+    # Markov transition sees real day-to-day continuity, same as the main
+    # per-day forecast loop in compute_forecast.
+    running_prev = _last_workday_status(att, today, ph_dates)
 
     for wk_key in sorted(weeks_map.keys()):
         days_in_week = weeks_map[wk_key]
@@ -727,16 +945,28 @@ def _compliance_forecast_weeks(
                 leave_count     += 1
                 predicted_status = "leave"
                 confidence_tier  = "certain"
+                running_prev     = "leave"
             elif is_past_actual:
                 rate              = 1.0 if actual_status == "wfo" else 0.0
                 week_proj        += rate
                 predicted_status  = actual_status
                 confidence_tier   = "certain"
+                running_prev      = actual_status
             else:
-                rate              = dow_rates_stable.get(dow, 0.40)
+                # Same Markov + quota-pressure combination the per-day
+                # forecast uses (see compute_forecast) — not just the same
+                # base rate. Otherwise this view and that one could still
+                # disagree on the exact same date even after both read
+                # from the same dow_rates_stable.
+                base = dow_rates_stable.get(dow, 0.40)
+                rate = markov_adjust(base, running_prev, personal_markov)
+                days_needed_remaining, days_left_inclusive = _quota_pressure_for_day(
+                    d_obj, ds, att, ph_dates, weekly_target)
+                rate = _quota_pressure_adjust(rate, days_needed_remaining, days_left_inclusive)
                 week_proj        += rate
                 predicted_status  = "wfo" if rate >= 0.5 else "wfh"
                 confidence_tier   = dow_confidence.get(dow, "insufficient")
+                running_prev      = predicted_status
 
             day_details.append({
                 "date":              ds,
@@ -850,19 +1080,19 @@ def compute_team_rhythm(
     member_forecasts: dict[str, dict[int, float]] = {}
     for m in members:
         dow_rates, active_weeks, _, _ = compute_dow_rates(
-            windowed.get(m["employee_id"], {}), ph_dates)
+            windowed.get(m["employee_id"], {}), ph_dates, today)
         if active_weeks >= 2:
             member_forecasts[m["employee_id"]] = dow_rates
         else:
             member_forecasts[m["employee_id"]] = {}
 
-    best_days      = _compute_best_days(members, windowed, ph_dates)
+    best_days      = _compute_best_days(members, windowed, ph_dates, today)
     overlap_matrix = _compute_overlap(members, windowed, member_forecasts,
                                       ph_dates, today)
     individual     = []
     for m in members:
         dow_rates, active_weeks, dow_intervals, dow_conf = compute_dow_rates(
-            windowed.get(m["employee_id"], {}), ph_dates)
+            windowed.get(m["employee_id"], {}), ph_dates, today)
         streak = _compute_streak(member_att.get(m["employee_id"], {}), today, ph_dates)
         individual.append({
             "employee_id":        m["employee_id"],
@@ -889,7 +1119,7 @@ def compute_team_rhythm(
         "team_size":      len(members),
     }
 
-def _compute_best_days(members, windowed, ph_dates):
+def _compute_best_days(members, windowed, ph_dates, today):
     # Fix 4: weighted average by observation count per weekday
     # Members with more data anchor the recommendation more strongly
     # than new joiners with 1-2 weeks of history
@@ -899,7 +1129,7 @@ def _compute_best_days(members, windowed, ph_dates):
 
     for m in members:
         att = windowed.get(m["employee_id"], {})
-        dow_rates, active_weeks, dow_intervals, _ = compute_dow_rates(att, ph_dates)
+        dow_rates, active_weeks, dow_intervals, _ = compute_dow_rates(att, ph_dates, today)
         if active_weeks < 2:
             continue
         for dow, rate in dow_rates.items():

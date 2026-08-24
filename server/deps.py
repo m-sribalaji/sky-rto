@@ -101,19 +101,32 @@ async def sync_employee_teams_card(employee_id: str, employee_name: str, team: s
         flag_reason = latest_seg.flag_reason if latest_seg else None
         leave_label = leave.leave_type.replace("_", " ").title() if leave else None
 
-        pills = build_status_pills(status, vpn_active, confidence, flagged, flag_reason, leave_label)
+        # Only touch the card when there's actually something today to show.
+        # This fires for flushed offline records too (queue_flush replays
+        # PAST dates through this same /api/checkin path), and querying
+        # "today" for a flush of, say, Wednesday's backlog correctly finds
+        # nothing yet if the user hasn't checked in today themselves. That
+        # used to still call upsert_employee_card with an empty pill list,
+        # which overwrote the card to "No status yet" — clobbering whatever
+        # real status was already showing. Skipping the upsert here (but
+        # still posting the reply below) means a card can only ever be
+        # updated with real data, never blanked out by an unrelated event.
+        if latest_seg is not None or leave is not None:
+            pills = build_status_pills(status, vpn_active, confidence, flagged, flag_reason, leave_label)
 
-        row = await db.get(TeamsMessage, employee_id)
-        existing_id = row.message_id if row else None
+            row = await db.get(TeamsMessage, employee_id)
+            existing_id = row.message_id if row else None
 
-        new_id = upsert_employee_card(employee_id, employee_name, team, pills,
-                                       existing_id, _SERVER_WEBHOOK)
-        if new_id and new_id != existing_id:
-            if row:
-                row.message_id = new_id
-            else:
-                db.add(TeamsMessage(employee_id=employee_id, message_id=new_id))
-            await db.commit()
+            new_id = upsert_employee_card(employee_id, employee_name, team, pills,
+                                           existing_id, _SERVER_WEBHOOK)
+            if new_id and new_id != existing_id:
+                if row:
+                    row.message_id = new_id
+                else:
+                    db.add(TeamsMessage(employee_id=employee_id, message_id=new_id))
+                await db.commit()
+        else:
+            logger.info(f"[INFO] No status for {employee_id} today yet — skipping card update, still posting reply")
 
         # Reply is keyed on employee_id, not message_id — the flow doesn't
         # return a Response (Premium-only), so we never learn the real
