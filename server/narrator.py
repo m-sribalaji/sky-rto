@@ -44,6 +44,12 @@ NARRATOR_AVAILABLE = bool(OPENAI_API_KEY)
 if not NARRATOR_AVAILABLE:
     logger.warning("[WARN] OPENAI_API_KEY not set - narrative summaries disabled, raw numbers only")
 
+# Bump this on any change to _SYSTEM_PROMPT below — it's folded into the
+# cache hash, so bumping it is what makes a prompt edit actually reach
+# users instead of every previously-cached sentence just sitting there
+# looking unaffected until its own facts happen to change.
+PROMPT_VERSION = 2
+
 _SYSTEM_PROMPT = """You summarize workplace attendance data for one person to read about themselves.
 
 Hard requirements — accuracy always wins over style, never break these:
@@ -62,7 +68,14 @@ How to write it well — this is the part that actually needs judgment, and it o
 
 
 def _facts_hash(section: str, facts: dict) -> str:
-    payload = json.dumps({"section": section, "facts": facts}, sort_keys=True, default=str)
+    # PROMPT_VERSION is part of the hash on purpose: the cache is keyed on
+    # "what would produce a different answer", and a changed system prompt
+    # does exactly that even when the underlying facts haven't moved.
+    # Without this, editing the prompt silently kept serving every
+    # previously-cached sentence until its own facts happened to change —
+    # which is exactly what happened the first time the prompt was tuned.
+    payload = json.dumps({"section": section, "facts": facts, "prompt_version": PROMPT_VERSION},
+                          sort_keys=True, default=str)
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
