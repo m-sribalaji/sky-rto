@@ -14,6 +14,9 @@ from segments import dominant_status_from_segments
 from deps import get_caller_context, get_caller_id, get_managed_teams, require_role
 from analytics import compute_forecast, compute_team_rhythm, _workdays_in_month
 from backtest import run_backtest
+from narrator import get_narrative
+
+_DOW_NAMES = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"]
 
 router = APIRouter()
 
@@ -137,6 +140,47 @@ async def get_insights(employee_id: str, request: Request = None,
         current_month_total_workdays = len(_workdays_in_month(today.year, today.month, ph_dates)),
         team_checkins       = team_checkins,
     )
+
+    # Narratives paraphrase the numbers already in `result` — see
+    # narrator.py's module docstring for why they never compute anything
+    # themselves. Each section caches independently and only re-calls the
+    # LLM when its own facts actually changed, so a WFH->WFO correction
+    # refreshes just the affected section(s), not all three.
+    result["narratives"] = {}
+    if not result.get("insufficient_data"):
+        m = result["monthly"]
+        progress_facts = {
+            "month": m["month"], "actual_wfo": m["actual_wfo"], "target": m["target"],
+            "needed": m["needed"], "elapsed_days": m["elapsed_days"],
+            "remaining_days": m["remaining_days"], "achievable": m["achievable"],
+            "on_track": m["on_track"], "predicted_total": m.get("predicted_total"),
+            "confidence_label": result["confidence_label"],
+            "predictability": result["predictability"],
+        }
+        pattern_facts = {
+            "dow_rates_percent": {_DOW_NAMES[int(k)]: round(v * 100) for k, v in result["dow_rates_stable"].items()},
+            "active_weeks": result["active_weeks"],
+            "confidence_label": result["confidence_label"],
+            "predictability": result["predictability"],
+        }
+        outlook_facts = {
+            "wfh_budget": result["wfh_budget"],
+            "projected_month_total": result["projected_month_total"],
+            "monthly_target": m["target"], "monthly_needed": m["needed"],
+            "weeks": [{
+                "week_start": w["week_start"], "week_end": w["week_end"],
+                "week_target": w["week_target"], "projected_wfo": w["projected_wfo"],
+                "at_risk": w["risk"], "is_current_week": w["is_current_week"],
+                "summary": w["week_summary"],
+            } for w in result["compliance_weeks"]],
+        }
+        result["narratives"]["progress"] = await get_narrative(
+            db, "employee", employee_id, "progress", progress_facts)
+        result["narratives"]["pattern"] = await get_narrative(
+            db, "employee", employee_id, "pattern", pattern_facts)
+        result["narratives"]["compliance_outlook"] = await get_narrative(
+            db, "employee", employee_id, "compliance_outlook", outlook_facts)
+
     return result
 
 
@@ -242,6 +286,21 @@ async def get_team_rhythm(team: str, request: Request = None,
         lookback_weeks = lookback_weeks,
     )
     result["team"] = team
+
+    rhythm_facts = {
+        "team": team,
+        "team_size": result["team_size"],
+        "lookback_weeks": result["lookback_weeks"],
+        "best_days": [{"day": bd["dow_name"], "percent_in_office": round(bd["probability"] * 100),
+                       "members_with_data": bd["members_with_data"]}
+                      for bd in result["best_days"][:3]],
+        "collaboration_gaps": [g["message"] for g in result["gaps"]],
+        "individual_summaries": [{
+            "name": p["employee_name"], "confidence": p["confidence"],
+            "active_weeks": p["active_weeks"], "current_wfo_streak": p["current_streak_wfo"],
+        } for p in result["individual"]],
+    }
+    result["narrative"] = await get_narrative(db, "team", team, "team_rhythm", rhythm_facts)
     return result
 
 

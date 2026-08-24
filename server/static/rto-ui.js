@@ -86,6 +86,21 @@ async function patch(p,b={}){
     return{ok:r.ok,data:await r.json()};
   }catch(e){return{ok:false,data:{}};}
 }
+// Renders an LLM-generated narrative sentence, or nothing at all if one
+// isn't available — the raw numbers around this block already stand on
+// their own, so absence is never a broken state, just a plainer one.
+// Styled distinctly (italic, left accent bar) so it visibly reads as
+// commentary rather than another data field, given it's paraphrase, not
+// a new source of truth.
+function narrativeBlock(text){
+  if(!text) return '';
+  const esc = String(text).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+  return `<div style="font-size:12px;font-style:italic;color:var(--tx2);line-height:1.5;
+              padding:8px 12px;margin:8px 0;border-left:2px solid var(--acc);background:var(--bg2)">
+    ${esc}
+  </div>`;
+}
+
 function renderSplitLabel(label){
   if(!label) return '';
   const parts = label.split(' → ');
@@ -1721,6 +1736,7 @@ async function loadInsights(){
   const progressCard = `
     <div class="card">
       <div class="card-title">${ownerLabel} ${m.month} Progress <span class="card-sub">${d.confidence_label}</span></div>
+      ${narrativeBlock(d.narratives?.progress)}
       <div style="margin:6px 0 14px">
         <div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:6px">
           <span style="font-family:var(--serif);font-size:28px;color:${barColor}">${m.actual_wfo}</span>
@@ -1767,6 +1783,7 @@ async function loadInsights(){
   const patternCard = `
     <div class="card">
       <div class="card-title">${ownerLabel} WFO Pattern <span class="card-sub">Day-of-week baseline</span></div>
+      ${narrativeBlock(d.narratives?.pattern)}
       <div style="display:flex;gap:8px;align-items:flex-end;height:80px">${dowBars}</div>
       <div style="font-family:var(--mono);font-size:10px;color:var(--tx3);margin-top:8px">
         Based on ${d.active_weeks} week${d.active_weeks!==1?'s':''} of recorded days — this is what has
@@ -1991,6 +2008,7 @@ async function loadInsights(){
           <span class="card-sub">${m.month} — remaining weeks</span>
         </div>
         ${legendHtml}
+        ${narrativeBlock(d.narratives?.compliance_outlook)}
         ${budgetHtml}
         <div style="display:flex;flex-direction:column;gap:10px">${weekRows}</div>
         <div style="font-family:var(--mono);font-size:10px;color:var(--tx3);margin-top:10px;padding-top:8px;border-top:1px solid var(--b0)">
@@ -2248,7 +2266,9 @@ async function loadRhythm(){
       <div style="display:flex;flex-direction:column;gap:8px">${indivRows || '<div style="font-family:var(--mono);font-size:11px;color:var(--tx3)">No one on this team has enough history yet.</div>'}</div>
     </div>`;
 
+  const teamNarrative = narrativeBlock(d.narrative);
   el.innerHTML = `
+    ${teamNarrative ? `<div style="margin-bottom:20px">${teamNarrative}</div>` : ''}
     <div class="two-col" style="margin-bottom:20px">${bestCard}${overlapCard}</div>
     <div style="margin-bottom:20px">${heatCard}</div>
     <div class="two-col">${gapsCard}${indivCard}</div>`;
