@@ -53,7 +53,8 @@ logger = logging.getLogger("analytics")
 # forecast stays interpretable after the algorithm moves on, and so
 # backtest.py can report results per version rather than conflating
 # different eras of the model together.
-MODEL_VERSION = "2.1.0"  # 2.1: gap-based EWMA decay, unified dow_rates_stable as canonical rate
+MODEL_VERSION = "3.0.0"  # 3.0: recent-level + damped weekday offset, calibration shrinkage,
+                         #      responsiveness-gated quota pressure (see PREDICTION MODEL below)
 
 # ── constants ──────────────────────────────────────────────────────────────
 LEAVE_TYPES = {
@@ -104,6 +105,46 @@ MONTHLY_WFO_TARGET = 12
 # with 1-2 is pulled most of the way there instead of relying on a single
 # data point or an arbitrary "new employee" alpha heuristic.
 TEAM_POOL_STRENGTH = 15
+
+# ── PREDICTION MODEL (v3) ──────────────────────────────────────────────────
+# v2 predicted from a per-weekday EWMA ("this person is WFO 67% of Tuesdays").
+# Backtested against real recorded history, that scored WORSE than predicting
+# a flat 0.5 every day. Two reasons, both confirmed by measurement:
+#
+#   1. People change. Someone can be near-100% office for a month and then
+#      shift to mostly-home. A per-weekday average over 6-12 weeks blends
+#      both regimes together and describes a person who no longer exists.
+#      Measured on real data, a plain "what have they done lately" rate beat
+#      every per-weekday variant tried — including per-weekday averages,
+#      per-weekday EWMAs at six different alphas, and last-N majority votes.
+#
+#   2. Confident predictions are expensive when the signal is weak. Brier
+#      score punishes a wrong 0.9 far harder than a wrong 0.6, so when
+#      behaviour is genuinely near-random at daily granularity (which it
+#      often is), the honest move is to say so rather than pick a side.
+#
+# So v3 decomposes into level + offset, the standard shape for a series with
+# a drifting baseline and a weak periodic component:
+#
+#   level  — recent WFO rate over the last RECENT_LEVEL_WINDOW working days.
+#            Tracks regime shifts automatically; this is the dominant term.
+#   offset — how much this particular weekday deviates from that person's
+#            own overall rate, in log-odds, damped hard by
+#            WEEKDAY_OFFSET_DAMPING. Weekday genuinely does carry a little
+#            signal for some people, but nothing like enough to lead with.
+#   shrink — final pull toward 0.5 by FORECAST_SHRINK, which is calibration,
+#            not timidity: it stops the model claiming more certainty than
+#            the underlying signal supports.
+#
+# These constants were chosen from a backtest sweep on real recorded data,
+# picking conservative values within the flat part of the curve rather than
+# the exact grid-search optimum — the sample is small enough that the single
+# best cell is not meaningfully better than its neighbours, and tuning to it
+# would be fitting noise. Re-run GET /api/admin/backtest as more history
+# accumulates; if these want moving, that endpoint is how you'll know.
+RECENT_LEVEL_WINDOW    = 8     # working days feeding the level term
+WEEKDAY_OFFSET_DAMPING = 0.35  # how much weekday deviation is allowed to matter
+FORECAST_SHRINK        = 0.55  # 1.0 = no shrinkage, 0 = always predict 0.5
 
 # ── confidence label ───────────────────────────────────────────────────────
 def _confidence_tier(n_obs: int) -> str:
@@ -596,47 +637,236 @@ def _shrink_to_team(dow_rates_stable: dict[int, float], dow_intervals: dict[int,
 
 # ── Quota pressure ──────────────────────────────────────────────────────────
 def _quota_pressure_for_day(fd: date, ds: str, att: dict[str, str],
-                            ph_dates: set[str], weekly_target: int) -> tuple[int, int]:
+                            ph_dates: set[str], weekly_target: int,
+                            predicted_wfo_dates: Optional[set[str]] = None) -> tuple[int, int]:
     """
-    (days_needed_remaining, days_left_inclusive) for fd's own ISO week,
-    based on what's already recorded — a real, already-committed shortfall,
-    not a hypothetical one built from this same forecast run's own earlier
-    predictions. That's a deliberate simplification: the pressure that
-    actually drives someone's behaviour is a real recorded gap, not a
-    forecast-on-a-forecast.
+    (days_needed_remaining, days_left_inclusive) for fd's own ISO week.
+
+    predicted_wfo_dates: dates earlier in THIS SAME forecast run that were
+    already predicted WFO, counted toward the week's target the same way a
+    real recorded day is. Without this, every day in a week with zero
+    actual data recomputes "0 WFO so far" from scratch and each one
+    independently concludes the week can only be salvaged by coming in —
+    so a week needing 3 office days can end up with all 5 remaining days
+    predicted WFO, each one technically "correct" in isolation but
+    collectively absurd. Once this day's own prediction lands, the
+    caller is expected to add ds to this set before evaluating the next
+    day, so later days in the same week see the earlier ones as already
+    "accounted for" and pressure eases off accordingly.
     """
+    predicted_wfo_dates = predicted_wfo_dates or set()
     monday        = fd - timedelta(days=fd.weekday())
     week_day_strs = [(monday + timedelta(days=i)).isoformat() for i in range(5)
                       if (monday + timedelta(days=i)).isoformat() not in ph_dates]
     leave_count        = sum(1 for wd in week_day_strs if att.get(wd) in ("leave", "public_holiday"))
     working_days_in_wk = len(week_day_strs) - leave_count
     week_target = math.ceil(working_days_in_wk * weekly_target / 5) if working_days_in_wk < 5 else weekly_target
-    wfo_so_far  = sum(1 for wd in week_day_strs if wd < ds and att.get(wd) == "wfo")
+    wfo_so_far  = sum(1 for wd in week_day_strs
+                      if wd < ds and (att.get(wd) == "wfo" or wd in predicted_wfo_dates))
     days_needed_remaining = max(0, week_target - wfo_so_far)
     days_left_inclusive = sum(1 for wd in week_day_strs
                               if wd >= ds and att.get(wd) not in ("leave", "public_holiday"))
     return days_needed_remaining, days_left_inclusive
 
-def _quota_pressure_adjust(prob: float, days_needed_remaining: int, days_left_inclusive: int) -> float:
+def compute_recent_level(att: dict[str, str], today: date, ph_dates: set[str],
+                          window: int = RECENT_LEVEL_WINDOW) -> tuple[float, int]:
+    """
+    This person's WFO rate over their most recent `window` recorded working
+    days — the level term of the v3 model (see PREDICTION MODEL above).
+
+    Deliberately a short flat window rather than a long decayed average:
+    the whole job of this term is to notice when someone's pattern has
+    genuinely shifted and to follow it, which a slow average is designed
+    not to do. Returns (rate, n_observations) so callers can tell a rate
+    backed by 8 days from one backed by 2.
+    """
+    days = sorted(
+        (ds for ds, st in att.items()
+         if st in ("wfo", "wfh") and ds < today.isoformat()
+         and ds not in ph_dates and _is_weekday(date.fromisoformat(ds))),
+        reverse=True,
+    )[:window]
+    if not days:
+        return 0.40, 0
+    wfo = sum(1 for ds in days if att[ds] == "wfo")
+    return wfo / len(days), len(days)
+
+
+def compute_weekday_offsets(att: dict[str, str], today: date, ph_dates: set[str],
+                             damping: float = WEEKDAY_OFFSET_DAMPING) -> dict[int, float]:
+    """
+    Per-weekday log-odds deviation from this person's own overall WFO rate,
+    damped — the offset term of the v3 model.
+
+    Expressed as a deviation rather than an absolute per-weekday rate on
+    purpose: it has to compose with a level term that moves. "Fridays run
+    hotter than my average" stays true when the average drops, whereas
+    "Fridays are 86%" silently becomes wrong the moment behaviour shifts.
+    """
+    working = {ds: st for ds, st in att.items()
+               if st in ("wfo", "wfh") and ds < today.isoformat()
+               and ds not in ph_dates and _is_weekday(date.fromisoformat(ds))}
+    if not working:
+        return {dow: 0.0 for dow in range(5)}
+
+    overall = sum(1 for st in working.values() if st == "wfo") / len(working)
+    overall = min(max(overall, 0.05), 0.95)
+
+    by_dow: dict[int, list[str]] = defaultdict(list)
+    for ds, st in working.items():
+        by_dow[date.fromisoformat(ds).weekday()].append(st)
+
+    offsets = {}
+    for dow in range(5):
+        obs = by_dow.get(dow, [])
+        if len(obs) < 2:
+            offsets[dow] = 0.0   # too thin to claim a weekday effect at all
+            continue
+        # Laplace-smoothed so one or two observations can't imply a 0%/100% weekday
+        rate = (sum(1 for s in obs if s == "wfo") + 1) / (len(obs) + 2)
+        offsets[dow] = (_logit(rate) - _logit(overall)) * damping
+    return offsets
+
+
+def compute_prediction_base(att: dict[str, str], today: date, ph_dates: set[str]) -> dict[int, float]:
+    """
+    The per-weekday probabilities the forecast actually predicts from:
+    recent level, adjusted by that weekday's damped offset. Distinct from
+    compute_dow_rates_stable, which stays a pure historical description for
+    the "My WFO Pattern" display — this one is the thing that has to be
+    right about tomorrow, and it's what the backtest scores.
+    """
+    level, _n = compute_recent_level(att, today, ph_dates)
+    level = min(max(level, 0.05), 0.95)
+    offsets = compute_weekday_offsets(att, today, ph_dates)
+    base_logit = _logit(level)
+    return {dow: max(0.05, min(0.95, _sigmoid(base_logit + offsets.get(dow, 0.0))))
+            for dow in range(5)}
+
+
+def compute_predictability(att: dict[str, str], today: date, ph_dates: set[str],
+                            lookback: int = 15) -> float:
+    """
+    How much genuine predictive signal this specific person has, measured
+    against their own recent history. Returns 0..1, feeding the shrinkage
+    that decides how confident the forecast is allowed to be.
+
+    A fixed shrinkage constant can't be right for everyone. Someone with a
+    rigid Mon/Wed/Fri routine deserves confident predictions; someone whose
+    days are effectively coin flips deserves ~0.5 and no pretence
+    otherwise. Measured against a flat "predict this person's own base
+    rate" strategy, the only benchmark that matters: if the signals can't
+    beat that, they're fitting noise, and the honest response is to stop
+    claiming to know. Deliberately self-scoring — each person's own
+    outcomes decide how much the model is trusted about them.
+    """
+    days = sorted(ds for ds, st in att.items()
+                  if st in ("wfo", "wfh") and ds < today.isoformat()
+                  and ds not in ph_dates and _is_weekday(date.fromisoformat(ds)))
+    if len(days) < 12:
+        return 0.5   # not enough history to judge either way — stay middling
+
+    eval_days = days[-lookback:]
+    err_model = err_base = 0.0
+    n = 0
+    for ds in eval_days:
+        prior = {k: v for k, v in att.items() if k < ds}
+        working_prior = [v for k, v in prior.items() if v in ("wfo", "wfh")]
+        if len(working_prior) < 6:
+            continue
+        d_obj = date.fromisoformat(ds)
+        base_rate = sum(1 for v in working_prior if v == "wfo") / len(working_prior)
+        pred = compute_prediction_base(prior, d_obj, ph_dates).get(d_obj.weekday(), base_rate)
+        actual = 1.0 if att[ds] == "wfo" else 0.0
+        err_model += (pred - actual) ** 2
+        err_base  += (base_rate - actual) ** 2
+        n += 1
+
+    if n == 0 or err_base <= 1e-9:
+        return 0.5
+    # Skill score: >0 means the signals genuinely beat the person's own base
+    # rate, <=0 means they're adding noise and should be damped toward it.
+    skill = 1.0 - (err_model / err_base)
+    return max(0.0, min(1.0, skill))
+
+
+def compute_compliance_responsiveness(att: dict[str, str], ph_dates: set[str], today: date,
+                                       weekly_target: int = WEEKLY_WFO_TARGET,
+                                       alpha: float = 0.35) -> float:
+    """
+    Does this person ACTUALLY chase the weekly office target when they fall
+    behind? Returns 0..1, where 1 = reliably hits target every week and 0 =
+    the target has no observable effect on their behaviour.
+
+    This exists because assuming target-seeking behaviour is a much stronger
+    claim than it looks. Quota pressure used to be applied to everyone at
+    full strength, which meant the model would confidently predict "in
+    office" for someone who is behind — overriding that person's own
+    observed habit — even when their history plainly shows they miss the
+    target and carry on as normal. That's the model asserting a behaviour
+    the evidence contradicts, and it produced worse-than-coin-flip
+    predictions for exactly the people whose recent pattern had shifted.
+
+    Measured over completed weeks only (the in-progress week can't be
+    scored yet), EWMA-weighted so a person who used to hit target but has
+    missed the last three weeks is scored on who they are now, not who
+    they were two months ago. Laplace-ish neutral 0.5 start means someone
+    with almost no history gets partial pressure rather than either
+    extreme.
+    """
+    week_days: dict[str, list[str]] = defaultdict(list)
+    for ds, st in att.items():
+        if ds >= today.isoformat():
+            continue  # only completed days
+        d = date.fromisoformat(ds)
+        if not _is_weekday(d) or ds in ph_dates:
+            continue
+        wk = (d - timedelta(days=d.weekday())).isoformat()
+        week_days[wk].append(st)
+
+    current_week = (today - timedelta(days=today.weekday())).isoformat()
+    scored = 0.5  # neutral prior — no evidence either way
+    seen = 0
+    for wk in sorted(week_days):
+        if wk >= current_week:
+            continue  # in-progress week isn't finished, can't be scored
+        statuses = week_days[wk]
+        working = [s for s in statuses if s in ("wfo", "wfh")]
+        if len(working) < 3:
+            continue  # partial week (holiday/leave-heavy or mid-install) — not a fair test
+        target = math.ceil(len(working) * weekly_target / 5) if len(working) < 5 else weekly_target
+        hit = 1.0 if sum(1 for s in working if s == "wfo") >= target else 0.0
+        scored = (1 - alpha) * scored + alpha * hit
+        seen += 1
+
+    if seen == 0:
+        return 0.5
+    return max(0.0, min(1.0, scored))
+
+
+def _quota_pressure_adjust(prob: float, days_needed_remaining: int, days_left_inclusive: int,
+                           responsiveness: float = 1.0) -> float:
     """
     Nudges probability toward "will hit quota" behaviour as a week gets
-    tight — someone 2 days behind with 2 workdays left is going to come in
-    almost regardless of what a normal Tuesday looks like for them. This
-    is real, learnable, target-seeking behaviour the day-of-week/Markov
-    signals alone have no way to see, since neither knows anything about
-    the weekly target.
+    tight — someone 2 days behind with 2 workdays left may well come in
+    regardless of what a normal Tuesday looks like for them. That's real,
+    learnable, target-seeking behaviour the day-of-week/Markov signals
+    can't see, since neither knows anything about the weekly target.
 
-    Blends in log-odds space, weighted by how binding the quota actually
-    is right now (needed / left): no pressure when comfortably ahead of
-    target (weight 0 — pure habit governs), full override of habit when
-    the target can only still be hit by coming in every remaining day
-    (weight 1 — quota dominates regardless of what this weekday usually
-    looks like for this person).
+    Blends in log-odds space, weighted by how binding the quota is right
+    now (needed / left) AND by how much this specific person has
+    historically responded to that pressure (see
+    compute_compliance_responsiveness). The responsiveness term is what
+    keeps this honest: pressure can only override someone's observed habit
+    to the extent their own history shows the target actually moves them.
+    For a reliable target-chaser it behaves as before; for someone who
+    routinely misses target it stays near-silent and habit governs, which
+    is what the evidence supports.
     """
     if days_left_inclusive <= 0:
         return prob
     quota_rate = max(0.0, min(1.0, days_needed_remaining / days_left_inclusive))
-    weight = quota_rate
+    weight = quota_rate * max(0.0, min(1.0, responsiveness))
     if weight <= 0:
         return prob
     quota_logit = _logit(0.97 if quota_rate >= 0.999 else max(quota_rate, 0.03))
@@ -701,6 +931,27 @@ def compute_forecast(
 
     # Build personal Markov matrix (uses Laplace smoothing, falls back to global)
     personal_markov = _build_personal_markov(att, ph_dates, today)
+    # How much this person's own history says the weekly target actually
+    # moves them — gates quota pressure so it can't assert compliance
+    # behaviour the evidence contradicts.
+    responsiveness = compute_compliance_responsiveness(att, ph_dates, today)
+    # v3 prediction base: recent level + damped weekday offset. dow_rates_stable
+    # remains the historical *description* shown in "My WFO Pattern"; this is
+    # what the forecast actually predicts from. See PREDICTION MODEL at the top.
+    pred_base = compute_prediction_base(att, today, ph_dates)
+    # How confident this person's own track record earns the forecast being.
+    # Blends the global floor with measured per-person skill, so a rigid
+    # routine gets sharp predictions and an erratic one gets honest hedging
+    # instead of noise dressed up as insight.
+    predictability = compute_predictability(att, today, ph_dates)
+    # sqrt curve, not linear: skill has to be earned before confidence is
+    # granted, but someone with a genuinely rigid routine still reaches
+    # near-full sharpness. Chosen by backtest sweep across four profiles
+    # (this employee's real history, a rigid Mon/Wed/Fri pattern, a pure
+    # coin-flip, and a noisy semi-structured one) — it won or tied on all
+    # four, where a linear curve under-sharpened real patterns and a raw
+    # pass-through over-trusted noise.
+    shrink = max(0.10, min(0.90, (predictability ** 0.5) * 0.9))
 
     prev_status = _last_workday_status(att, today, ph_dates)
 
@@ -717,6 +968,7 @@ def compute_forecast(
 
     forecast = []
     running_prev = prev_status
+    predicted_wfo_dates: set[str] = set()  # see _quota_pressure_for_day
 
     for fd in forecast_dates:
         ds = fd.isoformat()
@@ -753,27 +1005,26 @@ def compute_forecast(
             running_prev = actual
             continue
 
-        # Probabilistic prediction — base rate comes from dow_rates_stable,
-        # same source the Compliance Outlook week view uses (see
-        # _compliance_forecast_weeks below). These used to be two different
-        # rates (this one from the fast/adaptive dow_rates, that one from
-        # the 12-week-capped stable version), which meant the exact same
-        # future date could show a different predicted status depending on
-        # which panel you were looking at. dow_rates (fast) is still
-        # computed and returned — it's what personal_markov and the
-        # Wilson confidence intervals are keyed to, which is legitimately
-        # about sample size, not point-estimate volatility — it's just no
-        # longer the number used for the actual predicted probability.
-        base = dow_rates_stable.get(fd.weekday(), 0.40)
+        # v3 base: recent level + damped weekday offset (see PREDICTION MODEL).
+        # The same pred_base feeds the Compliance Outlook week view below, so
+        # the two panels can't disagree about the same date.
+        base = pred_base.get(fd.weekday(), 0.40)
         prob = markov_adjust(base, running_prev, personal_markov)
 
-        # Quota pressure — a real, learnable signal the day-of-week/Markov
-        # rates alone can't see: someone behind on their weekly target with
-        # few workdays left is going to come in regardless of habit. See
-        # _quota_pressure_for_day / _quota_pressure_adjust for the method.
+        # Quota pressure, gated by how much this person's own history shows
+        # the weekly target actually moves them — see
+        # compute_compliance_responsiveness for why that gate exists.
         days_needed_remaining, days_left_inclusive = _quota_pressure_for_day(
-            fd, ds, att, ph_dates, WEEKLY_WFO_TARGET)
-        prob = _quota_pressure_adjust(prob, days_needed_remaining, days_left_inclusive)
+            fd, ds, att, ph_dates, WEEKLY_WFO_TARGET, predicted_wfo_dates)
+        prob = _quota_pressure_adjust(prob, days_needed_remaining, days_left_inclusive,
+                                       responsiveness)
+
+        # Calibration shrinkage — the last step, applied to whatever the
+        # signals produced. Daily attendance is only weakly predictable even
+        # with good history, and an overconfident wrong call costs far more
+        # than a hedged one; this keeps stated confidence in line with what
+        # the data actually supports rather than what the arithmetic emitted.
+        prob = 0.5 + shrink * (prob - 0.5)
 
         # Absence signal — only for today (Fix #4: now reachable)
         if fd == today:
@@ -800,11 +1051,14 @@ def compute_forecast(
             "n_obs":      interval.get("n", 0),
         })
         running_prev = "wfo" if prob >= 0.5 else "wfh"
+        if running_prev == "wfo":
+            predicted_wfo_dates.add(ds)
 
     monthly = _monthly_progress(att, today, ph_dates, current_month_wfo)
     compliance_meta = _compliance_forecast_weeks(
-        att, today, ph_dates, dow_rates_stable, current_month_wfo,
-        dow_confidence=dow_confidence, personal_markov=personal_markov)
+        att, today, ph_dates, pred_base, current_month_wfo,
+        dow_confidence=dow_confidence, personal_markov=personal_markov,
+        responsiveness=responsiveness, shrink=shrink)
     month_rem = [f for f in forecast
                  if f["date"][:7] == today.strftime("%Y-%m")
                  and not f.get("certain") and f["status"] == "predicted_wfo"]
@@ -865,12 +1119,14 @@ def _compliance_forecast_weeks(
     att: dict[str, str],
     today: date,
     ph_dates: set[str],
-    dow_rates_stable: dict[int, float],
+    pred_base: dict[int, float],
     current_month_wfo: int,
     dow_confidence: dict[int, str] | None = None,
     monthly_target: int = MONTHLY_WFO_TARGET,
     weekly_target: int = WEEKLY_WFO_TARGET,
     personal_markov: Optional[dict] = None,
+    responsiveness: float = 1.0,
+    shrink: float = FORECAST_SHRINK,
 ) -> dict:
     """
     Compute per-remaining-week compliance outlook for the current month.
@@ -918,6 +1174,7 @@ def _compliance_forecast_weeks(
     # Markov transition sees real day-to-day continuity, same as the main
     # per-day forecast loop in compute_forecast.
     running_prev = _last_workday_status(att, today, ph_dates)
+    predicted_wfo_dates: set[str] = set()  # see _quota_pressure_for_day
 
     for wk_key in sorted(weeks_map.keys()):
         days_in_week = weeks_map[wk_key]
@@ -953,20 +1210,23 @@ def _compliance_forecast_weeks(
                 confidence_tier   = "certain"
                 running_prev      = actual_status
             else:
-                # Same Markov + quota-pressure combination the per-day
-                # forecast uses (see compute_forecast) — not just the same
-                # base rate. Otherwise this view and that one could still
-                # disagree on the exact same date even after both read
-                # from the same dow_rates_stable.
-                base = dow_rates_stable.get(dow, 0.40)
+                # Identical pipeline to the per-day forecast in
+                # compute_forecast — same pred_base, same Markov, same
+                # responsiveness-gated quota pressure, same shrinkage — so
+                # the two views can't disagree about the same date.
+                base = pred_base.get(dow, 0.40)
                 rate = markov_adjust(base, running_prev, personal_markov)
                 days_needed_remaining, days_left_inclusive = _quota_pressure_for_day(
-                    d_obj, ds, att, ph_dates, weekly_target)
-                rate = _quota_pressure_adjust(rate, days_needed_remaining, days_left_inclusive)
+                    d_obj, ds, att, ph_dates, weekly_target, predicted_wfo_dates)
+                rate = _quota_pressure_adjust(rate, days_needed_remaining, days_left_inclusive,
+                                               responsiveness)
+                rate = 0.5 + shrink * (rate - 0.5)
                 week_proj        += rate
                 predicted_status  = "wfo" if rate >= 0.5 else "wfh"
                 confidence_tier   = dow_confidence.get(dow, "insufficient")
                 running_prev      = predicted_status
+                if predicted_status == "wfo":
+                    predicted_wfo_dates.add(ds)
 
             day_details.append({
                 "date":              ds,
