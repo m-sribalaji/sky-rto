@@ -22,7 +22,11 @@ RUN pip install --no-cache-dir -r requirements.txt
 # can be pulled in from shared/ instead of being duplicated in server/.
 
 # Python server files
-COPY server/config.py server/database.py server/detection.py server/main.py server/deps.py server/schemas.py server/segments.py server/analytics.py ./
+# Wildcard, not an explicit file list — the explicit list used to miss
+# any brand-new top-level module (backtest.py shipped in the repo and in
+# the deploy tar, but never made it into the image until this line named
+# it, since Docker COPY only pulls in what's actually listed).
+COPY server/*.py ./
 COPY shared/notifier.py ./
 COPY server/routers/ ./routers/
 
