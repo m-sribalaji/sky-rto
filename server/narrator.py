@@ -162,6 +162,166 @@ def _call_openai(facts: dict, section_hint: str) -> Optional[str]:
         return None
 
 
+_COMBINED_SYSTEM_PROMPT = _SYSTEM_PROMPT + """
+
+You will be given facts for THREE separate sections at once: progress,
+pattern, and compliance_outlook. Write each section's summary
+independently, following all the rules above — a fact given under one
+section's heading belongs to that section only, never borrow a number
+from one section to describe another. Return a JSON object with exactly
+these three keys, each a string: "progress", "pattern",
+"compliance_outlook"."""
+
+_COMBINED_JSON_SCHEMA = {
+    "type": "json_schema",
+    "json_schema": {
+        "name": "personal_narratives",
+        "strict": True,
+        "schema": {
+            "type": "object",
+            "properties": {
+                "progress":           {"type": "string"},
+                "pattern":            {"type": "string"},
+                "compliance_outlook": {"type": "string"},
+            },
+            "required": ["progress", "pattern", "compliance_outlook"],
+            "additionalProperties": False,
+        },
+    },
+}
+
+
+def _call_openai_combined(sections: dict[str, dict]) -> Optional[dict]:
+    """
+    Same call as _call_openai, but asks for all three personal sections
+    (progress/pattern/compliance_outlook) in one request instead of three.
+    The system prompt (by far the biggest input-token cost, repeated
+    identically on every separate call) gets paid for once instead of
+    three times, and this drops three HTTP round-trips to one. Uses
+    structured outputs (a JSON schema, not just "please return JSON" in
+    the prompt) so parsing is reliable rather than hoping the model
+    formats its own answer the way we expect.
+    """
+    if not NARRATOR_AVAILABLE:
+        return None
+    user_content = "\n\n".join(
+        f"Section: {name}\nFacts (JSON): {json.dumps(facts, default=str)}"
+        for name, facts in sections.items()
+    )
+    body = {
+        "model": OPENAI_MODEL,
+        "messages": [
+            {"role": "system", "content": _COMBINED_SYSTEM_PROMPT},
+            {"role": "user", "content": user_content},
+        ],
+        "max_completion_tokens": 700,  # three sections' worth, same per-section budget as before
+        "reasoning_effort": "none",
+        "response_format": _COMBINED_JSON_SCHEMA,
+    }
+    try:
+        req = urllib.request.Request(
+            OPENAI_URL,
+            data=json.dumps(body).encode("utf-8"),
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {OPENAI_API_KEY}",
+            },
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=25) as resp:
+            if resp.status != 200:
+                logger.warning(f"[WARN] OpenAI returned HTTP {resp.status}")
+                return None
+            data = json.loads(resp.read().decode("utf-8"))
+            content = data["choices"][0]["message"]["content"]
+            parsed = json.loads(content)
+            if not all(k in parsed and isinstance(parsed[k], str) for k in ("progress", "pattern", "compliance_outlook")):
+                logger.warning(f"[WARN] Combined narrative response missing expected keys: {list(parsed.keys())}")
+                return None
+            return parsed
+    except urllib.error.HTTPError as e:
+        body_txt = ""
+        try:
+            body_txt = e.read().decode("utf-8", errors="ignore")
+        except Exception:
+            pass
+        logger.warning(f"[WARN] OpenAI HTTP {e.code}: {body_txt[:300]}")
+        return None
+    except Exception as e:
+        logger.warning(f"[WARN] OpenAI combined call failed: {e}")
+        return None
+
+
+async def get_combined_personal_narratives(db: AsyncSession, employee_id: str,
+                                            sections: dict[str, dict]) -> dict:
+    """
+    One call covering progress/pattern/compliance_outlook together,
+    cached as a single row (section="personal_combined") keyed on a hash
+    of all three facts dicts together. Same locking / rate-floor /
+    attempt-tracking design as get_narrative — see that function for why
+    each piece exists; this mirrors it rather than sharing code directly
+    since the payload shape (one JSON blob vs. one string) differs enough
+    to make a shared helper messier than two similar functions.
+
+    Returns {"progress": str|None, "pattern": str|None, "compliance_outlook": str|None}
+    — never raises, missing/failed generation just means None per key,
+    same contract as get_narrative for a single section.
+    """
+    empty = {"progress": None, "pattern": None, "compliance_outlook": None}
+    if not NARRATOR_AVAILABLE:
+        return empty
+
+    subject_type, subject_id, section = "employee", employee_id, "personal_combined"
+    key = f"{subject_type}:{subject_id}:{section}"
+
+    def _parse(blob: str) -> dict:
+        if not blob:
+            return empty
+        try:
+            parsed = json.loads(blob)
+            return {k: parsed.get(k) for k in ("progress", "pattern", "compliance_outlook")}
+        except Exception:
+            return empty
+
+    async with _lock_for(key):
+        new_hash = _facts_hash(section, sections)
+        q = await db.execute(select(Narrative).where(
+            Narrative.subject_type == subject_type,
+            Narrative.subject_id == subject_id,
+            Narrative.section == section,
+        ).order_by(Narrative.id.desc()))
+        row = q.scalars().first()
+
+        if row and row.source_hash == new_hash:
+            return _parse(row.narrative_text)
+
+        if row and row.last_attempt_at:
+            last = row.last_attempt_at.replace(tzinfo=timezone.utc) if row.last_attempt_at.tzinfo is None else row.last_attempt_at
+            age = (datetime.now(timezone.utc) - last).total_seconds()
+            if age < MIN_REGEN_SECONDS:
+                logger.info(f"[INFO] Skipping regen for {key} - last attempt {int(age)}s ago (floor: {MIN_REGEN_SECONDS}s)")
+                return _parse(row.narrative_text)
+
+        if row:
+            row.last_attempt_at = datetime.now(timezone.utc)
+        else:
+            row = Narrative(subject_type=subject_type, subject_id=subject_id, section=section,
+                             source_hash="", narrative_text="",
+                             last_attempt_at=datetime.now(timezone.utc))
+            db.add(row)
+        await db.commit()
+
+        parsed = _call_openai_combined(sections)
+        if parsed is None:
+            return _parse(row.narrative_text)
+
+        row.source_hash = new_hash
+        row.narrative_text = json.dumps(parsed)
+        row.generated_at = datetime.now(timezone.utc)
+        await db.commit()
+        return parsed
+
+
 async def get_narrative(db: AsyncSession, subject_type: str, subject_id: str,
                          section: str, facts: dict) -> Optional[str]:
     """

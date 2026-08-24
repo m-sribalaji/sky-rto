@@ -427,6 +427,77 @@ def first_run_setup():
     print("")
 
 
+# ── DASHBOARD RE-LOGIN ────────────────────────────────────────────────────────
+def sync_and_open_dashboard(force_open: bool = False, verbose: bool = False) -> bool:
+    """
+    Sync the device token and mint a fresh browser auth-handoff — same
+    machinery that already ran silently on every agent startup, just
+    pulled out so it can also be triggered on demand.
+
+    This exists because losing browser localStorage (cleared cache,
+    manually edited devtools, different profile, whatever) used to leave
+    an already-registered employee stuck: the browser's /api/token-refresh
+    call correctly requires proof of the CURRENT token to rotate one that
+    already exists — that's deliberate, it's what stops anyone on the
+    network from pulling a colleague's token just by knowing their
+    hostname — but a browser that lost its copy has no way to present
+    that proof itself. The fix was always "ask the device that actually
+    holds the valid token to vouch for you", which this machine can do
+    for itself; there was just no way to ask for it except waiting for
+    the next natural agent restart. Every step here runs with the
+    device's own already-issued token — this never touches anyone else's
+    credentials or requires the network trust boundary token-refresh
+    relies on, since it's presenting proof the caller already has.
+
+    force_open=True always opens the browser (the --relogin case);
+    normal startup keeps the original "only auto-open the very first
+    time a token is issued" behaviour so this doesn't pop a browser tab
+    on every ordinary restart.
+    """
+    import urllib.request as _ur, json as _json, webbrowser as _wb
+    cfg      = load_config()
+    hostname = get_hostname()
+    server   = cfg.get("server_url", "").rstrip("/")
+    if not server or not server_reachable(server):
+        if verbose: print("  [FAIL] Server unreachable — check VPN and try again.")
+        return False
+
+    had_token = bool(cfg.get("device_token"))
+    _sync_device_auth(server, hostname, cfg)
+    cfg   = load_config()  # reload after sync
+    token = cfg.get("device_token", "")
+    if not token:
+        if verbose: print("  [FAIL] No device token — this machine isn't registered yet.")
+        return False
+
+    try:
+        req = _ur.Request(
+            f"{server}/api/auth-handoff",
+            data=b"{}",
+            headers={"Content-Type": "application/json", "X-Device-Token": token},
+            method="POST",
+        )
+        with _ur.urlopen(req, timeout=5) as r:
+            hd = _json.loads(r.read())
+        handoff = hd.get("handoff", "")
+        if not handoff:
+            if verbose: print("  [FAIL] Server didn't return a handoff token.")
+            return False
+        dashboard_url = f"{server}/?auth={handoff}"
+        cfg["_dashboard_url"] = dashboard_url
+        save_config(cfg)
+        logger.info("[OK] Dashboard auth handoff created")
+        if force_open or not had_token:
+            _wb.open(dashboard_url)
+            logger.info("[OK] Dashboard opened" + (" (relogin)" if force_open else " for first-time auth setup"))
+            if verbose: print("  [OK] Dashboard opened in your browser — you should be logged in now.")
+        return True
+    except Exception as e:
+        logger.debug(f"Handoff creation skipped: {e}")
+        if verbose: print(f"  [FAIL] Could not reach server: {e}")
+        return False
+
+
 # ── MAIN ──────────────────────────────────────────────────────────────────────
 def main():
     parser = argparse.ArgumentParser(
@@ -441,6 +512,7 @@ Examples:
   rto-mac --install       (Re)install the launchd auto-start agent
   rto-mac --uninstall     Remove the launchd auto-start agent
   rto-mac --purge         Uninstall AND delete ~/.rto_tracker (config, logs, device token)
+  rto-mac --relogin       Fix "not registered" in the browser without touching a terminal
         """,
     )
     parser.add_argument("--force",     action="store_true",
@@ -449,6 +521,11 @@ Examples:
                         help="Clear all caches then force a fresh check-in")
     parser.add_argument("--retry",     action="store_true",
                         help="Retry any queued offline check-ins")
+    parser.add_argument("--relogin",   action="store_true",
+                        help="Re-sync this browser's login using the device's already-issued "
+                             "token, and open the dashboard — fixes a browser stuck showing "
+                             "'not registered' (cleared cache, edited localStorage, different "
+                             "profile) without needing to re-register the device")
     parser.add_argument("--install",   action="store_true",
                         help="(Re)install the launchd LaunchAgent")
     parser.add_argument("--uninstall", action="store_true",
@@ -483,6 +560,12 @@ Examples:
         run_retry()
         sys.exit(0)
 
+    if args.relogin:
+        print("")
+        print("  Re-syncing browser login...")
+        ok = sync_and_open_dashboard(force_open=True, verbose=True)
+        sys.exit(0 if ok else 1)
+
     if args.force:
         # Force a check-in and exit — useful for manual testing
         logger.info("--force: running forced check-in")
@@ -499,47 +582,12 @@ Examples:
     except Exception as _ue:
         logger.debug(f"Update check skipped: {_ue}")
 
-    # Sync device token and open dashboard with auth handoff.
-    # - Token sync runs on every startup, independent of check-in logic
-    # - Browser is opened automatically ONLY when token was just freshly obtained
-    #   (not on every startup — only when localStorage would be empty)
+    # Sync device token and open dashboard with auth handoff — only auto-opens
+    # the browser the very first time a token is issued, not on every
+    # ordinary restart. See sync_and_open_dashboard() for the full mechanism
+    # (also reachable on demand via --relogin).
     try:
-        import urllib.request as _ur, json as _json, webbrowser as _wb
-        cfg      = load_config()
-        hostname = get_hostname()
-        server   = cfg.get("server_url", "").rstrip("/")
-        if server and server_reachable(server):
-            had_token = bool(cfg.get("device_token"))
-            _sync_device_auth(server, hostname, cfg)
-            cfg   = load_config()  # reload after sync
-            token = cfg.get("device_token", "")
-            if token:
-                # Create handoff token for browser auto-login
-                try:
-                    req = _ur.Request(
-                        f"{server}/api/auth-handoff",
-                        data=b"{}",
-                        headers={
-                            "Content-Type": "application/json",
-                            "X-Device-Token": token,
-                        },
-                        method="POST",
-                    )
-                    with _ur.urlopen(req, timeout=5) as r:
-                        hd = _json.loads(r.read())
-                    handoff = hd.get("handoff", "")
-                    if handoff:
-                        dashboard_url = f"{server}/?auth={handoff}"
-                        cfg["_dashboard_url"] = dashboard_url
-                        save_config(cfg)
-                        logger.info("[OK] Dashboard auth handoff created")
-                        # Only open browser if token was JUST obtained (freshly registered
-                        # or migrating from pre-token version) — not on every startup
-                        if not had_token:
-                            _wb.open(dashboard_url)
-                            logger.info("[OK] Dashboard opened for first-time auth setup")
-                except Exception as _he:
-                    logger.debug(f"Handoff creation skipped: {_he}")
+        sync_and_open_dashboard(force_open=False)
     except Exception as _te:
         logger.debug(f"Token sync skipped: {_te}")
 

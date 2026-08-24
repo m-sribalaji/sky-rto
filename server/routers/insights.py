@@ -14,7 +14,7 @@ from segments import dominant_status_from_segments
 from deps import get_caller_context, get_caller_id, get_managed_teams, require_role
 from analytics import compute_forecast, compute_team_rhythm, _workdays_in_month
 from backtest import run_backtest
-from narrator import get_narrative
+from narrator import get_narrative, get_combined_personal_narratives
 
 _DOW_NAMES = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"]
 
@@ -143,9 +143,17 @@ async def get_insights(employee_id: str, request: Request = None,
 
     # Narratives paraphrase the numbers already in `result` — see
     # narrator.py's module docstring for why they never compute anything
-    # themselves. Each section caches independently and only re-calls the
-    # LLM when its own facts actually changed, so a WFH->WFO correction
-    # refreshes just the affected section(s), not all three.
+    # themselves. All three personal sections go out in ONE combined call
+    # (get_combined_personal_narratives) instead of three separate ones —
+    # the system prompt is by far the biggest input-token cost and used to
+    # get paid for three times per page view for no reason, since it's
+    # identical across all three. They still cache and invalidate
+    # together as a unit now, not independently — a change to any one
+    # section's facts regenerates all three, which is a real trade-off
+    # (see the narrator.py docstring on get_combined_personal_narratives),
+    # but the three numbers move together often enough in practice that
+    # it's a reasonable one for a 3x cut in both request count and
+    # repeated prompt overhead.
     result["narratives"] = {}
     if not result.get("insufficient_data"):
         m = result["monthly"]
@@ -176,12 +184,11 @@ async def get_insights(employee_id: str, request: Request = None,
                 "summary": w["week_summary"],
             } for w in result["compliance_weeks"]],
         }
-        result["narratives"]["progress"] = await get_narrative(
-            db, "employee", employee_id, "progress", progress_facts)
-        result["narratives"]["pattern"] = await get_narrative(
-            db, "employee", employee_id, "pattern", pattern_facts)
-        result["narratives"]["compliance_outlook"] = await get_narrative(
-            db, "employee", employee_id, "compliance_outlook", outlook_facts)
+        result["narratives"] = await get_combined_personal_narratives(db, employee_id, {
+            "progress": progress_facts,
+            "pattern": pattern_facts,
+            "compliance_outlook": outlook_facts,
+        })
 
     return result
 
