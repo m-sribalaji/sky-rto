@@ -184,7 +184,7 @@ async def get_narrative(db: AsyncSession, subject_type: str, subject_id: str,
         row = q.scalars().first()
 
         if row and row.source_hash == new_hash:
-            return row.narrative_text
+            return row.narrative_text or None
 
         # Rate floor keyed on last_attempt_at, NOT generated_at — a section
         # whose every call fails never sets generated_at, so a floor keyed
@@ -195,17 +195,27 @@ async def get_narrative(db: AsyncSession, subject_type: str, subject_id: str,
             age = (datetime.now(timezone.utc) - last).total_seconds()
             if age < MIN_REGEN_SECONDS:
                 logger.info(f"[INFO] Skipping regen for {key} - last attempt {int(age)}s ago (floor: {MIN_REGEN_SECONDS}s)")
-                return row.narrative_text
+                return row.narrative_text or None
 
         # Record the attempt BEFORE calling the API, and commit immediately
         # — so even if this call fails, hangs, or the process dies mid-call,
         # the next request still sees a recent last_attempt_at and backs
         # off, instead of every concurrent/subsequent request racing to
         # retry a call that was already known to be failing.
+        #
+        # source_hash/narrative_text get "" here, not left unset — the
+        # live table predates this column's nullable=True (this app's
+        # auto-migration only ever adds new columns, it doesn't relax an
+        # existing NOT NULL), so a brand-new row for a first-ever failed
+        # attempt still has to satisfy that constraint. "" reads the same
+        # as no-narrative-yet everywhere this value is consumed (falsy in
+        # both Python and the JS that renders it) without needing a manual
+        # ALTER TABLE against a live database.
         if row:
             row.last_attempt_at = datetime.now(timezone.utc)
         else:
             row = Narrative(subject_type=subject_type, subject_id=subject_id, section=section,
+                             source_hash="", narrative_text="",
                              last_attempt_at=datetime.now(timezone.utc))
             db.add(row)
         await db.commit()
@@ -216,7 +226,7 @@ async def get_narrative(db: AsyncSession, subject_type: str, subject_id: str,
             # nothing, if one exists (None if there's never been one). The
             # attempt is already recorded above, so this failure is rate-
             # limited on the next call regardless of what happens here.
-            return row.narrative_text
+            return row.narrative_text or None
 
         row.source_hash = new_hash
         row.narrative_text = text
