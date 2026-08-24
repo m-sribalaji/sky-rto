@@ -95,10 +95,25 @@ async function patch(p,b={}){
 function narrativeBlock(text){
   if(!text) return '';
   const esc = String(text).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+  // Blue, not the page's accent orange — orange already means "at risk" on
+  // these pages (badges, targets-missed rows), and this box sitting right
+  // above those in the same color read as another warning rather than
+  // commentary. Bottom-margin only (no top) so it sits flush under the
+  // title/legend above it instead of adding an extra, uneven gap.
   return `<div style="font-size:12px;font-style:italic;color:var(--tx2);line-height:1.5;
-              padding:8px 12px;margin:8px 0;border-left:2px solid var(--acc);background:var(--bg2)">
+              padding:8px 12px;margin:0 0 14px;border-left:2px solid var(--blue);
+              border-radius:0 6px 6px 0;background:var(--bg2)">
     ${esc}
   </div>`;
+}
+
+function toggleComplianceLegend(){
+  const el = document.getElementById('compliance-legend-text');
+  if(!el) return;
+  const expanded = el.style.maxWidth !== '0px' && el.style.maxWidth !== '';
+  el.style.maxWidth = expanded ? '0px' : '900px';
+  el.style.opacity  = expanded ? '0' : '1';
+  el.style.whiteSpace = expanded ? 'nowrap' : 'normal';
 }
 
 function renderSplitLabel(label){
@@ -1785,6 +1800,10 @@ async function loadInsights(){
       <div class="card-title">${ownerLabel} WFO Pattern <span class="card-sub">Day-of-week baseline</span></div>
       ${narrativeBlock(d.narratives?.pattern)}
       <div style="display:flex;gap:8px;align-items:flex-end;height:80px">${dowBars}</div>
+      ${d.narratives?.pattern ? `
+      <div style="font-family:var(--mono);font-size:10px;color:var(--tx3);margin-top:8px">
+        Based on ${d.active_weeks} week${d.active_weeks!==1?'s':''} of recorded days, not a prediction.
+      </div>` : `
       <div style="font-family:var(--mono);font-size:10px;color:var(--tx3);margin-top:8px">
         Based on ${d.active_weeks} week${d.active_weeks!==1?'s':''} of recorded days — this is what has
         actually happened, not a prediction.
@@ -1794,7 +1813,7 @@ async function loadInsights(){
         ${d.predictability !== undefined ? `<br>How well this predicts upcoming days: <span style="color:${
           d.confidence==='high'?'var(--green)':d.confidence==='medium'?'var(--amber)':'var(--tx2)'
         }">${d.confidence_label}</span>` : ''}
-      </div>
+      </div>`}
     </div>`;
 
   // ── Compliance status card ────────────────────────────────────────────
@@ -2266,9 +2285,8 @@ async function loadRhythm(){
       <div style="display:flex;flex-direction:column;gap:8px">${indivRows || '<div style="font-family:var(--mono);font-size:11px;color:var(--tx3)">No one on this team has enough history yet.</div>'}</div>
     </div>`;
 
-  const teamNarrative = narrativeBlock(d.narrative);
   el.innerHTML = `
-    ${teamNarrative ? `<div style="margin-bottom:20px">${teamNarrative}</div>` : ''}
+    ${narrativeBlock(d.narrative)}
     <div class="two-col" style="margin-bottom:20px">${bestCard}${overlapCard}</div>
     <div style="margin-bottom:20px">${heatCard}</div>
     <div class="two-col">${gapsCard}${indivCard}</div>`;

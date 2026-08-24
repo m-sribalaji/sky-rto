@@ -207,7 +207,10 @@
           <button class="btn btn-ghost btn-sm" onclick="exportCSV()"><i data-lucide="download"></i>Export CSV</button>
         </div>
       </div>
-      <div class="notice info"><i data-lucide="info"></i><span>Target: <strong>12 WFO days/month</strong> &mdash; <span style="color:var(--green)">Green</span> = met &nbsp;|&nbsp; <span style="color:var(--amber)">Amber</span> = in progress, on track &nbsp;|&nbsp; <span style="color:#f97316">Orange</span> = some weeks below 3 days, month ongoing &nbsp;|&nbsp; <span style="color:var(--red)">Red</span> = month ended, target missed.</span></div>
+      <div class="notice info" id="compliance-legend" onclick="toggleComplianceLegend()" style="cursor:pointer;overflow:hidden">
+        <i data-lucide="info" style="flex-shrink:0"></i>
+        <span id="compliance-legend-text" style="max-width:0;opacity:0;white-space:nowrap;overflow:hidden;transition:max-width 0.25s ease,opacity 0.2s ease">Target: <strong>12 WFO days/month</strong> &mdash; <span style="color:var(--green)">Green</span> = met &nbsp;|&nbsp; <span style="color:var(--amber)">Amber</span> = in progress, on track &nbsp;|&nbsp; <span style="color:#f97316">Orange</span> = some weeks below 3 days, month ongoing &nbsp;|&nbsp; <span style="color:var(--red)">Red</span> = month ended, target missed.</span>
+      </div>
       <div class="tbl-wrap"><table>
         <thead><tr><th></th><th>Employee</th><th>Team</th><th>WFO</th><th>WFH</th><th>Leave</th><th>Status</th><th>Weeks</th></tr></thead>
         <tbody id="compliance-tbody"><tr><td colspan="8"><div class="loading" style="padding:16px 14px"><div class="spinner"></div></div></td></tr></tbody>
