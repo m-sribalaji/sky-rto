@@ -1463,14 +1463,18 @@ async function initApp(){
       else if(a==='leavemgmt')  loadTeamLeave();   // only refresh the calendar, not the form
       else if(a==='anomalies')  loadAnomalies();
       else if(a==='team')       loadTeam();
-      // insights/rhythm deliberately excluded from the 60s auto-refresh:
-      // both call the OpenAI-backed narrator on every load, and that's
-      // designed around updating roughly once a day (or on a real status
-      // change), not once a minute. Auto-polling them here was hitting
-      // the API dozens of times an hour just from a tab sitting open —
-      // real cost for zero benefit, since the underlying numbers weren't
-      // changing that often anyway. The manual Refresh button still
-      // reloads them on demand.
+      // insights/rhythm deliberately excluded from the 60s auto-refresh —
+      // an explicit no-op branch, not just an absent case. Both call the
+      // OpenAI-backed narrator on every load, designed around updating
+      // roughly once a day (or on a real status change), not once a
+      // minute. Leaving them unmatched here previously fell through to
+      // the else-nav(a) catch-all below, which calls nav('insights') /
+      // nav('rhythm') — and nav() unconditionally calls loadInsights() /
+      // loadRhythm() itself (see the id==='insights' branch near the top
+      // of nav()), so the exclusion never actually took effect: this
+      // timer kept polling both pages every 60s regardless. The manual
+      // Refresh button still reloads them on demand.
+      else if(a==='insights' || a==='rhythm'){ /* intentional no-op */ }
       else nav(a); // for other pages (config, roles etc) full nav is fine
     }catch(e){}
   },60000);
