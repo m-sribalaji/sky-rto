@@ -100,8 +100,28 @@ jobs:
           # it once here means every future download (manual or
           # auto-update) inherits a valid signature automatically, since
           # they're all just fetching these exact same release bytes.
-          codesign --force --deep --sign - dist/rto-mac-arm64
-          codesign --verify --verbose dist/rto-mac-arm64
+          #
+          # `codesign --verify` alone isn't sufficient proof the signature
+          # is actually valid at launch time — confirmed live (2026-09):
+          # two separate builds passed `codesign --verify` here but still
+          # got SIGKILL'd on real hardware with "Taskgated Invalid
+          # Signature" (a stricter check than --verify performs). So this
+          # step now actually launches the signed binary (--help, which
+          # argparse handles immediately with no side effects) as the
+          # real proof it'll run, and retries the sign+launch cycle if it
+          # doesn't — catching this flake in CI instead of shipping a
+          # binary that gets silently killed on every user's machine.
+          for attempt in 1 2 3; do
+            codesign --force --deep --sign - dist/rto-mac-arm64
+            codesign --verify --verbose dist/rto-mac-arm64
+            if dist/rto-mac-arm64 --help > /dev/null 2>&1; then
+              echo "Signed binary launches successfully (attempt $attempt)."
+              exit 0
+            fi
+            echo "::warning::Signed binary failed to launch on attempt $attempt (SIGKILL/Taskgated flake) — retrying."
+          done
+          echo "::error::Signed binary still fails to launch after 3 attempts."
+          exit 1
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
