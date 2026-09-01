@@ -276,27 +276,29 @@ def _sync_device_auth(server: str, hostname: str, cfg: dict) -> dict:
                     logger.info(f"[OK] Device token rotated (was within {TOKEN_RENEW_WINDOW_DAYS}d of expiry)")
                 else:
                     logger.warning(f"[WARN] Proactive token rotation failed (status={status}) - will retry next sync")
-        if changed and cfg.get("device_token"):
-            # Enroll under the native_signer public-key scheme if this
-            # module is available (macOS-only, real-world tested; falls
-            # back to a no-op everywhere else) and this device hasn't
-            # already sent a public key. Runs once per device, right
-            # after any change that means we have a fresh/valid
-            # device_token — covers both a brand-new registration and an
-            # already-registered device picking this up for the first
-            # time after upgrading to a build that has it.
-            _maybe_enroll_native_signer(server, hostname, cfg)
+        # Enroll under the native_signer public-key scheme if this module
+        # is available (macOS-only, real-world tested; no-ops everywhere
+        # else) and this device hasn't sent a public key yet. Checked
+        # independently of `changed` — an already-registered, already-
+        # synced device (the common steady-state case, including every
+        # existing device picking this up for the first time after
+        # upgrading to a build that has it) wouldn't otherwise set
+        # `changed` at all, and this needs to run regardless.
+        if cfg.get("device_token") and not cfg.get("native_public_key"):
+            if _maybe_enroll_native_signer(server, hostname, cfg):
+                changed = True
         if changed:
             save_config(cfg)
     return device
 
-def _maybe_enroll_native_signer(server: str, hostname: str, cfg: dict) -> None:
+def _maybe_enroll_native_signer(server: str, hostname: str, cfg: dict) -> bool:
+    """Returns True iff cfg was actually modified (so the caller knows to save it)."""
     if cfg.get("native_public_key"):
-        return
+        return False
     try:
         import native_signer
     except ImportError:
-        return  # not built into this binary (or non-macOS) - stays on HMAC, silently
+        return False  # not built into this binary (or non-macOS) - stays on HMAC, silently
     from .api import api_post
     try:
         try:
@@ -318,9 +320,11 @@ def _maybe_enroll_native_signer(server: str, hostname: str, cfg: dict) -> None:
         if resp and resp.get("public_key_enrolled"):
             cfg["native_public_key"] = pub_b64
             logger.info("[OK] Enrolled under native_signer (Keychain-protected key)")
-        else:
-            logger.warning(f"[WARN] native_signer enrollment call did not confirm: {resp}")
+            return True
+        logger.warning(f"[WARN] native_signer enrollment call did not confirm: {resp}")
+        return False
     except Exception as e:
         # Never let enrollment issues break the normal HMAC-token flow —
         # this is a pure upgrade attempt, not a required step.
         logger.warning(f"[WARN] native_signer enrollment failed, staying on HMAC: {e}")
+        return False
