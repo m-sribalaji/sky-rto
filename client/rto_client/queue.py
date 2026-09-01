@@ -71,7 +71,19 @@ def queue_checkin(payload: dict, cfg: dict = None) -> int:
     sig_headers = None
     if cfg.get("native_public_key"):
         sig_headers = _sign_request_native(payload_bytes, queued=True)
-    if sig_headers is None and cfg.get("device_token"):
+        # IMPORTANT (found live, 2026-09): do NOT fall back to legacy HMAC
+        # here if native signing fails (e.g. Keychain locked — happens
+        # overnight while the Mac sleeps). Once a device has enrolled a
+        # public_key, the server ONLY accepts ECDSA signatures for it
+        # (deps.py's dual-path check is intentionally exclusive, not
+        # either/or — accepting either would let anyone bypass ECDSA
+        # entirely by just using the plaintext token, defeating the whole
+        # point). An HMAC-signed entry from an enrolled device is
+        # permanently, unrecoverably rejected by the server — worse than
+        # not signing at all, since flush_queue used to just replay it
+        # forever without ever retrying. Leaving sig_headers=None here
+        # instead means flush_queue (below) retries live signing instead.
+    elif cfg.get("device_token"):
         sig_headers = _sign_request(cfg["device_token"], payload_bytes, queued=True)
 
     entry = {
@@ -131,17 +143,33 @@ def flush_queue(server: str, cfg: dict = None) -> tuple:
                             use_native_signer=bool(cfg.get("native_public_key")), queued=True)
         else:
             sig_headers = entry.get("sig_headers")
-            if not sig_headers:
-                # Capture-time signing failed for this entry (e.g. device
-                # had neither native_signer nor a device_token at capture
-                # time) — nothing safe to replay, don't silently send it
-                # unsigned.
-                failed.append(entry)
-                logger.warning(f"[WARN] Queued entry for {date_str} has no capture-time signature - skipping")
-                continue
             payload_bytes = base64.b64decode(entry["payload_b64"])
-            resp = api_post_presigned(f"{server}/api/checkin", payload_bytes, sig_headers,
-                                      auth_headers=_get_auth_headers(cfg))
+            if sig_headers:
+                resp = api_post_presigned(f"{server}/api/checkin", payload_bytes, sig_headers,
+                                          auth_headers=_get_auth_headers(cfg))
+            elif cfg.get("native_public_key"):
+                # Capture-time native signing failed (Keychain was locked,
+                # most likely — this happens overnight while the Mac
+                # sleeps). Rather than give up permanently, retry live
+                # right now — flush time is typically right after
+                # reconnecting/waking, when the Keychain is far more
+                # likely to be accessible again. If it still fails, this
+                # entry stays queued and gets retried again next cycle.
+                sig_headers = _sign_request_native(payload_bytes, queued=True)
+                if sig_headers:
+                    resp = api_post_presigned(f"{server}/api/checkin", payload_bytes, sig_headers,
+                                              auth_headers=_get_auth_headers(cfg))
+                else:
+                    logger.warning(f"[WARN] Queued entry for {date_str} still can't be signed (native_signer unavailable) - will retry next cycle")
+                    failed.append(entry)
+                    continue
+            else:
+                # No signing method available at all for this entry and
+                # never was (device never enrolled, never had a token at
+                # capture time) — nothing safe to replay.
+                failed.append(entry)
+                logger.warning(f"[WARN] Queued entry for {date_str} has no signing method available - skipping")
+                continue
 
         if resp and resp.get("action") in ("ok", "already_checked_in",
                                             "confirm_needed", "override_locked",

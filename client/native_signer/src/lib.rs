@@ -216,6 +216,8 @@ mod macos_impl {
         static kSecAttrAccount: CFStringRef;
         static kSecValueData: CFStringRef;
         static kSecAttrAccess: CFStringRef;
+        static kSecAttrAccessible: CFStringRef;
+        static kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly: CFStringRef;
     }
 
     fn set_generic_password_with_self_only_acl(service: &str, account: &str, password: &[u8]) -> Result<(), SignerError> {
@@ -233,6 +235,19 @@ mod macos_impl {
                 (CFType::wrap_under_get_rule(kSecAttrAccount as *mut _), CFString::new(account).into_CFType()),
                 (CFType::wrap_under_get_rule(kSecValueData as *mut _), CFData::from_buffer(password).into_CFType()),
                 (CFType::wrap_under_get_rule(kSecAttrAccess as *mut _), access),
+                // ROOT CAUSE FIX (found live, 2026-09): omitting this
+                // attribute defaults to kSecAttrAccessibleWhenUnlocked,
+                // meaning the item genuinely can't be read while the
+                // device is locked or asleep — exactly what happened
+                // overnight and caused a real signing failure. A
+                // background agent needs to sign at arbitrary times,
+                // including screen-locked/asleep. AfterFirstUnlock (not
+                // "Always") still requires at least one unlock since
+                // boot — the item isn't readable on a freshly-booted,
+                // never-unlocked machine, which is the right balance.
+                // ThisDeviceOnly keeps it out of iCloud Keychain sync,
+                // consistent with this being a real per-device identity.
+                (CFType::wrap_under_get_rule(kSecAttrAccessible as *mut _), CFType::wrap_under_get_rule(kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly as *mut _)),
             ];
             let dict = CFDictionary::from_CFType_pairs(&pairs);
             let mut result: CFTypeRef = ptr::null();
