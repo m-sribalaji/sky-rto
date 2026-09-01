@@ -34,6 +34,57 @@ jobs:
         run: |
           pip install pyinstaller pyobjc-framework-Cocoa certifi
 
+      - name: Build and install native_signer (device-bound Keychain signing)
+        run: |
+          # macos-14 runners ship Rust/Cargo preinstalled — no extra
+          # third-party action needed for the toolchain itself.
+          cargo --version
+          pip install maturin
+          cd client/native_signer
+          maturin build --release --interpreter python3.11
+          pip install target/wheels/*.whl
+          cd ../..
+          python3 -c "import native_signer; print('native_signer import OK:', native_signer.__file__)"
+          pip install cryptography
+
+      - name: Verify native_signer actually works (not just compiles)
+        run: |
+          # Real functional test, not just "did it import" — generate a
+          # key, sign something, verify with the exact method the server
+          # uses (deps.py::_verify_ecdsa_signature), confirm a tampered
+          # message is rejected. Mirrors manual verification done on real
+          # hardware during development (see client/native_signer/README.md).
+          # Uses a CI-only key tag so it never collides with a real
+          # device's key, and cleans up after itself either way.
+          python3 -c "
+          import native_signer, base64, sys
+
+          try:
+              pub_b64 = native_signer.generate_device_keypair()
+              msg = b'ci-verification-2026-09'
+              sig_b64 = native_signer.sign_message(base64.b64encode(msg).decode())
+
+              from cryptography.hazmat.primitives.asymmetric import ec
+              from cryptography.hazmat.primitives import hashes
+              from cryptography.exceptions import InvalidSignature
+
+              pub = base64.b64decode(pub_b64)
+              sig = base64.b64decode(sig_b64)
+              public_key = ec.EllipticCurvePublicKey.from_encoded_point(ec.SECP256R1(), pub)
+              public_key.verify(sig, msg, ec.ECDSA(hashes.SHA256()))
+              print('OK: genuine signature verified')
+
+              try:
+                  public_key.verify(sig, b'tampered', ec.ECDSA(hashes.SHA256()))
+                  print('FAIL: tampered message incorrectly verified')
+                  sys.exit(1)
+              except InvalidSignature:
+                  print('OK: tampered message correctly rejected')
+          finally:
+              import subprocess
+              subprocess.run(['security', 'delete-generic-password', '-s', 'com.sky.rto-tracker', '-a', 'com.sky.rto-tracker.device-key'], capture_output=True)
+          "
+
       - name: Inject version and secrets into rto_client/config.py
         env:
           BUILD_NUM: ${{ github.run_number }}
@@ -87,6 +138,8 @@ jobs:
             --hidden-import=AppKit \
             --hidden-import=Foundation \
             --hidden-import=objc \
+            --hidden-import=native_signer \
+            --collect-all=native_signer \
             --name rto-mac-arm64 \
             scripts/rto_agent_mac.py
 

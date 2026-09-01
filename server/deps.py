@@ -281,14 +281,21 @@ def _verify_ecdsa_signature(public_key_b64: str, message: bytes, sig_b64: str) -
     try:
         import base64
         from cryptography.hazmat.primitives.asymmetric import ec
-        from cryptography.hazmat.primitives import hashes, serialization
+        from cryptography.hazmat.primitives import hashes
         from cryptography.exceptions import InvalidSignature
     except ImportError:
         raise HTTPException(500, "Server missing 'cryptography' package for public-key verification.")
     try:
         pub_bytes = base64.b64decode(public_key_b64)
         sig_bytes = base64.b64decode(sig_b64)
-        public_key = serialization.load_der_public_key(pub_bytes)
+        # native_signer exports the public key as an ANSI X9.63
+        # uncompressed point (0x04 || X || Y) via
+        # SecKeyCopyExternalRepresentation-equivalent, not a DER
+        # SubjectPublicKeyInfo blob — from_encoded_point is the matching
+        # decoder. (Found via a real end-to-end test failing with
+        # "Malformed signature or public key" — load_der_public_key was
+        # silently wrong for every device that would ever enroll.)
+        public_key = ec.EllipticCurvePublicKey.from_encoded_point(ec.SECP256R1(), pub_bytes)
         public_key.verify(sig_bytes, message, ec.ECDSA(hashes.SHA256()))
     except InvalidSignature:
         raise HTTPException(401, "Invalid request signature.")

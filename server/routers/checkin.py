@@ -33,18 +33,29 @@ logger = logging.getLogger("rto")
 async def checkin(p: CheckInPayload, request: Request, db: AsyncSession = Depends(get_db)):
     device = await db.get(Device, p.hostname)
     if not device: return {"action": "register_first"}
-    token = get_device_token(request)
-    await verify_device_auth(device, token, db)
     # This is the endpoint that produces "verified, high-confidence"
     # attendance records, so it's the one place a signature is required on
-    # top of the bearer token — see deps.verify_request_signature for what
-    # that does and doesn't protect against. request.body() is safe to
-    # await here even though `p` was already parsed from it: Starlette
-    # caches the raw bytes on first read, so this returns the exact same
-    # bytes the client signed, not a re-serialized (and therefore
+    # top of identity — see deps.verify_request_signature for what that
+    # does and doesn't protect against. request.body() is safe to await
+    # here even though `p` was already parsed from it: Starlette caches
+    # the raw bytes on first read, so this returns the exact same bytes
+    # the client signed, not a re-serialized (and therefore
     # signature-mismatching) copy.
     raw_body = await request.body()
-    verify_request_signature(request, raw_body, device)
+    if device.public_key:
+        # Public-key-enrolled device (client/native_signer): the ECDSA
+        # signature alone proves identity — deps.verify_request_signature
+        # checks it against device.public_key. No plaintext bearer token
+        # is required or checked here at all, which is the actual point
+        # of this scheme (security review, 2026-09): unlike the legacy
+        # HMAC token, the private key never sat in a plaintext file this
+        # request could have been forged from.
+        verify_request_signature(request, raw_body, device)
+    else:
+        # Legacy HMAC device — unchanged bearer-token + signature check.
+        token = get_device_token(request)
+        await verify_device_auth(device, token, db)
+        verify_request_signature(request, raw_body, device)
     today     = p.date if p.date else today_str()
     # Skip weekends
     if is_weekend(today):
