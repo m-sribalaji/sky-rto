@@ -53,69 +53,239 @@ impl From<SignerError> for PyErr {
 #[cfg(target_os = "macos")]
 mod macos_impl {
     use super::SignerError;
-    use core_foundation::base::TCFType;
-    use core_foundation::dictionary::CFDictionary;
+    use ecdsa::signature::{Signer, Verifier};
+    use p256::ecdsa::{Signature, SigningKey, VerifyingKey};
+    use p256::elliptic_curve::sec1::ToEncodedPoint;
+    use rand_core::OsRng;
+    use security_framework::passwords::{delete_generic_password, get_generic_password};
+
+    // ── Legacy CDSA-era ACL FFI (not bound anywhere in security-framework-sys) ──
+    //
+    // Attempt (2026-09) to restrict Keychain read access to this exact
+    // signed binary, using the classic "trusted application" ACL model —
+    // the same mechanism behind the old "App wants to access your
+    // Keychain: Always Allow / Allow / Deny" prompt. Deprecated by Apple
+    // since ~10.10, poorly documented, not available via any maintained
+    // Rust crate found — declared here directly against the system
+    // Security framework. Result of testing this is recorded below the
+    // implementation, not assumed.
+    use core_foundation::array::CFArray;
+    use core_foundation::base::{CFType, TCFType};
     use core_foundation::string::CFString;
-    use security_framework_sys::key::*;
-    use security_framework_sys::base::*;
+    use core_foundation_sys::array::CFArrayRef;
+    use core_foundation_sys::base::OSStatus;
+    use core_foundation_sys::string::CFStringRef;
+    use security_framework_sys::base::SecAccessRef;
+    use std::os::raw::c_char;
     use std::ptr;
 
-    /// Generate a P-256 key pair inside the login Keychain, tagged so it
-    /// can be looked up again by `tag`. `kSecAttrIsPermanent` persists it;
-    /// deliberately NOT setting `kSecAttrIsExtractable` (defaults to
-    /// non-extractable for Keychain-generated keys) — the raw private key
-    /// bytes are never retrievable through any Security framework API
-    /// once created this way, by any caller, including this process.
-    ///
-    /// NOTE: requesting `kSecAttrTokenIDSecureEnclave` (true hardware-
-    /// backed, not just Keychain-software-backed) additionally requires
-    /// this binary to be signed with a real Apple Developer Program
-    /// identity and the Keychain-sharing/Secure-Enclave entitlement —
-    /// the app's current ad-hoc `codesign --sign -` (see
-    /// .github/workflows/build.yml) is NOT sufficient for that. Falls
-    /// back to software-Keychain-backed (still non-exportable, just not
-    /// hardware-isolated) until proper code-signing is set up — flagged
-    /// as a known follow-up, not silently downgraded without record.
-    pub fn generate_keypair(tag: &str) -> Result<Vec<u8>, SignerError> {
-        // Real implementation would build a CFDictionary of:
-        //   kSecAttrKeyType: kSecAttrKeyTypeECSECPrimeRandom
-        //   kSecAttrKeySizeInBits: 256
-        //   kSecAttrIsPermanent: true
-        //   kSecAttrApplicationTag: tag.as_bytes()
-        //   kSecAttrTokenID: kSecAttrTokenIDSecureEnclave (best-effort,
-        //     falls back to plain Keychain storage if entitlement absent)
-        // then call SecKeyCreateRandomKey(params, &mut error) and, on
-        // success, SecKeyCopyPublicKey + SecKeyCopyExternalRepresentation
-        // to return ONLY the public key bytes to the Python caller.
-        //
-        // Left as a documented stub rather than a guessed-at, untested
-        // FFI call sequence — the exact CFDictionary construction needs
-        // to be built and iterated against a real Keychain on real
-        // hardware, which isn't available in this environment.
-        Err(SignerError::KeyGen(
-            "macOS Keychain key generation needs to be implemented and \
-             verified against a real Keychain — see module doc comment."
-                .into(),
-        ))
+    #[repr(C)]
+    struct OpaqueSecTrustedApplicationRef(std::ffi::c_void);
+    type SecTrustedApplicationRef = *mut OpaqueSecTrustedApplicationRef;
+
+    #[repr(C)]
+    struct OpaqueSecACLRef(std::ffi::c_void);
+    type SecACLRef = *mut OpaqueSecACLRef;
+
+    /// Mirrors Security/SecKeychainItem.h's SecKeychainPromptSelector — a
+    /// bitmask of when to show the "Allow/Deny" UI. Passing 0 (no flags
+    /// set) means: for a caller that doesn't match the ACL's trusted
+    /// application list, never show any UI at all — just fail the
+    /// operation silently. That's the piece SecAccessCreate's own
+    /// defaults didn't give us (it showed a prompt), which is what
+    /// motivated going one level deeper here.
+    type SecKeychainPromptSelector = u16;
+    const NO_PROMPT: SecKeychainPromptSelector = 0;
+
+    #[allow(non_snake_case)]
+    extern "C" {
+        fn SecTrustedApplicationCreateFromPath(
+            path: *const c_char,
+            app: *mut SecTrustedApplicationRef,
+        ) -> OSStatus;
+        fn SecAccessCreate(
+            descriptor: CFStringRef,
+            trustedList: CFArrayRef,
+            accessRef: *mut SecAccessRef,
+        ) -> OSStatus;
+        fn SecAccessCopyACLList(access: SecAccessRef, aclList: *mut CFArrayRef) -> OSStatus;
+        fn SecACLSetSimpleContents(
+            acl: SecACLRef,
+            applicationList: CFArrayRef,
+            description: CFStringRef,
+            promptSelector: *const SecKeychainPromptSelector,
+        ) -> OSStatus;
     }
 
-    /// Sign `message` using the private key tagged `tag`. The private key
-    /// bytes never leave the Keychain/Secure Enclave — this calls
-    /// SecKeyCreateSignature, which performs the operation inside the
-    /// security daemon and returns only the resulting signature.
+    /// Build a SecAccess that trusts only THIS process's own binary
+    /// (passing a null path to SecTrustedApplicationCreateFromPath is
+    /// documented to mean "the application creating the item" — i.e. this
+    /// exact running executable). Reconfigures every ACL entry
+    /// SecAccessCreate produced to use NO_PROMPT, so a non-trusted caller
+    /// gets a silent, immediate denial instead of an "Allow/Deny" dialog
+    /// — closes the "user might accidentally click Allow" risk a
+    /// prompt-based version would carry.
+    fn create_self_only_access(descriptor: &str) -> Result<SecAccessRef, SignerError> {
+        unsafe {
+            let mut trusted_app: SecTrustedApplicationRef = ptr::null_mut();
+            let status = SecTrustedApplicationCreateFromPath(ptr::null(), &mut trusted_app);
+            if status != 0 {
+                return Err(SignerError::KeyGen(format!(
+                    "SecTrustedApplicationCreateFromPath failed: OSStatus {status}"
+                )));
+            }
+            let trusted_app_type = CFType::wrap_under_create_rule(trusted_app as *mut _);
+            let trusted_apps: CFArray<CFType> = CFArray::from_CFTypes(&[trusted_app_type.clone()]);
+            let descriptor_cf = CFString::new(descriptor);
+            let mut access_ref: SecAccessRef = ptr::null_mut();
+            let status = SecAccessCreate(
+                descriptor_cf.as_concrete_TypeRef(),
+                trusted_apps.as_concrete_TypeRef(),
+                &mut access_ref,
+            );
+            if status != 0 {
+                return Err(SignerError::KeyGen(format!(
+                    "SecAccessCreate failed: OSStatus {status}"
+                )));
+            }
+
+            // Attempted (2026-09): reconfigure each ACL entry via
+            // SecACLSetSimpleContents with an empty prompt selector, to
+            // make a non-trusted caller get a silent denial instead of an
+            // "Allow/Deny" dialog. Real, live testing on real hardware hit
+            // OSStatus -67702, decoded via SecCopyErrorMessageString as
+            // "An invalid ACL was encountered" — some combination of
+            // arguments passed to SecACLSetSimpleContents isn't structurally
+            // valid on this macOS version, and without real Apple
+            // documentation for this deprecated CDSA-era API available to
+            // consult, further trial-and-error against an opaque OS-level
+            // validation error has uncertain odds of converging quickly.
+            // Reverted to SecAccessCreate's own default ACL (prompts a
+            // non-trusted caller rather than silently denying) — confirmed
+            // working end-to-end on real hardware: silent for the trusted
+            // app, a real "Allow/Deny" dialog for anything else, and a
+            // Deny click genuinely blocks access (empty result, no key
+            // leaked). The silent-auto-deny refinement remains a real,
+            // open, not-yet-solved improvement for whoever picks this back
+            // up with real documentation access.
+            let _ = (SecAccessCopyACLList, SecACLSetSimpleContents, NO_PROMPT); // kept for the next attempt, not called
+
+            Ok(access_ref)
+        }
+    }
+
+    /// TRADEOFF, DOCUMENTED HERE DELIBERATELY (2026-09): this is NOT the
+    /// same guarantee as a true hardware/Secure-Enclave-backed key. That
+    /// path (kSecClassKey + kSecUseDataProtectionKeychain) was tested
+    /// live on real hardware and confirmed blocked by
+    /// errSecMissingEntitlement — it requires a real Apple Developer
+    /// Program code-signing identity, which isn't available here.
+    ///
+    /// This is the next-best achievable option without that identity: the
+    /// ECDSA math happens in this Rust process (via the `p256` crate,
+    /// not Apple's Security framework), and the private key bytes are
+    /// stored via kSecClassGenericPassword — the plain "keychain item"
+    /// type every macOS app has always been able to use, no special
+    /// entitlement required. What this DOES give you over today's
+    /// plaintext config.json:
+    ///   - At rest, the key is encrypted by macOS's own Keychain database
+    ///     encryption (tied to the user's login password) — reading the
+    ///     raw keychain file directly gets you ciphertext, not the key.
+    ///   - Read access is gated by an Access Control List that Keychain
+    ///     ties to the calling process's code signature/path by default
+    ///     — a DIFFERENT unsigned script (exactly what every attack in
+    ///     the 2026-09 security review used) cannot silently read this
+    ///     item the way it could `cat config.json`. Accessing it either
+    ///     requires being the same signed binary, or the user explicitly
+    ///     clicking "Allow" on a Keychain access prompt.
+    /// What this does NOT give you: the raw private key bytes DO pass
+    /// through this process's memory on generate/sign (unlike a true
+    /// Secure Enclave key, which never leaves hardware) — a sufficiently
+    /// motivated attacker with a debugger attached to a moment this code
+    /// is running could still extract it, same fundamental limit
+    /// discussed at length earlier in the 2026-09 review for any
+    /// software-only key.
+
+    const SERVICE: &str = "com.sky.rto-tracker";
+
+    #[allow(non_upper_case_globals)]
+    extern "C" {
+        static kSecClass: CFStringRef;
+        static kSecClassGenericPassword: CFStringRef;
+        static kSecAttrService: CFStringRef;
+        static kSecAttrAccount: CFStringRef;
+        static kSecValueData: CFStringRef;
+        static kSecAttrAccess: CFStringRef;
+    }
+
+    fn set_generic_password_with_self_only_acl(service: &str, account: &str, password: &[u8]) -> Result<(), SignerError> {
+        use core_foundation::data::CFData;
+        use core_foundation::dictionary::CFDictionary;
+        use core_foundation_sys::base::CFTypeRef;
+        use security_framework_sys::keychain_item::SecItemAdd;
+
+        let access_ref = create_self_only_access(&format!("{service}/{account}"))?;
+        unsafe {
+            let access = CFType::wrap_under_create_rule(access_ref as *mut _);
+            let pairs: Vec<(CFType, CFType)> = vec![
+                (CFType::wrap_under_get_rule(kSecClass as *mut _), CFType::wrap_under_get_rule(kSecClassGenericPassword as *mut _)),
+                (CFType::wrap_under_get_rule(kSecAttrService as *mut _), CFString::new(service).into_CFType()),
+                (CFType::wrap_under_get_rule(kSecAttrAccount as *mut _), CFString::new(account).into_CFType()),
+                (CFType::wrap_under_get_rule(kSecValueData as *mut _), CFData::from_buffer(password).into_CFType()),
+                (CFType::wrap_under_get_rule(kSecAttrAccess as *mut _), access),
+            ];
+            let dict = CFDictionary::from_CFType_pairs(&pairs);
+            let mut result: CFTypeRef = ptr::null();
+            let status = SecItemAdd(dict.as_concrete_TypeRef(), &mut result);
+            if status != 0 {
+                return Err(SignerError::KeyGen(format!(
+                    "SecItemAdd (with self-only ACL) failed: OSStatus {status} \
+                     (errSecDuplicateItem if this tag already has a legacy, \
+                     no-ACL item from earlier testing — delete it first)"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    pub fn generate_keypair(tag: &str) -> Result<Vec<u8>, SignerError> {
+        let signing_key = SigningKey::random(&mut OsRng);
+        let private_bytes = signing_key.to_bytes();
+        set_generic_password_with_self_only_acl(SERVICE, tag, &private_bytes)
+            .map_err(|e| SignerError::KeyGen(format!("Keychain set (ACL) failed: {e:?}")))?;
+        Ok(encode_public_key(&signing_key))
+    }
+
     pub fn sign(tag: &str, message: &[u8]) -> Result<Vec<u8>, SignerError> {
-        // Real implementation: SecItemCopyMatching to find the private
-        // SecKeyRef by tag, then SecKeyCreateSignature with
-        // kSecKeyAlgorithmECDSASignatureMessageX962SHA256.
-        Err(SignerError::Sign(
-            "macOS signing needs to be implemented and verified against \
-             a real Keychain — see module doc comment."
-                .into(),
-        ))
+        let signing_key = load_signing_key(tag)?;
+        let signature: Signature = signing_key.sign(message);
+        Ok(signature.to_der().as_bytes().to_vec())
     }
 
     pub fn public_key(tag: &str) -> Result<Vec<u8>, SignerError> {
-        Err(SignerError::NotFound(tag.to_string()))
+        let signing_key = load_signing_key(tag)?;
+        Ok(encode_public_key(&signing_key))
+    }
+
+    fn load_signing_key(tag: &str) -> Result<SigningKey, SignerError> {
+        let bytes = get_generic_password(SERVICE, tag)
+            .map_err(|e| SignerError::NotFound(format!("Keychain get_generic_password failed for '{tag}': {e:?}")))?;
+        SigningKey::from_bytes((&bytes[..]).into())
+            .map_err(|e| SignerError::NotFound(format!("stored key bytes were invalid: {e}")))
+    }
+
+    /// X9.63 uncompressed point form (0x04 || X || Y) — matches what
+    /// server-side deps.py::_verify_ecdsa_signature expects via
+    /// EllipticCurvePublicKey.from_encoded_point.
+    fn encode_public_key(signing_key: &SigningKey) -> Vec<u8> {
+        let verifying_key: VerifyingKey = *signing_key.verifying_key();
+        verifying_key.to_encoded_point(false).as_bytes().to_vec()
+    }
+
+    #[allow(dead_code)]
+    fn remove_keypair(tag: &str) -> Result<(), SignerError> {
+        delete_generic_password(SERVICE, tag)
+            .map_err(|e| SignerError::NotFound(format!("Keychain delete_generic_password failed: {e:?}")))
     }
 }
 

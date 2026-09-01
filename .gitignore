@@ -45,6 +45,9 @@ data/
 # ── Docker ────────────────────────────────────────────────
 .dockerignore
 
+# ── Rust build output (client/native_signer) ──────────────
+target/
+
 # ── Misc ──────────────────────────────────────────────────
 *.swp
 *.swo
