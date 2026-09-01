@@ -19,7 +19,7 @@ from sqlalchemy import select
 from database import get_db, Device, Role, AnomalyLog
 from deps import (
     get_client_ip, get_device_token, get_role, generate_api_token, limiter,
-    is_sky_network, issue_token_expiry,
+    is_sky_network, issue_token_expiry, verify_device_auth,
 )
 from schemas import RegisterPayload
 
@@ -41,18 +41,57 @@ async def register(p: RegisterPayload, request: Request, db: AsyncSession = Depe
     if existing:
         existing.employee_name=p.employee_name; existing.employee_id=p.employee_id
         existing.team=p.team; existing.platform=p.platform
+        if p.public_key:
+            # Re-enrollment under the native_signer public-key scheme —
+            # HMAC api_token stays on the row (not cleared) so nothing
+            # currently mid-flight with the old scheme breaks, but new
+            # requests get verified via public_key going forward (see
+            # deps.verify_request_signature).
+            existing.public_key = p.public_key
         if not existing.api_token:
             existing.api_token = generate_api_token()
             existing.token_issued_at, existing.token_expires_at = issue_token_expiry()
         await db.commit()
         return {"status": "updated", "hostname": p.hostname,
                 "employee_id": existing.employee_id, "api_token": existing.api_token,
+                "public_key_enrolled": bool(existing.public_key),
                 "token_expires_at": existing.token_expires_at.isoformat()+"Z" if existing.token_expires_at else None}
+    # Block registering a second device under an employee_id that already
+    # has one, unless the caller can prove ownership of that existing
+    # device (its current token). Without this, anyone reachable from the
+    # Sky network could mint a fresh, fully valid credential claiming to
+    # be any coworker's employee_id — no theft or extraction needed, the
+    # server would just hand it out. Security review (2026-09), finding
+    # confirmed live.
+    existing_for_employee_q = await db.execute(
+        select(Device).where(Device.employee_id == p.employee_id))
+    existing_for_employee = existing_for_employee_q.scalars().first()
+    if existing_for_employee and existing_for_employee.hostname != p.hostname:
+        presented_token = get_device_token(request)
+        try:
+            await verify_device_auth(existing_for_employee, presented_token, db)
+        except HTTPException:
+            logger.warning(
+                f"[SECURITY] Rejected registration of new hostname "
+                f"'{p.hostname}' for employee_id '{p.employee_id}' — an "
+                f"existing device '{existing_for_employee.hostname}' is "
+                f"already registered and no valid proof of ownership "
+                f"(X-Device-Token) was presented."
+            )
+            raise HTTPException(
+                409,
+                f"employee_id '{p.employee_id}' is already registered to "
+                f"device '{existing_for_employee.hostname}'. If this is a "
+                f"new machine for the same employee, present that device's "
+                f"current X-Device-Token to authorize adding a new one, or "
+                f"contact an admin.",
+            )
     token = generate_api_token()
     issued_at, expires_at = issue_token_expiry()
     db.add(Device(hostname=p.hostname, employee_name=p.employee_name,
                   employee_id=p.employee_id, team=p.team, platform=p.platform,
-                  api_token=token, token_issued_at=issued_at, token_expires_at=expires_at))
+                  api_token=token, token_issued_at=issued_at, token_expires_at=expires_at,
+                  public_key=p.public_key))
     await db.commit()
     # Stash the token against the nonce that gated this page load, so the
     # polling agent can retrieve it via /api/reg-nonce-status/{nonce}

@@ -96,6 +96,11 @@ DEFAULT_CONFIG = {
     "device_token":         None,
     "token_expires_at":     None,  # ISO timestamp — when the server will stop honouring device_token
     "poll_interval_seconds": 300,
+    # Set once native_signer successfully enrolls this device (base64
+    # public key) — presence of this key is what tells api.py to sign
+    # with the OS-protected private key instead of the legacy HMAC
+    # device_token. See client/native_signer/README.md for build status.
+    "native_public_key":    None,
 }
 
 # Rotate before the server-side expiry actually hits, so a well-behaved

@@ -31,18 +31,33 @@ def classify(
     """
     Multi-signal classification - priority order:
 
-    1. Office LAN subnet (10.126.0.0/16)     -> WFO definitive
-    2. Office DNS server or domain            -> WFO definitive
+    1. Office LAN subnet (10.126.0.0/16)     -> WFO (flagged, see note)
+    2. Office DNS server or domain            -> WFO (flagged, see note)
        (unless home LAN + VPN -> WFH, VPN just routes DNS)
     3. VPN tunnel active:
-       a. + office LAN or DNS               -> WFO (in office on VPN)
+       a. + office LAN or DNS               -> WFO (flagged, see note)
        b. + home LAN (192.168/172.16)       -> WFH confirmed
        c. + private_unknown 10.x.x.x        -> WFH (benefit of doubt)
        d. no other signals                  -> vpn_ambiguous (prompt user)
-    4. Ethernet active + not home LAN        -> WFO medium confidence
+    4. Ethernet active + not home LAN        -> WFO (flagged, see note)
     5. Home LAN, no VPN                      -> WFH definitive
     6. Private unknown (10.x home ISP)       -> WFH medium (benefit of doubt)
     7. No signals at all                     -> WFH medium (safer default)
+
+    NOTE on WFO confidence (2026-09 security review): every WFO path here
+    is derived entirely from values the client itself reports (lan_ip,
+    dns_servers, is_ethernet) - none of them are independently verifiable
+    by the server. A security review found that on this deployment,
+    verify_client_signals' cross-check against the connecting public_ip
+    (conn_is_sky) has no real discriminating power, because Sky's VPN
+    egresses through the same address space as genuine office traffic -
+    meaning a fabricated lan_ip claim from home is accepted identically to
+    a real one. Until there's an independently-verifiable signal (e.g. a
+    network-level distinction from IT, still pending), every WFO
+    determination from these client-reported signals is capped at MEDIUM
+    confidence and flagged for manager visibility, rather than treated as
+    high-confidence/definitive. This doesn't stop a false claim - nothing
+    purely server-side can - but it stops it from being silent.
     """
     vpn_active = bool(vpn_tunnel_ip)
     lan_class  = classify_lan(lan_ip)
@@ -56,11 +71,14 @@ def classify(
     if lan_is_office:
         return DetectionResult(
             auto_status = "wfo",
-            confidence  = CONF_HIGH,
+            confidence  = CONF_MED,
             vpn_active  = vpn_active,
-            flagged     = False,
-            flag_reason = None,
-            detail      = f"Office LAN {lan_ip} - definitive WFO.",
+            flagged     = True,
+            flag_reason = (
+                f"WFO based on self-reported office LAN {lan_ip} - not "
+                f"independently verifiable on this network. Needs review."
+            ),
+            detail      = f"Office LAN {lan_ip} claimed - unverified WFO.",
         )
 
     # -- 2. Office DNS -------------------------------------
@@ -82,13 +100,17 @@ def classify(
             )
         return DetectionResult(
             auto_status = "wfo",
-            confidence  = CONF_HIGH,
+            confidence  = CONF_MED,
             vpn_active  = vpn_active,
-            flagged     = False,
-            flag_reason = None,
+            flagged     = True,
+            flag_reason = (
+                f"WFO based on self-reported office DNS "
+                f"(servers={dns_servers}, domains={dns_domains}) - not "
+                f"independently verifiable on this network. Needs review."
+            ),
             detail      = (
-                f"Office DNS detected "
-                f"(servers={dns_servers}, domains={dns_domains}) - WFO."
+                f"Office DNS claimed "
+                f"(servers={dns_servers}, domains={dns_domains}) - unverified WFO."
             ),
         )
 
@@ -98,11 +120,14 @@ def classify(
         if lan_is_office or dns_office:
             return DetectionResult(
                 auto_status = "wfo",
-                confidence  = CONF_HIGH,
+                confidence  = CONF_MED,
                 vpn_active  = True,
-                flagged     = False,
-                flag_reason = None,
-                detail      = "VPN on + office signals - in office.",
+                flagged     = True,
+                flag_reason = (
+                    "WFO based on self-reported office LAN/DNS while on VPN - "
+                    "not independently verifiable on this network. Needs review."
+                ),
+                detail      = "VPN on + self-reported office signals - unverified WFO.",
             )
         # 3b. VPN + known home LAN -> WFH
         if lan_is_home:
@@ -143,9 +168,12 @@ def classify(
             auto_status = "wfo",
             confidence  = CONF_MED,
             vpn_active  = False,
-            flagged     = False,
-            flag_reason = None,
-            detail      = "Ethernet/dock + not on home subnet - likely in office.",
+            flagged     = True,
+            flag_reason = (
+                "WFO based on self-reported ethernet/non-home LAN - not "
+                "independently verifiable on this network. Needs review."
+            ),
+            detail      = "Ethernet/dock + not on home subnet - unverified WFO.",
         )
 
     # -- 5. Home LAN, no VPN -------------------------------

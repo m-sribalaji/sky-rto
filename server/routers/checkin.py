@@ -18,7 +18,7 @@ from segments import (
     close_segment, open_new_segment, LEAVE_TYPES,
 )
 from deps import (
-    get_client_ip, get_device_token, today_str, is_weekend, require_role,
+    get_client_ip, get_device_token, get_caller_id, today_str, is_weekend, require_role,
     verify_device_auth, verify_request_signature,
     NOTIFIER_AVAILABLE, notify_override_applied, LEVEL_ALL,
     _SERVER_WEBHOOK, _SERVER_URL, sync_employee_teams_card,
@@ -65,7 +65,51 @@ async def checkin(p: CheckInPayload, request: Request, db: AsyncSession = Depend
         # fabricated (LAN/DNS/VPN) — log that instead of assuming it was
         # always the LAN IP, which stopped being true once the DNS/VPN
         # claims got the same cross-check.
+        # NOTE: no AnomalyLog write here — the generic `if result.flagged`
+        # block further down (right after _upsert_checkin) already writes
+        # one unconditionally for every flagged result, fabrication
+        # included. This branch exists only to log a more specific warning
+        # line than that generic block does.
         logger.warning(f"[SECURITY] {device.employee_id}: {result.flag_reason}")
+    elif result.flagged and result.auto_status == "wfo":
+        # Any other flagged WFO result — currently the "unverified,
+        # client-reported-signal-only" downgrade from the 2026-09 security
+        # review (detection.classify()'s WFO paths). No AnomalyLog write
+        # needed here either, same reason as above — the generic block
+        # further down already covers it.
+        logger.info(f"[FLAGGED] {device.employee_id}: {result.flag_reason}")
+
+    # Backdated WFO claims (date param != the real current date) replay
+    # whatever network signals the client currently has under a different
+    # day's date. Security review (2026-09) found this indistinguishable
+    # from a genuine same-day check-in unless separately flagged — the
+    # /api/missed endpoint already treats unverified backdated WFO this
+    # way, this brings /api/checkin's own `date` override in line with it.
+    real_today   = today_str()
+    is_backdated = bool(p.date) and p.date != real_today
+    if is_backdated and result.auto_status == "wfo":
+        result.flagged     = True
+        backdate_reason = (
+            f"Backdated WFO submission — claims {today} but was submitted "
+            f"on {real_today}. A same-day network signal can't verify a "
+            f"different day's attendance; needs manager review."
+        )
+        result.flag_reason = (
+            f"{result.flag_reason} {backdate_reason}" if result.flag_reason
+            else backdate_reason
+        )
+        logger.warning(f"[SECURITY] {device.employee_id}: {backdate_reason}")
+        db.add(AnomalyLog(
+            employee_id   = device.employee_id,
+            employee_name = device.employee_name,
+            anomaly_type  = "backdated_wfo_checkin",
+            description   = (
+                f"{device.employee_name} ({device.employee_id}) submitted a "
+                f"backdated WFO check-in for {today} (submitted {real_today}). "
+                f"LAN: {p.lan_ip or 'unknown'}."
+            ),
+            severity = "high",
+        ))
 
     logger.info(f"CheckIn: {device.employee_id} lan={p.lan_ip} conn={public_ip} -> {result.auto_status}({result.confidence}){' [FLAGGED]' if result.flagged else ''}")
     if result.auto_status == "vpn_ambiguous":
@@ -131,8 +175,18 @@ async def checkin(p: CheckInPayload, request: Request, db: AsyncSession = Depend
 
     await _upsert_checkin(device, today, public_ip, p, result, db)
     if result.flagged and result.flag_reason:
+        # Distinguish real signal fabrication (client claimed office
+        # signals from a connection that doesn't back that up — high
+        # severity, real evidence of a lie) from the broader "unverified,
+        # client-reported-only WFO" case (medium — could be genuine, just
+        # not independently verifiable on this network). Previously
+        # everything flagged landed under one generic "lan_mismatch"/high
+        # label regardless of cause (security review, 2026-09).
+        is_fabrication = (result.flag_reason or "").startswith("Signal fabrication:")
+        anomaly_type = "signal_fabrication" if is_fabrication else "unverified_wfo_checkin"
+        severity     = "high" if is_fabrication else "medium"
         db.add(AnomalyLog(employee_id=device.employee_id, employee_name=device.employee_name,
-                          anomaly_type="lan_mismatch", description=result.flag_reason, severity="high"))
+                          anomaly_type=anomaly_type, description=result.flag_reason, severity=severity))
         await db.commit()
 
     # Every check-in reaches a persistent Teams card for this person — see
@@ -179,6 +233,12 @@ async def confirm(p: ConfirmPayload, request: Request, db: AsyncSession = Depend
     if not device: raise HTTPException(404, "Not registered")
     token = get_device_token(request)
     await verify_device_auth(device, token, db)
+    # Same signature requirement as /api/checkin — this endpoint also
+    # writes an attendance status, so a bearer token alone (which, per
+    # security review 2026-09, travels in plaintext over this deployment's
+    # unencrypted HTTP) shouldn't be sufficient on its own to flip it.
+    raw_body = await request.body()
+    verify_request_signature(request, raw_body, device)
     if p.declared_status not in ("wfo","wfh"): raise HTTPException(400, "must be wfo|wfh")
     today    = today_str()
     open_seg = await get_open_segment(device.employee_id, today, db)
@@ -196,7 +256,18 @@ async def confirm(p: ConfirmPayload, request: Request, db: AsyncSession = Depend
 @router.post("/api/override")
 async def override(p: OverridePayload, request: Request,
                    db: AsyncSession = Depends(get_db)):
-    await require_role(request, db, "manager", caller_id=p.override_by)
+    caller_id = await require_role(request, db, "manager", caller_id=p.override_by)
+    # Same signature requirement as /api/checkin — a manager's bearer
+    # token alone (plaintext-HTTP-exposed per security review 2026-09)
+    # shouldn't be sufficient by itself to rewrite someone else's
+    # attendance history. Signed with the CALLER's own device/token, not
+    # the target employee's — require_role already verified caller_id
+    # owns a real device and a valid token.
+    caller_dq = await db.execute(select(Device).where(Device.employee_id == caller_id))
+    caller_device = caller_dq.scalars().first()
+    if not caller_device: raise HTTPException(401, "Caller device not found.")
+    raw_body = await request.body()
+    verify_request_signature(request, raw_body, caller_device)
     dq     = await db.execute(select(Device).where(Device.employee_id == p.employee_id))
     device = dq.scalars().first()
     if not device: raise HTTPException(404, "Employee not found")

@@ -473,8 +473,14 @@ async function loadSidebarUser(){
   }
   buildNav(); buildTopbarActions();
   if(MY_ROLE!=='employee'){
-    const s=await get('/api/stats');
-    if(s){const b=document.getElementById('nb-anomalies');if(b)b.textContent=s.flagged;}
+    // Was reading /api/stats' `flagged` (today's CheckIn.flagged count only)
+    // — a completely different, much narrower number than the actual
+    // Anomalies table this badge is supposed to represent, so it sat at
+    // 0 while real unresolved anomalies piled up underneath (security
+    // review, 2026-09). Read the same source the Anomalies page itself
+    // uses instead.
+    const a=await get('/api/anomalies');
+    if(a){const b=document.getElementById('nb-anomalies');if(b)b.textContent=(a.anomalies||[]).length;}
   }
   return true;
 }

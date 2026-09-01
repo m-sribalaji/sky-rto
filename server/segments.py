@@ -1,5 +1,7 @@
 # segments.py - Split day segment management
 import json
+import asyncio
+from collections import defaultdict
 from datetime import datetime, timezone
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, and_, desc
@@ -7,6 +9,15 @@ from database import DaySegment, LeaveRequest, PublicHoliday
 import logging
 
 logger = logging.getLogger("segments")
+
+# Per-(employee_id, date) locks around handle_checkin's read-then-write of
+# the "current open segment" — without this, two concurrent requests for
+# the same day can both read the same pre-write state and produce a stale
+# response (security review, 2026-09, confirmed live: one request reported
+# "already_checked_in: wfh" moments after a concurrent request had already
+# flipped the day to wfo). In-process only, same tradeoff as narrator.py's
+# _locks — fine since this app runs a single worker process.
+_segment_locks: dict = defaultdict(asyncio.Lock)
 
 LEAVE_TYPES = {
     "annual":           {"label": "Annual Leave",         "emoji": "", "icon": "palm-tree"},
@@ -101,6 +112,24 @@ async def open_new_segment(
     return seg
 
 async def handle_checkin(
+    employee_id, employee_name, hostname, date,
+    new_status, confidence, source,
+    public_ip, lan_ip, vpn_active, vpn_tunnel_ip,
+    dns_servers, dns_domains, is_ethernet, platform,
+    flagged, flag_reason, db: AsyncSession,
+    queued_at: str = None,
+) -> dict:
+    # Serialize concurrent check-ins for the same (employee, date) — see
+    # _segment_locks' comment above for why this matters.
+    async with _segment_locks[(employee_id, date)]:
+        return await _handle_checkin_locked(
+            employee_id, employee_name, hostname, date,
+            new_status, confidence, source,
+            public_ip, lan_ip, vpn_active, vpn_tunnel_ip,
+            dns_servers, dns_domains, is_ethernet, platform,
+            flagged, flag_reason, db, queued_at=queued_at)
+
+async def _handle_checkin_locked(
     employee_id, employee_name, hostname, date,
     new_status, confidence, source,
     public_ip, lan_ip, vpn_active, vpn_tunnel_ip,

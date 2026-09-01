@@ -1,0 +1,25 @@
+[package]
+name = "native_signer"
+version = "0.1.0"
+edition = "2021"
+description = "Device-bound, non-exportable ECDSA signing for the Sky RTO agent — private key lives only in the OS credential store (macOS Keychain / Windows CNG key storage), never in application memory as raw bytes."
+
+[lib]
+name = "native_signer"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = { version = "0.22", features = ["extension-module"] }
+base64 = "0.22"
+thiserror = "1.0"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+security-framework = "2.11"
+security-framework-sys = "2.11"
+core-foundation = "0.9"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { version = "0.58", features = [
+    "Win32_Security_Cryptography",
+    "Win32_Foundation",
+] }

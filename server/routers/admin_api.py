@@ -96,13 +96,24 @@ async def admin_table_data(
     return {"table": table_name, "columns": cols, "rows": [row_to_dict(r) for r in rows],
             "total": total, "page": page, "limit": limit}
 
+# Fields no admin should be able to overwrite through the generic editor —
+# these are credentials, not data. A security review (2026-09) found that
+# admin_edit_row let any admin silently overwrite devices.api_token with
+# an arbitrary value, effectively minting/replacing another employee's
+# bearer credential with no audit trail. Editing these now requires a
+# dedicated, audited action instead (not implemented here — this just
+# closes the silent-overwrite path).
+_PROTECTED_FIELDS = {
+    "devices": {"api_token"},
+}
+
 @router.patch("/api/admin/table/{table_name}/{row_id}")
 async def admin_edit_row(
     table_name: str, row_id: str,
     request: Request, db: AsyncSession = Depends(get_db)
 ):
     """Edit a single row's fields - admin only."""
-    await require_role(request, db, "admin")
+    admin_id = await require_role(request, db, "admin")
     TABLE_MAP = {
         "devices": Device, "checkins": CheckIn, "day_segments": DaySegment,
         "leave_requests": LeaveRequest, "public_holidays": PublicHoliday,
@@ -123,9 +134,17 @@ async def admin_edit_row(
         c.key: type(mapper.mapper.columns[c.key].type).__name__
         for c in mapper.mapper.column_attrs
     }
+    protected = _PROTECTED_FIELDS.get(table_name, set())
+    changes = []  # (field, old, new) for the audit trail
 
     for field, value in body.items():
         if field == pk: continue  # never edit PK
+        if field in protected:
+            raise HTTPException(
+                403,
+                f"'{field}' on '{table_name}' can't be edited through this "
+                f"generic editor — it's a credential field, not data."
+            )
         if not hasattr(row, field): continue
         col_type = col_types.get(field, "String")
         # Coerce types
@@ -143,9 +162,27 @@ async def admin_edit_row(
                 coerced = _dt.fromisoformat(str(value).replace("Z", "+00:00"))
             else:
                 coerced = str(value)
+            old_value = getattr(row, field, None)
+            if old_value != coerced:
+                changes.append((field, old_value, coerced))
             setattr(row, field, coerced)
         except Exception as e:
             raise HTTPException(400, f"Invalid value for {field} ({col_type}): {e}")
+
+    # Audit trail — who changed what, on which row, and when. Previously
+    # nothing recorded this at all (security review, 2026-09); reusing
+    # AnomalyLog rather than adding a new table/migration.
+    if changes:
+        changes_desc = "; ".join(f"{f}: {o!r} -> {n!r}" for f, o, n in changes)
+        db.add(AnomalyLog(
+            employee_id   = admin_id,
+            employee_name = admin_id,
+            anomaly_type  = "admin_table_edit",
+            description   = (
+                f"Admin '{admin_id}' edited {table_name}/{row_id}: {changes_desc}"
+            ),
+            severity = "medium",
+        ))
 
     await db.commit()
     return {"updated": True}
@@ -182,7 +219,7 @@ async def admin_delete_row(
 ):
     """Delete a row by primary key - admin only.
     Deleting a device cascades to all related records."""
-    await require_role(request, db, "admin")
+    admin_id = await require_role(request, db, "admin")
     TABLE_MAP = {
         "devices": Device, "checkins": CheckIn, "day_segments": DaySegment,
         "leave_requests": LeaveRequest, "public_holidays": PublicHoliday,
@@ -195,6 +232,16 @@ async def admin_delete_row(
     q   = await db.execute(select(model).where(getattr(model, pk) == row_id))
     row = q.scalars().first()
     if not row: raise HTTPException(404, "Row not found")
+
+    # Audit trail (security review, 2026-09) — record before the row is
+    # actually gone.
+    db.add(AnomalyLog(
+        employee_id   = admin_id,
+        employee_name = admin_id,
+        anomaly_type  = "admin_table_delete",
+        description   = f"Admin '{admin_id}' deleted {table_name}/{row_id}",
+        severity = "medium",
+    ))
 
     # Cascade delete: if deleting a device, wipe all related records first
     if table_name == "devices":

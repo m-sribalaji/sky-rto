@@ -80,6 +80,12 @@ class RegisterPayload(BaseModel):
     hostname: str; employee_name: str; employee_id: str
     team: Optional[str]=None; platform: Optional[str]=None
     nonce: Optional[str]=None
+    # Set only by devices enrolling under the native_signer public-key
+    # scheme (client/native_signer) — base64 DER-encoded EC public key.
+    # When present, the device is verified by ECDSA signature instead of
+    # the legacy HMAC api_token scheme going forward
+    # (deps.verify_request_signature).
+    public_key: Optional[str]=None
 
     @field_validator("employee_id")
     @classmethod

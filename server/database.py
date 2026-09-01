@@ -28,6 +28,15 @@ class Device(Base):
     # these the first time an old device successfully authenticates.
     token_issued_at  = Column(DateTime, nullable=True)
     token_expires_at = Column(DateTime, nullable=True)
+    # Device-bound public key (base64), from client/native_signer. When
+    # set, the device's requests are verified by ECDSA signature against
+    # this public key instead of the legacy HMAC-with-plaintext-token
+    # scheme — the corresponding private key never leaves the device's
+    # OS-protected key storage (Keychain/CNG), so it can't be read out of
+    # config.json the way api_token could be (security review, 2026-09).
+    # Nullable/additive: existing devices keep using api_token until they
+    # re-enroll under the new scheme; both are supported side by side.
+    public_key    = Column(String, nullable=True)
 
 class Role(Base):
     """employee_id -> admin | manager | employee (default if not in table)"""

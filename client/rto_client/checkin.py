@@ -86,7 +86,7 @@ def run_checkin(force: bool = False):
         if not server_reachable(server):
             logger.warning(f"[WARN] Server unreachable at {server}")
             if local_class in ("wfo", "wfh"):
-                queue_len = queue_checkin(payload)
+                queue_len = queue_checkin(payload, cfg)
                 cfg["last_checkin_date"]   = today
                 cfg["last_status"]         = local_class
                 cfg["last_detected_class"] = local_class
@@ -194,11 +194,12 @@ def run_checkin(force: bool = False):
         # Missed day check (once per day)
         check_missed_yesterday(server, hostname, cfg, today)
 
-        response = api_post(f"{server}/api/checkin", payload, auth_headers=_get_auth_headers(cfg), sign_key=cfg.get("device_token"))
+        response = api_post(f"{server}/api/checkin", payload, auth_headers=_get_auth_headers(cfg),
+                            sign_key=cfg.get("device_token"), use_native_signer=bool(cfg.get("native_public_key")))
         if not response:
             logger.error("[FAIL] Check-in POST failed - queuing for retry")
             if local_class in ("wfo", "wfh"):
-                queue_len = queue_checkin(payload)
+                queue_len = queue_checkin(payload, cfg)
                 employee_id = cfg.get("employee_id")
                 if NOTIFIER_AVAILABLE and employee_id:
                     post_employee_reply(
@@ -237,7 +238,8 @@ def run_checkin(force: bool = False):
             existing_status = response.get("status")
             if local_class in ("wfo", "wfh") and existing_status != local_class and force:
                 force_payload = {**payload, "force_update": True}
-                resp2 = api_post(f"{server}/api/checkin", force_payload, auth_headers=_get_auth_headers(cfg), sign_key=cfg.get("device_token"))
+                resp2 = api_post(f"{server}/api/checkin", force_payload, auth_headers=_get_auth_headers(cfg),
+                                 sign_key=cfg.get("device_token"), use_native_signer=bool(cfg.get("native_public_key")))
                 if resp2 and resp2.get("action") == "ok":
                     status = resp2.get("status")
                     logger.info(f"[OK] Status updated: {status}")

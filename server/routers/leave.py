@@ -196,6 +196,7 @@ async def record_missed(p: MissedDayPayload, request: Request, db: AsyncSession=
                     "detail": "Leave already recorded for this date."}
     final_status = p.status  # may get overridden below if claimed signals don't check out
     conf         = "high"    # leave/holiday days are always "certain", not a probability
+    unverified_wfo = False   # set below only in the non-leave (wfo/wfh) branch
     if is_leave:
         lq  = await db.execute(select(LeaveRequest).where(and_(
             LeaveRequest.employee_id==device.employee_id, LeaveRequest.date==p.date)))
@@ -270,7 +271,17 @@ async def record_missed(p: MissedDayPayload, request: Request, db: AsyncSession=
         # forever, flag it as an anomaly (visible in the Anomalies panel)
         # and track a monthly count so a pattern of unverified WFO claims
         # is visible, not just each individual one.
-        if final_status == "wfo" and conf == "user_declared":
+        #
+        # Security review (2026-09): this used to be purely cosmetic — the
+        # anomaly got logged, but the CheckIn record itself was never
+        # marked flagged, and severity only escalated to "high" after the
+        # 4th claim in a month, so the first three were easy to miss in
+        # practice. Now every unverified WFO claim is "high" immediately,
+        # and the CheckIn row itself carries the flag so it's visible
+        # anywhere that surfaces flagged records, not just the Anomalies
+        # panel.
+        unverified_wfo = final_status == "wfo" and conf == "user_declared"
+        if unverified_wfo:
             month_prefix = p.date[:7]  # YYYY-MM
             cnt_q = await db.execute(select(func.count()).select_from(AnomalyLog).where(and_(
                 AnomalyLog.employee_id == device.employee_id,
@@ -278,7 +289,6 @@ async def record_missed(p: MissedDayPayload, request: Request, db: AsyncSession=
                 AnomalyLog.description.like(f"%{month_prefix}%"),
             )))
             month_count = (cnt_q.scalar() or 0) + 1
-            severity = "high" if month_count > 3 else "medium"
             db.add(AnomalyLog(
                 employee_id=device.employee_id, employee_name=device.employee_name,
                 anomaly_type="unverified_wfo_declared",
@@ -288,7 +298,7 @@ async def record_missed(p: MissedDayPayload, request: Request, db: AsyncSession=
                     f"to verify. This is their #{month_count} unverified WFO claim "
                     f"in {month_prefix}."
                 ),
-                severity=severity,
+                severity="high",
             ))
             logger.warning(
                 f"[SECURITY] Unverified WFO self-declaration: {device.employee_id} "
@@ -304,6 +314,12 @@ async def record_missed(p: MissedDayPayload, request: Request, db: AsyncSession=
     crec.final_status=lt if is_leave else final_status; crec.overridden=True
     crec.override_by=device.employee_id; crec.override_note=f"Missed day ({source})"
     crec.confidence=conf
+    if unverified_wfo:
+        crec.flagged = True
+        crec.flag_reason = (
+            f"Unverified self-declared WFO for {p.date} — no network "
+            f"signals to corroborate; needs manager review."
+        )
     await db.commit()
     await sync_employee_teams_card(
         device.employee_id, device.employee_name, device.team,

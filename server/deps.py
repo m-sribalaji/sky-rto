@@ -221,6 +221,16 @@ def _purge_expired_nonces(now: float) -> None:
     for k in expired:
         _seen_nonces.pop(k, None)
 
+# A queued (offline) check-in is captured — and, for public_key devices,
+# signed — at real-signal-capture time, then possibly delivered hours or
+# days later once the device reconnects. That's a legitimate delay, not a
+# replay attack, but the normal SIGNATURE_FRESHNESS_SECONDS window (5 min)
+# would reject it. Requests carrying X-Queued: true get this much wider
+# allowance instead — bounded by the payload's own date validators
+# (CHECKIN_MAX_BACKDATE_DAYS / MISSED_DAY_MAX_LOOKBACK_DAYS in schemas.py)
+# doing the actual ceiling enforcement, same as today.
+QUEUED_SIGNATURE_FRESHNESS_SECONDS = 15 * 24 * 60 * 60  # 15 days, comfortably covers the 14-day backdate bound
+
 def verify_request_signature(request: Request, raw_body: bytes, device: Device) -> None:
     sig       = request.headers.get("X-Signature")
     ts_header = request.headers.get("X-Timestamp")
@@ -233,7 +243,9 @@ def verify_request_signature(request: Request, raw_body: bytes, device: Device) 
         raise HTTPException(401, "Invalid request timestamp.")
 
     now = _time.time()
-    if abs(now - ts) > SIGNATURE_FRESHNESS_SECONDS:
+    is_queued = request.headers.get("X-Queued", "").lower() == "true"
+    freshness = QUEUED_SIGNATURE_FRESHNESS_SECONDS if is_queued else SIGNATURE_FRESHNESS_SECONDS
+    if abs(now - ts) > freshness:
         raise HTTPException(401, "Request timestamp outside allowed window — check the agent's clock.")
 
     _purge_expired_nonces(now)
@@ -241,12 +253,47 @@ def verify_request_signature(request: Request, raw_body: bytes, device: Device) 
     if nonce_key in _seen_nonces:
         raise HTTPException(401, "Request already used (replay detected).")
 
-    message  = f"{ts_header}.{nonce}.".encode() + raw_body
-    expected = hmac.new(device.api_token.encode(), message, hashlib.sha256).hexdigest()
-    if not hmac.compare_digest(expected, sig):
-        raise HTTPException(401, "Invalid request signature.")
+    message = f"{ts_header}.{nonce}.".encode() + raw_body
 
-    _seen_nonces[nonce_key] = now + SIGNATURE_FRESHNESS_SECONDS
+    if device.public_key:
+        # Device-bound ECDSA path (client/native_signer) — the private
+        # key never left the device's OS-protected key storage. Verifying
+        # here only needs the public key, which is safe to store/transmit
+        # in the clear.
+        _verify_ecdsa_signature(device.public_key, message, sig)
+    else:
+        # Legacy HMAC path, unchanged, for devices not yet re-enrolled
+        # under the public-key scheme.
+        expected = hmac.new(device.api_token.encode(), message, hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(expected, sig):
+            raise HTTPException(401, "Invalid request signature.")
+
+    _seen_nonces[nonce_key] = now + freshness
+
+def _verify_ecdsa_signature(public_key_b64: str, message: bytes, sig_b64: str) -> None:
+    """
+    Verify an ECDSA (P-256) signature from a native_signer-enrolled
+    device. Deliberately isolated in its own function/import so a device
+    fleet with zero public_key-enrolled devices yet doesn't need the
+    `cryptography` package importable to boot — only exercised once the
+    first device actually re-enrolls under the new scheme.
+    """
+    try:
+        import base64
+        from cryptography.hazmat.primitives.asymmetric import ec
+        from cryptography.hazmat.primitives import hashes, serialization
+        from cryptography.exceptions import InvalidSignature
+    except ImportError:
+        raise HTTPException(500, "Server missing 'cryptography' package for public-key verification.")
+    try:
+        pub_bytes = base64.b64decode(public_key_b64)
+        sig_bytes = base64.b64decode(sig_b64)
+        public_key = serialization.load_der_public_key(pub_bytes)
+        public_key.verify(sig_bytes, message, ec.ECDSA(hashes.SHA256()))
+    except InvalidSignature:
+        raise HTTPException(401, "Invalid request signature.")
+    except Exception:
+        raise HTTPException(401, "Malformed signature or public key.")
 
 # ── Rate limiting ──────────────────────────────────────────────────────────
 # Protects credential-issuance and self-declared-attendance endpoints from

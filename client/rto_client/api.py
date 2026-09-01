@@ -19,7 +19,7 @@ import urllib.error
 from .config import logger, IS_MAC, IS_WIN, _NO_WIN
 
 
-def _sign_request(sign_key: str, body: bytes) -> dict:
+def _sign_request(sign_key: str, body: bytes, queued: bool = False) -> dict:
     """
     Build the X-Signature/X-Timestamp/X-Nonce headers the server checks in
     deps.verify_request_signature — see that function's docstring for what
@@ -29,16 +29,55 @@ def _sign_request(sign_key: str, body: bytes) -> dict:
     caller already serialized, not re-encoded from the payload dict (which
     could reorder keys and produce a different signature than the request
     the server actually receives).
+
+    Legacy HMAC path — `sign_key` is the plaintext device_token. Kept as
+    the default/fallback; see _sign_request_native for the device-bound
+    key alternative (security review, 2026-09 — this is the exact path
+    every credential-based test in that review used, since sign_key here
+    has to exist in readable form somewhere on disk for HMAC to work at
+    all).
     """
     ts    = str(int(time.time()))
     nonce = secrets.token_hex(8)
     message = f"{ts}.{nonce}.".encode() + body
     sig = hmac.new(sign_key.encode(), message, hashlib.sha256).hexdigest()
-    return {"X-Timestamp": ts, "X-Nonce": nonce, "X-Signature": sig}
+    headers = {"X-Timestamp": ts, "X-Nonce": nonce, "X-Signature": sig}
+    if queued: headers["X-Queued"] = "true"
+    return headers
+
+
+def _sign_request_native(body: bytes, queued: bool = False) -> dict | None:
+    """
+    Device-bound signing via client/native_signer — the private key never
+    leaves OS-protected storage (Keychain/CNG), so unlike _sign_request
+    there's no plaintext key on disk for this to ever expose. Returns None
+    (caller falls back to _sign_request) if native_signer isn't
+    importable/built yet, or if signing fails for any reason — this must
+    never be the thing that breaks a real check-in while the native
+    module is still being rolled out. See client/native_signer/README.md
+    for current build status before assuming this path is actually live.
+    """
+    try:
+        import base64
+        import native_signer  # the compiled Rust/PyO3 extension
+    except ImportError:
+        return None
+    try:
+        ts    = str(int(time.time()))
+        nonce = secrets.token_hex(8)
+        message = f"{ts}.{nonce}.".encode() + body
+        message_b64 = base64.b64encode(message).decode()
+        sig_b64 = native_signer.sign_message(message_b64)
+        headers = {"X-Timestamp": ts, "X-Nonce": nonce, "X-Signature": sig_b64}
+        if queued: headers["X-Queued"] = "true"
+        return headers
+    except Exception as e:
+        logger.warning(f"[WARN] native_signer signing failed, falling back to HMAC: {e}")
+        return None
 
 
 def api_post(url, payload, timeout=10, auth_headers: dict = None, return_status: bool = False,
-             sign_key: str = None):
+             sign_key: str = None, use_native_signer: bool = False, queued: bool = False):
     """
     POST JSON. Returns parsed response dict on success.
     If return_status=True, returns (response_or_None, http_status_or_None) instead —
@@ -47,6 +86,14 @@ def api_post(url, payload, timeout=10, auth_headers: dict = None, return_status:
     request — currently just /api/checkin. Leave it out for everything else;
     signing only makes sense once a device has a token to sign with, and
     only matters for the endpoint that produces "verified" attendance data.
+
+    Pass use_native_signer=True to prefer the device-bound key from
+    client/native_signer over the legacy HMAC sign_key — falls back to
+    HMAC automatically if native_signer isn't built/importable, so this
+    is always safe to pass once a device has enrolled (config.json's
+    native_public_key is set). Pass queued=True for offline-queue flush
+    calls, so the server applies its wider replay-freshness window
+    instead of the normal 5-minute one (deps.QUEUED_SIGNATURE_FRESHNESS_SECONDS).
     """
     try:
         data = json.dumps(payload).encode()
@@ -58,10 +105,49 @@ def api_post(url, payload, timeout=10, auth_headers: dict = None, return_status:
         }
         if auth_headers:
             hdrs.update(auth_headers)
-        if sign_key:
-            hdrs.update(_sign_request(sign_key, data))
+        sig_headers = None
+        if use_native_signer:
+            sig_headers = _sign_request_native(data, queued=queued)
+        if sig_headers is None and sign_key:
+            sig_headers = _sign_request(sign_key, data, queued=queued)
+        if sig_headers:
+            hdrs.update(sig_headers)
         req  = urllib.request.Request(url, data=data,
                    headers=hdrs, method="POST")
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            body = json.loads(r.read().decode())
+            return (body, r.status) if return_status else body
+    except urllib.error.HTTPError as e:
+        logger.error(f"[FAIL] POST {url}: HTTP Error {e.code}: {e.reason}")
+        return (None, e.code) if return_status else None
+    except Exception as e:
+        logger.error(f"[FAIL] POST {url}: {e}")
+        return (None, None) if return_status else None
+
+def api_post_presigned(url, payload_bytes: bytes, sig_headers: dict, timeout=10,
+                        auth_headers: dict = None, return_status: bool = False):
+    """
+    Send a request whose signature was already computed at an earlier
+    time (queue.py's capture-time signing) — sends `payload_bytes` and
+    `sig_headers` exactly as given, no re-signing. This is the point of
+    capture-time signing: if the queue file gets edited after capture,
+    the stored signature no longer matches the (now-different) bytes and
+    the server's signature check rejects it, the same way any other
+    tampered request would be rejected — unlike the old flush_queue,
+    which read whatever was currently on disk and signed THAT, silently
+    accepting any edit made before flush (security review, 2026-09).
+    """
+    try:
+        hdrs = {
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "Accept-Encoding": "identity",
+            "Connection": "close",
+        }
+        if auth_headers:
+            hdrs.update(auth_headers)
+        hdrs.update(sig_headers)
+        req = urllib.request.Request(url, data=payload_bytes, headers=hdrs, method="POST")
         with urllib.request.urlopen(req, timeout=timeout) as r:
             body = json.loads(r.read().decode())
             return (body, r.status) if return_status else body
